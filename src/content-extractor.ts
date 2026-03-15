@@ -157,10 +157,10 @@ export class ContentExtractor {
     $('[style*="background-image"]').remove();
     
     // Remove empty elements and whitespace-only elements
-    $('*').each(function() {
-      const $this = $(this);
-      if ($this.children().length === 0 && $this.text().trim() === '') {
-        $this.remove();
+    $('*').each((_, element) => {
+      const $element = $(element);
+      if ($element.children().length === 0 && $element.text().trim() === '') {
+        $element.remove();
       }
     });
     
@@ -204,7 +204,7 @@ export class ContentExtractor {
       mainContent = $('body').text().trim();
     }
     
-    // Clean up the text
+    // Clean up the text - use a local function instead of this.cleanTextContent
     const cleanedContent = this.cleanTextContent(mainContent);
     
     return cleanText(cleanedContent, this.maxContentLength);
