@@ -5,6 +5,9 @@ import { generateTimestamp, sanitizeQuery } from './utils.js';
 import { RateLimiter } from './rate-limiter.js';
 import { BrowserPool } from './browser-pool.js';
 
+// Import WebKit-first browser engine
+import { createOptimizedBrowser, getEnginePriorityOrder, BrowserEngineType, getHeadlessOption } from './browser-engine.js';
+
 export class SearchEngine {
   private readonly rateLimiter: RateLimiter;
   private browserPool: BrowserPool;
@@ -12,94 +15,36 @@ export class SearchEngine {
   constructor() {
     this.rateLimiter = new RateLimiter(10); // 10 requests per minute
     this.browserPool = new BrowserPool();
+    
+    console.log(`[SearchEngine] Using WebKit-first engine priority: ${getEnginePriorityOrder().join(' -> ')}`);
   }
 
   async search(options: SearchOptions): Promise<SearchResultWithMetadata> {
     const { query, numResults = 5, timeout = 10000 } = options;
     const sanitizedQuery = sanitizeQuery(query);
     
-    console.log(`[SearchEngine] Starting search for query: "${sanitizedQuery}"`);
+    console.log(`[SearchEngine] Starting parallel search for query: "${sanitizedQuery}"`);
     
     try {
       return await this.rateLimiter.execute(async () => {
-        console.log(`[SearchEngine] Starting search with multiple engines...`);
-        
         // Configuration from environment variables
         const enableQualityCheck = process.env.ENABLE_RELEVANCE_CHECKING !== 'false';
         const qualityThreshold = parseFloat(process.env.RELEVANCE_THRESHOLD || '0.3');
         const forceMultiEngine = process.env.FORCE_MULTI_ENGINE_SEARCH === 'true';
-        const debugBrowsers = process.env.DEBUG_BROWSER_LIFECYCLE === 'true';
         
-        console.log(`[SearchEngine] Quality checking: ${enableQualityCheck}, threshold: ${qualityThreshold}, multi-engine: ${forceMultiEngine}, debug: ${debugBrowsers}`);
+        console.log(`[SearchEngine] Quality checking: ${enableQualityCheck}, threshold: ${qualityThreshold}`);
 
-        // Try multiple approaches to get search results, starting with most reliable
-        const approaches = [
-          { method: this.tryBrowserBingSearch.bind(this), name: 'Browser Bing' },
-          { method: this.tryBrowserBraveSearch.bind(this), name: 'Browser Brave' },
-          { method: this.tryDuckDuckGoSearch.bind(this), name: 'Axios DuckDuckGo' }
-        ];
+        // WebKit-first engine priority for parallel search
+        const enginePriority: BrowserEngineType[] = getEnginePriorityOrder();
+        const useParallel = process.env.PARALLEL_SEARCH !== 'false'; // Default to true
         
-        let bestResults: SearchResult[] = [];
-        let bestEngine = 'None';
-        let bestQuality = 0;
-        
-        for (let i = 0; i < approaches.length; i++) {
-          const approach = approaches[i];
-          try {
-            console.log(`[SearchEngine] Attempting ${approach.name} (${i + 1}/${approaches.length})...`);
-            
-            // Use more aggressive timeouts for faster fallback
-            const approachTimeout = Math.min(timeout / 3, 4000); // Max 4 seconds per approach for faster fallback
-            const results = await approach.method(sanitizedQuery, numResults, approachTimeout);
-            if (results.length > 0) {
-              console.log(`[SearchEngine] Found ${results.length} results with ${approach.name}`);
-              
-              // Validate result quality to detect irrelevant results
-              const qualityScore = enableQualityCheck ? this.assessResultQuality(results, sanitizedQuery) : 1.0;
-              console.log(`[SearchEngine] ${approach.name} quality score: ${qualityScore.toFixed(2)}/1.0`);
-              
-              // Track the best results so far
-              if (qualityScore > bestQuality) {
-                bestResults = results;
-                bestEngine = approach.name;
-                bestQuality = qualityScore;
-              }
-              
-              // If quality is excellent, return immediately (unless forcing multi-engine)
-              if (qualityScore >= 0.8 && !forceMultiEngine) {
-                console.log(`[SearchEngine] Excellent quality results from ${approach.name}, returning immediately`);
-                return { results, engine: approach.name };
-              }
-              
-              // If quality is acceptable and this isn't Bing (first engine), return
-              if (qualityScore >= qualityThreshold && approach.name !== 'Browser Bing' && !forceMultiEngine) {
-                console.log(`[SearchEngine] Good quality results from ${approach.name}, using as primary`);
-                return { results, engine: approach.name };
-              }
-              
-              // If this is the last engine or quality is acceptable, prepare to return
-              if (i === approaches.length - 1) {
-                if (bestQuality >= qualityThreshold || !enableQualityCheck) {
-                  console.log(`[SearchEngine] Using best results from ${bestEngine} (quality: ${bestQuality.toFixed(2)})`);
-                  return { results: bestResults, engine: bestEngine };
-                } else if (bestResults.length > 0) {
-                  console.log(`[SearchEngine] Warning: Low quality results from all engines, using best available from ${bestEngine}`);
-                  return { results: bestResults, engine: bestEngine };
-                }
-              } else {
-                console.log(`[SearchEngine] ${approach.name} results quality: ${qualityScore.toFixed(2)}, continuing to try other engines...`);
-              }
-            }
-          } catch (error) {
-            console.error(`[SearchEngine] ${approach.name} approach failed:`, error);
-            
-            // Handle browser-specific errors (no cleanup needed since each engine uses dedicated browsers)
-            await this.handleBrowserError(error, approach.name);
-          }
+        if (useParallel) {
+          console.log(`[SearchEngine] Running parallel search with engines: ${enginePriority.join(', ')}`);
+          return await this.searchWithParallelEngines(sanitizedQuery, numResults, timeout, enableQualityCheck, qualityThreshold);
+        } else {
+          console.log(`[SearchEngine] Using sequential search fallback`);
+          return await this.searchWithSequentialFallbacks(sanitizedQuery, numResults, timeout, enableQualityCheck, qualityThreshold);
         }
-        
-        console.log(`[SearchEngine] All approaches failed, returning empty results`);
-        return { results: [], engine: 'None' };
       });
     } catch (error) {
       console.error('[SearchEngine] Search error:', error);
@@ -111,6 +56,184 @@ export class SearchEngine {
         });
       }
       throw new Error(`Failed to perform search: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Parallel search using Promise.race() - tries multiple engines simultaneously
+   */
+  private async searchWithParallelEngines(
+    query: string,
+    numResults: number,
+    timeout: number,
+    enableQualityCheck: boolean,
+    qualityThreshold: number
+  ): Promise<SearchResultWithMetadata> {
+    const startTime = Date.now();
+    
+    // Create parallel search promises for each engine
+    const enginePriority: BrowserEngineType[] = getEnginePriorityOrder();
+    const searchPromises = enginePriority.map((engineType, index) => ({
+      engineType,
+      promise: this.runSearchWithEngine(engineType, query, numResults, timeout / 3)
+        .then(results => {
+          if (results.length > 0 && enableQualityCheck) {
+            const qualityScore = this.assessResultQuality(results, query);
+            console.log(`[SearchEngine] Parallel ${engineType} found ${results.length} results (quality: ${qualityScore.toFixed(2)})`);
+            
+            // Return early with high-quality results
+            if (qualityScore >= 0.8) {
+              return { results, engine: `${engineType}-parallel`, qualityScore };
+            }
+            
+            // Check if quality meets threshold
+            if (qualityScore >= qualityThreshold || index === enginePriority.length - 1) {
+              return { results, engine: `${engineType}-parallel`, qualityScore };
+            }
+          } else if (results.length > 0) {
+            console.log(`[SearchEngine] Parallel ${engineType} found ${results.length} results`);
+            return { results, engine: `${engineType}-parallel`, qualityScore: 1.0 };
+          }
+          
+          // Return null to indicate this engine didn't produce good enough results
+          return null;
+        })
+        .catch(error => {
+          console.log(`[SearchEngine] Parallel ${engineType} search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+          return null;
+        }),
+    }));
+
+    // Race all searches and return first successful result
+    for (const { engineType, promise } of searchPromises) {
+      try {
+        const result = await Promise.race([promise, new Promise<null>((_, reject) => 
+          setTimeout(() => reject(new Error('Search timeout')), timeout / 2)
+        )]);
+        
+        if (result && result.qualityScore >= qualityThreshold) {
+          console.log(`[SearchEngine] Parallel search completed in ${Date.now() - startTime}ms using ${engineType}`);
+          return { results: result.results, engine: result.engine };
+        }
+      } catch (error) {
+        // Search timed out or failed, continue to next
+        console.log(`[SearchEngine] Parallel search for ${engineType} did not succeed`);
+      }
+    }
+    
+    console.log(`[SearchEngine] All parallel searches completed in ${Date.now() - startTime}ms`);
+    return { results: [], engine: 'none' };
+  }
+
+  /**
+   * Sequential fallback search (original behavior, kept for compatibility)
+   */
+  private async searchWithSequentialFallbacks(
+    query: string,
+    numResults: number,
+    timeout: number,
+    enableQualityCheck: boolean,
+    qualityThreshold: number
+  ): Promise<SearchResultWithMetadata> {
+    // Try multiple approaches to get search results, starting with most reliable
+    const approaches = [
+      { method: this.tryBrowserBingSearch.bind(this), name: 'Browser Bing' },
+      { method: this.tryBrowserBraveSearch.bind(this), name: 'Browser Brave' },
+      { method: this.tryDuckDuckGoSearch.bind(this), name: 'Axios DuckDuckGo' }
+    ];
+    
+    let bestResults: SearchResult[] = [];
+    let bestEngine = 'None';
+    let bestQuality = 0;
+    
+    for (let i = 0; i < approaches.length; i++) {
+      const approach = approaches[i];
+      try {
+        console.log(`[SearchEngine] Attempting ${approach.name} (${i + 1}/${approaches.length})...`);
+        
+        // Use more aggressive timeouts for faster fallback
+        const approachTimeout = Math.min(timeout / 3, 4000); // Max 4 seconds per approach
+        const results = await approach.method(query, numResults, approachTimeout);
+        if (results.length > 0) {
+          console.log(`[SearchEngine] Found ${results.length} results with ${approach.name}`);
+          
+          // Validate result quality to detect irrelevant results
+          const qualityScore = enableQualityCheck ? this.assessResultQuality(results, query) : 1.0;
+          console.log(`[SearchEngine] ${approach.name} quality score: ${qualityScore.toFixed(2)}/1.0`);
+          
+          // Track the best results so far
+          if (qualityScore > bestQuality) {
+            bestResults = results;
+            bestEngine = approach.name;
+            bestQuality = qualityScore;
+          }
+          
+          // If quality is excellent, return immediately
+          if (qualityScore >= 0.8) {
+            console.log(`[SearchEngine] Excellent quality results from ${approach.name}, returning immediately`);
+            return { results, engine: approach.name };
+          }
+          
+          // If quality is acceptable and this isn't first engine, return
+          if (qualityScore >= qualityThreshold && approach.name !== 'Browser Bing') {
+            console.log(`[SearchEngine] Good quality results from ${approach.name}, using as primary`);
+            return { results, engine: approach.name };
+          }
+          
+          // If this is the last engine or quality is acceptable, prepare to return
+          if (i === approaches.length - 1) {
+            if (bestQuality >= qualityThreshold || !enableQualityCheck) {
+              console.log(`[SearchEngine] Using best results from ${bestEngine} (quality: ${bestQuality.toFixed(2)})`);
+              return { results: bestResults, engine: bestEngine };
+            } else if (bestResults.length > 0) {
+              console.log(`[SearchEngine] Warning: Low quality results from all engines, using best available`);
+              return { results: bestResults, engine: bestEngine };
+            }
+          }
+        }
+      } catch (error) {
+        console.error(`[SearchEngine] ${approach.name} approach failed:`, error);
+        await this.handleBrowserError(error, approach.name);
+      }
+    }
+    
+    console.log(`[SearchEngine] All sequential approaches failed, returning empty results`);
+    return { results: [], engine: 'None' };
+  }
+
+  /**
+   * Runs a search with a specific browser engine
+   */
+  private async runSearchWithEngine(
+    engineType: BrowserEngineType,
+    query: string,
+    numResults: number,
+    timeout: number
+  ): Promise<SearchResult[]> {
+    console.log(`[SearchEngine] Starting ${engineType} search for: ${query}`);
+    
+    const browser = await createOptimizedBrowser({
+      engineType,
+      headlessMode: 'new', // Use new headless mode
+    });
+    
+    try {
+      // Use appropriate search method based on engine
+      if (engineType === 'webkit') {
+        return await this.tryDuckDuckGoSearch(query, numResults, timeout);
+      } else if (engineType === 'chromium') {
+        return await this.tryBrowserBingSearchInternal(browser, query, numResults, timeout);
+      } else if (engineType === 'firefox') {
+        return await this.tryBrowserBraveSearchInternal(browser, query, numResults, timeout);
+      }
+      
+      return [];
+    } finally {
+      try {
+        await browser.close();
+      } catch (error) {
+        console.log(`[SearchEngine] Error closing ${engineType} browser:`, error);
+      }
     }
   }
 
