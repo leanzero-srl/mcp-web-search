@@ -60,3 +60,66 @@ export interface GitHubCrawlOptions {
   includeCodeOnly?: boolean;
   timeout?: number;
 }
+
+// OpenAPI/Technical Document Extraction Types
+
+export enum TechnicalDocType {
+  OPENAPI_JSON = 'openapi-json',
+  OPENAPI_YAML = 'openapi-yaml',
+  SWAGGER_JSON = 'swagger-json',
+  SWAGGER_YAML = 'swagger-yaml',
+  API_DOCS = 'api-docs',
+  REST_API = 'rest-api',
+  TECHNICAL_MD = 'technical-md',
+  TECHNICAL_PDF = 'technical-pdf',
+}
+
+export interface OpenAPISpecInfo {
+  url: string;
+  title?: string;
+  version?: string;
+  description?: string;
+  basePath?: string;
+  docType: TechnicalDocType;
+  size?: number;
+  timestamp: string;
+}
+
+export interface DownloadedOpenAPI {
+  id: string;
+  originalUrl: string;
+  localPath: string;
+  fileName: string;
+  openAPISpec: OpenAPISpecInfo;
+  downloadTime: string;
+  domain: string;
+  path: string;
+  keywords?: string[];
+}
+
+export interface CrawlCacheEntry {
+  url: string;
+  timestamp: string;
+  expiresAt: string;
+  contentHash: string;
+  docType?: TechnicalDocType;
+  title?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface OpenAPIExtractionOptions {
+  url?: string;
+  downloadDir?: string;
+  maxContentLength?: number;
+  timeout?: number;
+  forceRefresh?: boolean;
+}
+
+export interface OpenAPIExtractionResult {
+  success: boolean;
+  url: string;
+  openAPISpec?: OpenAPISpecInfo;
+  downloadedFile?: DownloadedOpenAPI;
+  error?: string;
+  detectedType?: TechnicalDocType;
+}

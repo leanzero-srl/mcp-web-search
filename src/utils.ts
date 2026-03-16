@@ -50,6 +50,13 @@ export function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Generates a unique identifier for caching and tracking purposes
+ */
+export function generateUUID(): string {
+  return Date.now().toString(36) + Math.random().toString(36).substring(2);
+}
+
 export function isPdfUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
