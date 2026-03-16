@@ -4,7 +4,7 @@ import { Page } from 'playwright';
 import { ContentExtractionOptions, SearchResult } from './types.js';
 import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
 import { BrowserPool } from './browser-pool.js';
-import { scoreContentQuality, validateContentQuality, getBestContentSelector, ContentQualityResult, cleanText as qualityCleanText, getWordCount as qualityGetWordCount } from './content-quality-scorer.js';
+import { scoreContentQuality, getBestContentSelector, ContentQualityResult, cleanText as qualityCleanText } from './content-quality-scorer.js';
 
 export class EnhancedContentExtractor {
   private readonly defaultTimeout: number;

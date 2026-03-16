@@ -27,12 +27,19 @@ The original implementation was slow due to sequential search engine attempts an
 
 ## Features
 
+### Web Search Features
 - **Multi-Engine Web Search**: Parallel attempts prioritizing Bing > Brave > DuckDuckGo for optimal reliability and performance
 - **Full Page Content Extraction**: Fetches and extracts complete page content from search results with automatic fallback mechanisms
 - **Multiple Search Tools**: Three specialised tools for different use cases
 - **Smart Request Strategy**: Uses axios for fast requests, falls back to Playwright browsers when needed
 - **Concurrent Processing**: Extracts content from multiple pages simultaneously
 - **Content Quality Validation**: Ensures minimum 200 characters and relevance scoring before returning results
+
+### GitHub Repository Crawler
+- **README.md Extraction**: Directly fetches README content using GitHub API
+- **Code File Crawling**: Recursively crawls repository structure to find code files (.js, .ts, .py, etc.)
+- **Content Preview**: Extracts first 500 characters of each file for quick inspection
+- **Configurable Limits**: Control depth and number of files extracted via environment variables
 
 ## How It Works
 
@@ -228,6 +235,77 @@ If the single page tool still times out:
 - **Limit browsers**: Reduce `MAX_BROWSERS` (default: 3)
 - **Reduce context pool**: Lower `CONTEXT_POOL_SIZE` to limit memory usage
 
+## GitHub Repository Crawler
+
+The server also provides a tool for extracting content from GitHub repositories:
+
+### 4. `get-github-repo-content`
+A specialized tool for crawling GitHub repositories:
+1. Takes a GitHub repository URL as input
+2. Fetches the README.md file directly using GitHub API
+3. Recursively crawls the repository structure to find code files
+4. Extracts content previews from each file (.js, .ts, .py, etc.)
+5. Returns structured information about the repository
+
+**Example Usage:**
+```json
+{
+  "name": "get-github-repo-content",
+  "arguments": {
+    "url": "https://github.com/owner/repo",
+    "maxDepth": 3,
+    "maxFiles": 50
+  }
+}
+```
+
+**Parameters:**
+- `url`: The URL of the GitHub repository (required)
+- `maxDepth`: Maximum directory depth to crawl (optional, default: from environment or 3)
+- `maxFiles`: Maximum number of files to extract content from (optional, default: from environment or 50)
+
+### Environment Variables
+
+The server supports several environment variables for configuration:
+
+#### Basic Configuration
+- **`MAX_CONTENT_LENGTH`**: Maximum content length in characters (default: 500000)
+- **`DEFAULT_TIMEOUT`**: Default timeout for requests in milliseconds (default: 6000)
+- **`MIN_CONTENT_LENGTH`**: Minimum content length required for valid results (default: 200)
+
+#### Browser Configuration
+- **`MAX_BROWSERS`**: Maximum number of browser instances to maintain (default: 3)
+- **`BROWSER_TYPES`**: Comma-separated list of browser types to use (default: 'webkit,chromium,firefox', options: webkit, chromium, firefox)
+- **`BROWSER_HEADLESS`**: Enable headless mode for browsers (default: true)
+
+#### Context Pool Configuration
+- **`CONTEXT_POOL_SIZE`**: Maximum number of contexts in the pool (default: 10)
+- **`CONTEXT_REUSE_TIMEOUT`**: Time in milliseconds before context is considered stale (default: 30000)
+- **`CONTEXT_MAX_AGE`**: Maximum age of context in milliseconds before forced refresh (default: 60000)
+
+#### Search Quality and Engine Selection
+- **`ENABLE_RELEVANCE_CHECKING`**: Enable/disable search result quality validation (default: true)
+- **`RELEVANCE_THRESHOLD`**: Minimum quality score for search results (0.0-1.0, default: 0.3)
+- **`FORCE_MULTI_ENGINE_SEARCH`**: Try all search engines and return best results (default: false)
+
+#### Performance Tuning
+- **`BROWSER_FALLBACK_THRESHOLD`**: Number of axios failures before using browser fallback (default: 3)
+- **`DEBUG_BROWSER_LIFECYCLE`**: Enable detailed browser lifecycle logging for debugging (default: false)
+
+#### GitHub Repository Crawler Configuration
+- **`GITHUB_MAX_DEPTH`**: Maximum directory depth to crawl (default: 3)
+- **`GITHUB_MAX_FILES`**: Maximum number of files to extract content from (default: 50)
+- **`GITHUB_TIMEOUT`**: Request timeout in milliseconds (default: 10000)
+
+#### Code File Extensions
+The crawler automatically identifies and extracts content from common code file extensions:
+```
+.js, .ts, .jsx, .tsx, .py, .java, .go, .rs, .rb,
+.php, .cs, .cpp, .c, .h, .hpp, .swift, .kt, .scala,
+.sh, .bash, .yml, .yaml, .json, .xml, .html, .css,
+.scss, .sass, .less, .sql, .md, .rst, .txt
+```
+
 ## Compatibility
 
 This MCP server has been developed and tested with **LM Studio** and **LibreChat**. It has not been tested with other MCP clients.
@@ -324,6 +402,31 @@ A utility tool for extracting content from a specific webpage:
   }
 }
 ```
+
+### 4. `get-github-repo-content` (Repository Crawler)
+A specialized tool for extracting content from GitHub repositories:
+1. Takes a GitHub repository URL as input
+2. Fetches the README.md file directly using GitHub API
+3. Recursively crawls the repository structure to find code files (.js, .ts, .py, etc.)
+4. Extracts content previews from each file (first 500 characters)
+5. Returns structured information about the repository
+
+**Example Usage:**
+```json
+{
+  "name": "get-github-repo-content",
+  "arguments": {
+    "url": "https://github.com/owner/repo",
+    "maxDepth": 3,
+    "maxFiles": 50
+  }
+}
+```
+
+**Parameters:**
+- `url`: The URL of the GitHub repository (required)
+- `maxDepth`: Maximum directory depth to crawl (optional, default: from environment or 3)
+- `maxFiles`: Maximum number of files to extract content from (optional, default: from environment or 50)
 
 ## Standalone Usage
 

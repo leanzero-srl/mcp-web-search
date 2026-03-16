@@ -1,8 +1,24 @@
+/**
+ * Legacy Content Extractor - DEPRECATED
+ * 
+ * This module contains the original ContentExtractor class which has been replaced by
+ * EnhancedContentExtractor in enhanced-content-extractor.ts. The enhanced version provides:
+ * - Better browser-based fallback for JavaScript-heavy sites
+ * - Improved content quality scoring and validation
+ * - More robust PDF detection with query parameter handling
+ * - Better error handling and retry logic
+ * 
+ * DO NOT USE this class. Use EnhancedContentExtractor instead.
+ */
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { ContentExtractionOptions, SearchResult } from './types.js';
 import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
 
+/**
+ * @deprecated Use EnhancedContentExtractor instead. This class is no longer maintained
+ * and will be removed in future versions.
+ */
 export class ContentExtractor {
   private readonly defaultTimeout: number;
   private readonly maxContentLength: number;

@@ -6,13 +6,15 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { SearchEngine } from './search-engine.js';
 import { EnhancedContentExtractor } from './enhanced-content-extractor.js';
-import { WebSearchToolInput, WebSearchToolOutput, SearchResult } from './types.js';
+import { WebSearchToolInput, WebSearchToolOutput, SearchResult, GitHubFile } from './types.js';
 import { isPdfUrl } from './utils.js';
+import { GitHubExtractor } from './github-extractor.js';
 
 class WebSearchMCPServer {
   private server: McpServer;
   private searchEngine: SearchEngine;
   private contentExtractor: EnhancedContentExtractor;
+  private githubExtractor?: GitHubExtractor;
 
   constructor() {
     this.server = new McpServer({
@@ -22,6 +24,23 @@ class WebSearchMCPServer {
 
     this.searchEngine = new SearchEngine();
     this.contentExtractor = new EnhancedContentExtractor();
+
+    // Initialize GitHub extractor with defaults
+    try {
+      const maxDepth = parseInt(process.env.GITHUB_MAX_DEPTH || '3', 10);
+      const maxFiles = parseInt(process.env.GITHUB_MAX_FILES || '50', 10);
+      const timeout = parseInt(process.env.GITHUB_TIMEOUT || '10000', 10);
+      
+      this.githubExtractor = new GitHubExtractor({
+        maxDepth: isNaN(maxDepth) ? 3 : maxDepth,
+        maxFiles: isNaN(maxFiles) ? 50 : maxFiles,
+        timeout: isNaN(timeout) ? 10000 : timeout
+      });
+      
+      console.log(`[WebSearchMCPServer] GitHub extractor initialized with maxDepth=${maxDepth}, maxFiles=${maxFiles}`);
+    } catch (error) {
+      console.warn('[WebSearchMCPServer] Failed to initialize GitHub extractor:', error);
+    }
 
     this.setupTools();
     this.setupGracefulShutdown();
@@ -322,6 +341,127 @@ class WebSearchMCPServer {
         }
       }
     );
+
+    // Register the GitHub repository content extraction tool
+    this.server.tool(
+      'get-github-repo-content',
+      'Extract and return content from a GitHub repository. This tool fetches README.md and crawls code files (.js, .ts, .py, etc.) from the repository. Use this when you need to understand the structure and contents of a GitHub project.',
+      {
+        url: z.string().url().describe('The URL of the GitHub repository (e.g., https://github.com/owner/repo)'),
+        maxDepth: z.union([z.number(), z.string()]).transform((val) => {
+          const num = typeof val === 'string' ? parseInt(val, 10) : val;
+          if (isNaN(num) || num < 0) {
+            throw new Error('Invalid maxDepth: must be a non-negative number');
+          }
+          return num;
+        }).optional().describe('Maximum directory depth to crawl (default: from environment or 3)'),
+        maxFiles: z.union([z.number(), z.string()]).transform((val) => {
+          const num = typeof val === 'string' ? parseInt(val, 10) : val;
+          if (isNaN(num) || num < 0) {
+            throw new Error('Invalid maxFiles: must be a non-negative number');
+          }
+          return num;
+        }).optional().describe('Maximum number of files to extract content from (default: from environment or 50)'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: get-github-repo-content`);
+        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+        try {
+          // Validate arguments
+          if (typeof args !== 'object' || args === null) {
+            throw new Error('Invalid arguments: args must be an object');
+          }
+          const obj = args as Record<string, unknown>;
+          
+          if (!obj.url || typeof obj.url !== 'string') {
+            throw new Error('Invalid arguments: url is required and must be a string');
+          }
+
+          let maxDepth: number | undefined;
+          if (obj.maxDepth !== undefined) {
+            const maxDepthValue = typeof obj.maxDepth === 'string' ? parseInt(obj.maxDepth, 10) : obj.maxDepth;
+            if (typeof maxDepthValue !== 'number' || isNaN(maxDepthValue)) {
+              throw new Error('Invalid maxDepth: must be a number');
+            }
+            maxDepth = maxDepthValue;
+          }
+
+          let maxFiles: number | undefined;
+          if (obj.maxFiles !== undefined) {
+            const maxFilesValue = typeof obj.maxFiles === 'string' ? parseInt(obj.maxFiles, 10) : obj.maxFiles;
+            if (typeof maxFilesValue !== 'number' || isNaN(maxFilesValue)) {
+              throw new Error('Invalid maxFiles: must be a number');
+            }
+            maxFiles = maxFilesValue;
+          }
+
+          console.log(`[MCP] Starting GitHub repository extraction for: ${obj.url}`);
+          
+          // Validate we have a GitHub extractor initialized
+          if (!this.githubExtractor) {
+            throw new Error('GitHub extractor is not initialized. Check GITHUB_MAX_DEPTH, GITHUB_MAX_FILES environment variables.');
+          }
+
+          // Use the GitHub extractor to get repository content
+          const result = await this.githubExtractor.extractGitHubContent(obj.url, { 
+            maxDepth,
+            maxFiles 
+          });
+
+          console.log(`[MCP] GitHub extraction completed: ${result.repositoryInfo.owner}/${result.repositoryInfo.repo} (${result.files.length} files)`);
+
+          // Format the result as text
+          let responseText = `**GitHub Repository Content from: ${obj.url}**\n\n`;
+          responseText += `**Repository:** ${result.repositoryInfo.owner}/${result.repositoryInfo.repo}\n`;
+          responseText += `**Default Branch:** ${result.repositoryInfo.defaultBranch}\n`;
+          responseText += `**Files Extracted:** ${result.files.length}\n\n`;
+          
+          // Add README if available
+          if (result.readme && result.readme.trim()) {
+            let readmeContent = result.readme.trim();
+            const maxLength = maxDepth || maxFiles ? 2000 : 5000;
+            if (readmeContent.length > maxLength) {
+              readmeContent = readmeContent.substring(0, maxLength) + `\n\n[README truncated at ${maxLength} characters]`;
+            }
+            responseText += `**README.md:**\n${readmeContent}\n\n`;
+          } else {
+            responseText += `**README.md:** No README found\n\n`;
+          }
+          
+          // Add file list
+          if (result.files.length > 0) {
+            responseText += `**Files:**\n`;
+            result.files.forEach((file, idx) => {
+              responseText += `${idx + 1}. ${file.path} (${file.size || 0} bytes)\n`;
+              
+              // Include file content preview (first 500 chars)
+              if (file.content && file.content.length > 0) {
+                let contentPreview = file.content.trim();
+                if (contentPreview.length > 500) {
+                  contentPreview = contentPreview.substring(0, 500) + `\n\n[Content truncated at 500 characters]`;
+                }
+                responseText += `   Preview: ${contentPreview}\n`;
+              }
+            });
+          } else {
+            responseText += `**Files:** No files found or all files were skipped.\n`;
+          }
+
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: responseText,
+              },
+            ],
+          };
+        } catch (error) {
+          console.error(`[MCP] Error in get-github-repo-content tool handler:`, error);
+          throw error;
+        }
+      }
+    );
   }
 
   private validateAndConvertArgs(args: unknown): WebSearchToolInput {
@@ -332,6 +472,12 @@ class WebSearchMCPServer {
     // Ensure query is a string
     if (!obj.query || typeof obj.query !== 'string') {
       throw new Error('Invalid arguments: query is required and must be a string');
+    }
+    
+    // Validate query is not empty (after trimming whitespace)
+    const trimmedQuery = obj.query.trim();
+    if (trimmedQuery === '') {
+      throw new Error('Invalid arguments: query cannot be empty or whitespace only');
     }
 
     // Convert limit to number if it's a string
