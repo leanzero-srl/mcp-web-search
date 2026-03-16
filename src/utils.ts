@@ -53,9 +53,17 @@ export function delay(ms: number): Promise<void> {
 export function isPdfUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
-    return parsed.pathname.toLowerCase().endsWith('.pdf');
+    // Check if pathname ends with .pdf OR if query string contains a .pdf parameter
+    const pathIsPdf = parsed.pathname.toLowerCase().endsWith('.pdf');
+    
+    // Also check search params for .pdf extensions (e.g., file.pdf?download=1)
+    const searchParamsHavePdf = [...parsed.searchParams.entries()].some(
+      ([, value]) => value.toLowerCase().includes('.pdf')
+    );
+    
+    return pathIsPdf || searchParamsHavePdf;
   } catch {
     // If URL parsing fails, check the raw string as fallback
     return url.toLowerCase().endsWith('.pdf');
   }
-} 
+}
