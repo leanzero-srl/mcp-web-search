@@ -6,9 +6,10 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { SearchEngine } from './search-engine.js';
 import { EnhancedContentExtractor } from './enhanced-content-extractor.js';
-import { WebSearchToolInput, WebSearchToolOutput, SearchResult, GitHubFile } from './types.js';
+import { WebSearchToolInput, WebSearchToolOutput, SearchResult, GitHubFile, OpenAPIExtractionResult } from './types.js';
 import { isPdfUrl } from './utils.js';
 import { GitHubExtractor } from './github-extractor.js';
+import { openAPIExtractor } from './openapi-extractor.js';
 
 class WebSearchMCPServer {
   private server: McpServer;
@@ -458,6 +459,188 @@ class WebSearchMCPServer {
           };
         } catch (error) {
           console.error(`[MCP] Error in get-github-repo-content tool handler:`, error);
+          throw error;
+        }
+      }
+    );
+
+    // Register the OpenAPI specification extraction tool
+    this.server.tool(
+      'get-openapi-spec',
+      'Extract and download OpenAPI/Swagger specifications from API documentation pages. This tool automatically discovers OpenAPI specs by checking HTML link tags, common URL patterns, and versioned swagger files. The spec is saved to docs/technical/openapi/ for future use without re-crawling.',
+      {
+        url: z.string().url().describe('The URL of the API documentation page (e.g., https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro/)'),
+        forceRefresh: z.union([z.boolean(), z.string()]).transform((val) => {
+          if (typeof val === 'string') {
+            return val.toLowerCase() === 'true';
+          }
+          return Boolean(val);
+        }).default(false).describe('Force refresh the cache and re-download the spec'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: get-openapi-spec`);
+        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+        try {
+          // Validate arguments
+          if (typeof args !== 'object' || args === null) {
+            throw new Error('Invalid arguments: args must be an object');
+          }
+          const obj = args as Record<string, unknown>;
+          
+          if (!obj.url || typeof obj.url !== 'string') {
+            throw new Error('Invalid arguments: url is required and must be a string');
+          }
+
+          let forceRefresh = false; // default
+          if (obj.forceRefresh !== undefined) {
+            const refreshValue = typeof obj.forceRefresh === 'string' ? obj.forceRefresh.toLowerCase() : obj.forceRefresh;
+            forceRefresh = Boolean(refreshValue);
+          }
+
+          console.log(`[MCP] Starting OpenAPI spec extraction from: ${obj.url}`);
+          
+          // Use the OpenAPI extractor (url is already passed as first argument)
+          const result = await openAPIExtractor.extractOpenAPISpec(obj.url, {
+            forceRefresh: forceRefresh || undefined,
+          } as any);
+
+          console.log(`[MCP] OpenAPI extraction completed: success=${result.success}`);
+
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to extract OpenAPI specification:\n\nError: ${result.error || 'Unknown error'}`,
+                },
+              ],
+            };
+          }
+
+          // Format the result
+          let responseText = `**OpenAPI Specification Extracted Successfully!**\n\n`;
+          
+          if (result.downloadedFile) {
+            responseText += `**Downloaded File:** ${result.downloadedFile.fileName}\n`;
+            responseText += `**Local Path:** ${result.downloadedFile.localPath}\n`;
+            responseText += `**Original URL:** ${result.openAPISpec?.url || obj.url}\n\n`;
+          }
+          
+          if (result.openAPISpec) {
+            responseText += `**Specification Info:**\n`;
+            if (result.openAPISpec.title) responseText += `- Title: ${result.openAPISpec.title}\n`;
+            if (result.openAPISpec.version) responseText += `- Version: ${result.openAPISpec.version}\n`;
+            if (result.openAPISpec.description) {
+              let desc = result.openAPISpec.description;
+              if (desc.length > 500) desc = desc.substring(0, 500) + '...';
+              responseText += `- Description: ${desc}\n`;
+            }
+            if (result.openAPISpec.basePath) responseText += `- Base Path: ${result.openAPISpec.basePath}\n`;
+            if (result.openAPISpec.docType) responseText += `- Type: ${result.openAPISpec.docType}\n`;
+            if (result.openAPISpec.size !== undefined) responseText += `- Size: ${result.openAPISpec.size} bytes\n`;
+          }
+          
+          responseText += `\n**Note:** The full OpenAPI specification has been saved to:\`${result.downloadedFile?.localPath || 'docs/technical/openapi/' + obj.url.replace(/[^a-z0-9]/gi, '-')}.json\`\n\nYou can read this file directly for the complete API documentation without needing to re-extract it.\n`;
+          
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: responseText,
+              },
+            ],
+          };
+        } catch (error) {
+          console.error(`[MCP] Error in get-openapi-spec tool handler:`, error);
+          throw error;
+        }
+      }
+    );
+
+    // Register the list cached documents tool
+    this.server.tool(
+      'list-cached-documents',
+      'List all documents that have been crawled and saved by this MCP server. This includes OpenAPI specifications, technical documentation, and other extracted content. Use this to see what has already been downloaded and avoid re-crawling.',
+      {
+        category: z.union([z.string(), z.literal('all')]).default('all').describe('Filter by category (openapi, technical-md, all)'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: list-cached-documents`);
+        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+        try {
+          let category = 'all'; // default
+          if (typeof args === 'object' && args !== null) {
+            const obj = args as Record<string, unknown>;
+            if (obj.category !== undefined) {
+              category = typeof obj.category === 'string' ? obj.category : 'all';
+            }
+          }
+
+          console.log(`[MCP] Listing cached documents, category: ${category}`);
+
+          // Get OpenAPI specs from cache
+          const openapiSpecs = openAPIExtractor.listCachedOpenAPISpecs();
+          
+          // Filter by category if specified
+          let results = openapiSpecs;
+          if (category !== 'all' && category !== 'openapi') {
+            results = [];
+          }
+
+          console.log(`[MCP] Found ${results.length} cached documents`);
+
+          // Format the result
+          let responseText = `**Cached Documents**\n\n`;
+          responseText += `**Total Cached:** ${results.length}\n`;
+          
+          if (category === 'openapi') {
+            responseText += `**Category:** OpenAPI/Swagger Specifications\n\n`;
+          } else {
+            responseText += `**Category:** All (OpenAPI, Technical Docs)\n\n`;
+          }
+
+          if (results.length === 0) {
+            responseText += `No documents found.\n`;
+          } else {
+            responseText += `\n| # | Title | File Name | Domain | Downloaded |\n`;
+            responseText += `|---|-------|-----------|--------|------------|\n`;
+            
+            results.forEach((spec, idx) => {
+              const title = spec.openAPISpec.title || 'Untitled';
+              const domain = spec.domain;
+              const date = new Date(spec.downloadTime).toLocaleDateString();
+              
+              // Truncate long titles
+              let displayTitle = title;
+              if (displayTitle.length > 40) {
+                displayTitle = title.substring(0, 37) + '...';
+              }
+              
+              responseText += `| ${idx + 1} | ${displayTitle} | ${spec.fileName} | ${domain} | ${date} |\n`;
+            });
+          }
+
+          // Add cache statistics
+          const stats = openAPIExtractor.getCacheStats();
+          responseText += `\n**Cache Statistics:**\n`;
+          responseText += `- Total Entries: ${stats.total}\n`;
+          responseText += `- Valid Entries: ${stats.valid}\n`;
+          if (stats.size !== undefined) {
+            responseText += `- Cache File Size: ${(stats.size / 1024).toFixed(2)} KB\n`;
+          }
+
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: responseText,
+              },
+            ],
+          };
+        } catch (error) {
+          console.error(`[MCP] Error in list-cached-documents tool handler:`, error);
           throw error;
         }
       }
