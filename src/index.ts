@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { SearchEngine } from './search-engine.js';
 import { EnhancedContentExtractor } from './enhanced-content-extractor.js';
 import { WebSearchToolInput, WebSearchToolOutput, SearchResult, GitHubFile, OpenAPIExtractionResult } from './types.js';
+import { ProgressiveSearchEngine } from './progressive-search-engine.js';
 import { isPdfUrl } from './utils.js';
 import { GitHubExtractor } from './github-extractor.js';
 import { openAPIExtractor } from './openapi-extractor.js';
@@ -553,6 +554,129 @@ class WebSearchMCPServer {
           };
         } catch (error) {
           console.error(`[MCP] Error in get-openapi-spec tool handler:`, error);
+          throw error;
+        }
+      }
+    );
+
+    // Register the progressive web search tool (advanced strategy with automatic query expansion)
+    this.server.tool(
+      'progressive-web-search',
+      'Advanced web search with automatic query expansion and multi-stage searching. This tool first tries the exact user query, then progressively expands using synonyms, related terms, and alternative phrasings if good results aren\'t found. Use this for complex research where the exact wording might not match the best sources.',
+      {
+        query: z.string().describe('Search query to execute (uses progressive expansion strategy)'),
+        maxDepth: z.union([z.number(), z.string()]).transform((val) => {
+          const num = typeof val === 'string' ? parseInt(val, 10) : val;
+          if (isNaN(num) || num < 1 || num > 5) {
+            throw new Error('Invalid maxDepth: must be a number between 1 and 5');
+          }
+          return num;
+        }).default(3).describe('Maximum number of expansion stages (1-5, default: 3)'),
+        limit: z.union([z.number(), z.string()]).transform((val) => {
+          const num = typeof val === 'string' ? parseInt(val, 10) : val;
+          if (isNaN(num) || num < 1 || num > 20) {
+            throw new Error('Invalid limit: must be a number between 1 and 20');
+          }
+          return num;
+        }).default(10).describe('Maximum number of results to return (1-20, default: 10)'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: progressive-web-search`);
+        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+        try {
+          // Validate and convert arguments
+          if (typeof args !== 'object' || args === null) {
+            throw new Error('Invalid arguments: args must be an object');
+          }
+          const obj = args as Record<string, unknown>;
+          
+          if (!obj.query || typeof obj.query !== 'string') {
+            throw new Error('Invalid arguments: query is required and must be a string');
+          }
+
+          let maxDepth = 3; // default
+          if (obj.maxDepth !== undefined) {
+            const maxDepthValue = typeof obj.maxDepth === 'string' ? parseInt(obj.maxDepth, 10) : obj.maxDepth;
+            if (typeof maxDepthValue !== 'number' || isNaN(maxDepthValue)) {
+              throw new Error('Invalid maxDepth: must be a number');
+            }
+            maxDepth = maxDepthValue;
+          }
+
+          let limit = 10; // default
+          if (obj.limit !== undefined) {
+            const limitValue = typeof obj.limit === 'string' ? parseInt(obj.limit, 10) : obj.limit;
+            if (typeof limitValue !== 'number' || isNaN(limitValue)) {
+              throw new Error('Invalid limit: must be a number');
+            }
+            limit = limitValue;
+          }
+
+          console.log(`[MCP] Starting progressive web search for: "${obj.query}"`);
+          console.log(`[MCP] Max depth: ${maxDepth}, Limit: ${limit}`);
+
+          // Create progressive search engine instance
+          const progressiveSearch = new ProgressiveSearchEngine([this.searchEngine], {
+            maxDepth,
+            minResultsPerStage: 3,
+            maxTotalResults: limit,
+          });
+
+          // Perform progressive search with options object containing all parameters
+          const results = await progressiveSearch.search(obj.query, {
+            query: obj.query,
+            maxDepth,
+            maxTotalResults: limit,
+          });
+
+          console.log(`[MCP] Progressive search completed, found ${results.length} results`);
+
+          // Format the results as text with stage information
+          let responseText = `**Progressive Web Search Results for: "${obj.query}"**\n\n`;
+          responseText += `**Strategy:** Progressive expansion with automatic query rewriting\n`;
+          responseText += `**Stages Used:** ${results.some(r => r.stage > 1) ? 'Multiple' : 'Single'}\n\n`;
+
+          if (results.length === 0) {
+            responseText += `No results found. The search expanded through multiple strategies but no relevant content was discovered.\n`;
+          } else {
+            results.forEach((result, idx) => {
+              responseText += `**${idx + 1}. ${result.title}**\n`;
+              responseText += `URL: ${result.url}\n`;
+              responseText += `Stage: ${result.stage}\n`;
+              responseText += `Query Used: "${result.queryUsed}"\n`;
+              responseText += `Relevance Score: ${(result.relevanceScore * 100).toFixed(1)}%\n`;
+              responseText += `Description: ${result.description}\n`;
+              
+              if (result.fullContent && result.fullContent.trim()) {
+                let content = result.fullContent;
+                const maxLength = 3000; // Reasonable preview for progressive search
+                if (content.length > maxLength) {
+                  content = content.substring(0, maxLength) + `\n\n[Content truncated at ${maxLength} characters]`;
+                }
+                responseText += `\n**Content Preview:**\n${content}\n`;
+              } else if (result.contentPreview && result.contentPreview.trim()) {
+                let content = result.contentPreview;
+                if (content.length > 1000) {
+                  content = content.substring(0, 1000) + `\n\n[Content truncated at 1000 characters]`;
+                }
+                responseText += `\n**Content Preview:**\n${content}\n`;
+              }
+
+              responseText += `\n---\n\n`;
+            });
+          }
+
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: responseText,
+              },
+            ],
+          };
+        } catch (error) {
+          console.error(`[MCP] Error in progressive-web-search tool handler:`, error);
           throw error;
         }
       }

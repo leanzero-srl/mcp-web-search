@@ -344,7 +344,7 @@ npm run format # Run Prettier
 
 ## MCP Tools
 
-This server provides three specialised tools for different web search needs:
+This server provides four specialised tools for different web search needs:
 
 ### 1. `full-web-search` (Main Tool)
 The most comprehensive web search tool that:
@@ -427,6 +427,49 @@ A specialized tool for extracting content from GitHub repositories:
 - `url`: The URL of the GitHub repository (required)
 - `maxDepth`: Maximum directory depth to crawl (optional, default: from environment or 3)
 - `maxFiles`: Maximum number of files to extract content from (optional, default: from environment or 50)
+
+### 5. `progressive-web-search` (Advanced Strategy with Automatic Expansion)
+An advanced search tool that uses intelligent query expansion strategies to find the best results:
+
+**How It Works:**
+1. **Stage 1 - Literal Search**: Starts with the exact user query in its original form
+2. **Stage 2+ - Semantic Expansion**: If good results aren't found, automatically expands the query using:
+   - Synonym replacement (e.g., "tools" → "software applications", "platforms")
+   - Phrase variations (e.g., "How to X" → "Guide for X", "Tutorial about X")
+   - The semantic enrichment from synonym databases
+3. **Stage 3+ - Topic Deepening**: If still not enough results, searches related topics based on key concepts in the query
+4. **Relevance Scoring**: Each result is scored and sorted by relevance to ensure best results appear first
+
+**Use Cases:**
+- Complex research where the exact wording might not match the best sources
+- Exploratory searches where you're not sure of the exact terminology
+- Finding resources when technical terms have evolved or vary by region
+- Multi-faceted queries that benefit from different phrasings
+
+**Example Usage:**
+```json
+{
+  "name": "progressive-web-search",
+  "arguments": {
+    "query": "best coding tools for beginners",
+    "maxDepth": 3,
+    "limit": 10
+  }
+}
+```
+
+**Parameters:**
+- `query`: The search query to execute (required)
+- `maxDepth`: Maximum number of expansion stages (1-5, default: 3)
+- `limit`: Maximum number of results to return (1-20, default: 10)
+
+**Query Expansion Examples:**
+| Original Query | Expanded Variations |
+|----------------|---------------------|
+| "ai tools" | "artificial intelligence software applications", "machine learning platforms", "best ai tools" |
+| "fix code" | "repair code", "resolve code issues", "correct programming errors" |
+| "create app" | "build application", "develop software", "make mobile app" |
+| "how to learn" | "guide for learning", "tutorial about learning", "learn how to..." |
 
 ## Standalone Usage
 
