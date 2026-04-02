@@ -1,7 +1,32 @@
 #!/usr/bin/env node
 console.log('Web Search MCP Server starting...');
 
+// Import the main McpServer class
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+
+// Define MCP Error types locally (not exported from @modelcontextprotocol/sdk/server/mcp.js)
+enum ERROR_CODES {
+  ConnectionClosed = -32000,
+  RequestTimeout = -32001,
+  ParseError = -32700,
+  InvalidRequest = -32600,
+  MethodNotFound = -32601,
+  InvalidParams = -32602,
+  InternalError = -32603,
+  ResourceExhausted = -32009,
+  Unauthorized = -32008,
+}
+
+class McpError extends Error {
+  readonly code: number;
+  
+  constructor(code: number, message: string) {
+    super(message);
+    this.code = code;
+    this.name = 'McpError';
+  }
+}
+
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { SearchEngine } from './search-engine.js';
@@ -17,6 +42,69 @@ class WebSearchMCPServer {
   private searchEngine: SearchEngine;
   private contentExtractor: EnhancedContentExtractor;
   private githubExtractor?: GitHubExtractor;
+
+  /**
+   * Helper function to convert errors to McpError with proper codes
+   */
+  private handleError(error: unknown, toolName: string): never {
+    console.error(`[MCP] Error in ${toolName}:`, error);
+
+    if (error instanceof McpError) {
+      throw error;
+    }
+
+    if (error instanceof Error) {
+      // Categorize common errors and map to appropriate MCP error codes
+      const message = error.message.toLowerCase();
+
+      if (message.includes('invalid') || message.includes('required')) {
+        throw new McpError(
+          ERROR_CODES.InvalidParams,
+          `Invalid parameters: ${error.message}`
+        );
+      }
+
+      if (message.includes('timeout') || message.includes('timed out')) {
+        throw new McpError(
+          ERROR_CODES.InternalError,
+          `Request timeout: ${error.message}`
+        );
+      }
+
+      if (message.includes('not found') || message.includes('404')) {
+        throw new McpError(
+          ERROR_CODES.InvalidParams,
+          `Resource not found: ${error.message}`
+        );
+      }
+
+      if (message.includes('rate limit') || message.includes('quota')) {
+        throw new McpError(
+          ERROR_CODES.ResourceExhausted,
+          `Rate limit exceeded: ${error.message}`
+        );
+      }
+
+      if (message.includes('unauthorized') || message.includes('401') || message.includes('403')) {
+        throw new McpError(
+          ERROR_CODES.Unauthorized,
+          `Authentication/authorization failed: ${error.message}`
+        );
+      }
+
+      // Default to internal error for unknown issues
+      throw new McpError(
+        ERROR_CODES.InternalError,
+        `Internal server error: ${error.message}`
+      );
+    }
+
+    // Fallback for non-Error objects
+    throw new McpError(
+      ERROR_CODES.InternalError,
+      `Unknown error occurred`
+    );
+  }
 
   constructor() {
     this.server = new McpServer({
@@ -161,8 +249,7 @@ class WebSearchMCPServer {
             ],
           };
         } catch (error) {
-          console.error(`[MCP] Error in tool handler:`, error);
-          throw error;
+          this.handleError(error, 'full-web-search');
         }
       }
     );
@@ -254,8 +341,7 @@ class WebSearchMCPServer {
             }
           }
         } catch (error) {
-          console.error(`[MCP] Error in get-web-search-summaries tool handler:`, error);
-          throw error;
+          this.handleError(error, 'get-web-search-summaries');
         }
       }
     );
@@ -338,8 +424,7 @@ class WebSearchMCPServer {
             ],
           };
         } catch (error) {
-          console.error(`[MCP] Error in get-single-web-page-content tool handler:`, error);
-          throw error;
+          this.handleError(error, 'get-single-web-page-content');
         }
       }
     );
@@ -459,8 +544,7 @@ class WebSearchMCPServer {
             ],
           };
         } catch (error) {
-          console.error(`[MCP] Error in get-github-repo-content tool handler:`, error);
-          throw error;
+          this.handleError(error, 'get-github-repo-content');
         }
       }
     );
@@ -553,8 +637,7 @@ class WebSearchMCPServer {
             ],
           };
         } catch (error) {
-          console.error(`[MCP] Error in get-openapi-spec tool handler:`, error);
-          throw error;
+          this.handleError(error, 'get-openapi-spec');
         }
       }
     );
@@ -676,8 +759,7 @@ class WebSearchMCPServer {
             ],
           };
         } catch (error) {
-          console.error(`[MCP] Error in progressive-web-search tool handler:`, error);
-          throw error;
+          this.handleError(error, 'progressive-web-search');
         }
       }
     );
@@ -764,8 +846,7 @@ class WebSearchMCPServer {
             ],
           };
         } catch (error) {
-          console.error(`[MCP] Error in list-cached-documents tool handler:`, error);
-          throw error;
+          this.handleError(error, 'list-cached-documents');
         }
       }
     );
@@ -871,8 +952,15 @@ class WebSearchMCPServer {
         status: combinedStatus,
       };
     } catch (error) {
-      console.error('Web search error:', error);
-      throw new Error(`Web search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      // Re-throw McpError directly, otherwise convert to internal error
+      if (error instanceof McpError) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : 'Unknown web search error';
+      throw new McpError(
+        ERROR_CODES.InternalError,
+        `Web search failed: ${message}`
+      );
     }
   }
 
