@@ -1,5 +1,18 @@
 #!/usr/bin/env node
-console.log('Web Search MCP Server starting...');
+
+// Redirect both console.log and console.error to stderr to prevent corruption of MCP protocol over stdout
+const originalConsoleLog = console.log;
+const originalConsoleError = console.error;
+
+console.log = (...args) => {
+  const message = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+  process.stderr.write(`[LOG] ${message}\n`);
+};
+
+console.error = (...args) => {
+  const message = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+  process.stderr.write(`[ERROR] ${message}\n`);
+};
 
 // Import the main McpServer class
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -327,52 +340,40 @@ class WebSearchMCPServer {
 
           console.log(`[MCP] Starting web search summaries...`);
           
-          try {
-            // Use existing search engine to get results with snippets
-            const searchResponse = await this.searchEngine.search({
-              query: obj.query,
-              numResults: limit,
-            });
+          // Use existing search engine to get results with snippets
+          const searchResponse = await this.searchEngine.search({
+            query: obj.query,
+            numResults: limit,
+          });
 
-            // const searchTime = Date.now() - startTime; // Unused for now
+          // Convert to summary format (no content extraction)
+          const summaryResults = searchResponse.results.map(item => ({
+            title: item.title,
+            url: item.url,
+            description: item.description,
+            timestamp: item.timestamp,
+          }));
 
-            // Convert to summary format (no content extraction)
-            const summaryResults = searchResponse.results.map(item => ({
-              title: item.title,
-              url: item.url,
-              description: item.description,
-              timestamp: item.timestamp,
-            }));
+          console.log(`[MCP] Search summaries completed, found ${summaryResults.length} results`);
+          
+          // Format the results as text
+          let responseText = `Search summaries for "${obj.query}" with ${summaryResults.length} results:\n\n`;
+          
+          summaryResults.forEach((summary, i) => {
+            responseText += `**${i + 1}. ${summary.title}**\n`;
+            responseText += `URL: ${summary.url}\n`;
+            responseText += `Description: ${summary.description}\n`;
+            responseText += `\n---\n\n`;
+          });
 
-            console.log(`[MCP] Search summaries completed, found ${summaryResults.length} results`);
-            
-            // Format the results as text
-            let responseText = `Search summaries for "${obj.query}" with ${summaryResults.length} results:\n\n`;
-            
-            summaryResults.forEach((summary, i) => {
-              responseText += `**${i + 1}. ${summary.title}**\n`;
-              responseText += `URL: ${summary.url}\n`;
-              responseText += `Description: ${summary.description}\n`;
-              responseText += `\n---\n\n`;
-            });
-
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: responseText,
-                },
-              ],
-            };
-          } finally {
-            // Ensure browsers are cleaned up after search-only operations
-            // This prevents EventEmitter memory leaks when browsers accumulate listeners
-            try {
-              await this.searchEngine.closeAll();
-            } catch (cleanupError) {
-              console.error(`[MCP] Error during browser cleanup:`, cleanupError);
-            }
-          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: responseText,
+              },
+            ],
+          };
         } catch (error) {
           this.handleError(error, 'get-web-search-summaries');
         }

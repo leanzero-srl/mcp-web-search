@@ -39,7 +39,7 @@ export async function createOptimizedBrowser(
 ): Promise<Browser> {
   const effectiveOptions = { ...DEFAULT_ENGINE_OPTIONS, ...options };
   
-  console.log(`[BrowserEngine] Launching browser with engine: ${effectiveOptions.engineType}, headless mode: ${effectiveOptions.headlessMode}`);
+  console.error(`[BrowserEngine] Launching browser with engine: ${effectiveOptions.engineType}, headless mode: ${effectiveOptions.headlessMode}`);
   
   // Build launch options based on browser type and headless mode
   // Use default 'new' if undefined to avoid TS error
@@ -59,17 +59,17 @@ export async function createOptimizedBrowser(
   try {
     switch (effectiveOptions.engineType) {
       case 'webkit':
-        console.log('[BrowserEngine] Using WebKit engine for optimal speed');
+        console.error('[BrowserEngine] Using WebKit engine for optimal speed');
         browser = await webkit.launch(launchOptions);
         break;
         
       case 'chromium':
-        console.log('[BrowserEngine] Using Chromium engine with new headless mode');
+        console.error('[BrowserEngine] Using Chromium engine with new headless mode');
         browser = await chromium.launch(launchOptions);
         break;
         
       case 'firefox':
-        console.log('[BrowserEngine] Using Firefox engine as fallback');
+        console.error('[BrowserEngine] Using Firefox engine as fallback');
         browser = await firefox.launch(launchOptions);
         break;
         
@@ -78,18 +78,18 @@ export async function createOptimizedBrowser(
         browser = await webkit.launch(launchOptions);
     }
     
-    console.log(`[BrowserEngine] Browser launched successfully, connected: ${browser.isConnected()}`);
+      console.log(`[BrowserEngine] Browser launched successfully, connected: ${browser.isConnected()}`); // Intentionally using log for success to stderr via redirect
     return browser;
   } catch (error) {
-    console.error(`[BrowserEngine] Failed to launch ${effectiveOptions.engineType} browser:`, error);
+    console.log(`[BrowserEngine] Failed to launch ${effectiveOptions.engineType} browser:`, error); // Intentionally using log for errors to stderr via redirect
     
     // Try fallback engines if primary fails
     if (effectiveOptions.engineType === 'webkit') {
-      console.log('[BrowserEngine] Fallback: Trying Chromium...');
+      console.log('[BrowserEngine] Fallback: Trying Chromium...'); // Intentionally using log for debug
       try {
         return await chromium.launch(launchOptions);
       } catch {
-        console.log('[BrowserEngine] Chromium also failed, trying Firefox...');
+        console.log('[BrowserEngine] Chromium also failed, trying Firefox...'); // Intentionally using log for debug
         return await firefox.launch(launchOptions);
       }
     }
