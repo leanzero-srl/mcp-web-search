@@ -25,6 +25,163 @@ The original implementation was slow due to sequential search engine attempts an
 - Context reuse: ~50x faster than fresh browser launches
 - Single page tool reliability: Significantly improved with quality validation
 
+## Observability & Production Readiness (New)
+
+This fork now includes comprehensive observability and production-ready features:
+
+### 1. Structured Audit Logging
+All tool calls, successes, failures, and errors are logged in structured JSON format for:
+- Full audit trail of all API interactions
+- Debugging and troubleshooting with complete context
+- Sensitive data redaction (API keys, tokens, passwords)
+
+**Log Format:**
+```json
+{
+  "timestamp": "2025-04-03T10:00:00.000Z",
+  "level": "info|error",
+  "event": "tool_call|tool_success|tool_error",
+  "tool": "full-web-search",
+  "query": "search query",
+  "duration_ms": 1250,
+  "num_results_returned": 5,
+  "content_length": 45230
+}
+```
+
+### 2. Telemetry & Metrics Collection
+Real-time metrics tracking for monitoring and alerting:
+- Tool call success/failure rates
+- Search engine performance (latency, success rate per engine)
+- Average content extraction times
+
+**Example Metrics:**
+```
+=== MCP Web Search Telemetry Summary ===
+Total Tool Calls: 150
+Successful: 142 (94%)
+Failed: 8
+Average Search Time: 3.2s
+
+Search Engine Stats:
+  bing: 65 calls (97% success)
+  brave: 50 calls (92% success)
+  duckduckgo: 35 calls (86% success)
+```
+
+### 3. Enhanced Error Handling
+Comprehensive error taxonomy with proper JSON-RPC 2.0 codes:
+- **ParseError** (-32700): Invalid JSON received
+- **InvalidRequest** (-32600): Invalid request object
+- **InvalidParams** (-32602): Invalid method parameters
+- **InternalError** (-32603): Internal server error
+- **ResourceNotFound** (-32002): Resource not found (MCP spec)
+- **RequestTimeout** (-32001): Request timeout
+- **RateLimitExceeded** (-32009): Rate limit exceeded
+
+### 4. Production Features
+- Automatic browser cleanup after each operation
+- Graceful shutdown handling for SIGINT/SIGTERM
+- Memory leak prevention with context pooling
+- HTTP/2 to HTTP/1.1 fallback for protocol errors
+
+## Enterprise Guardrails (New)
+
+This fork now includes comprehensive security and enterprise-ready features:
+
+### 1. Per-Session Rate Limiting
+Track and limit requests per client session/user:
+- Configurable limits per session (default: 30 requests/minute)
+- Automatic reset after configurable time window
+- Session state tracking with blocking on exceeded limits
+
+**Environment Variables:**
+- `MAX_REQUESTS_PER_MINUTE`: Maximum requests per minute per session (default: 30)
+
+### 2. Input Validation & Sanitization
+Validate all tool arguments before processing:
+- Query length validation (max 1000 characters default)
+- URL format validation
+- Parameter type checking and coercion
+- Allowed argument whitelist per tool
+
+**Validated Fields:**
+- `query`: Must be non-empty string, max length
+- `limit`: Must be number/string between 1-20
+- `includeContent`: Boolean or boolean-like strings
+- `url`: Must start with http:// or https://
+
+### 3. Output Length Limiting
+Prevent token overflow by limiting output size:
+- Configurable maximum content length (default: 50000 characters)
+- Automatic truncation with clear indicators
+- Graceful degradation for large responses
+
+**Environment Variables:**
+- `MAX_OUTPUT_LENGTH`: Maximum output content length in characters (default: 50000)
+
+### 4. Global Request Throttling
+Prevent server overload from too many concurrent requests:
+- Configurable max requests per second (default: 10)
+- Automatic rejection when limit exceeded
+- Queue-based processing to smooth traffic spikes
+
+**Environment Variables:**
+- `MAX_REQUESTS_PER_SECOND`: Maximum global requests per second (default: 10)
+
+### 5. Session Management
+Manage client sessions efficiently:
+- Session state tracking with automatic cleanup
+- Session count monitoring for debugging
+- Clear all sessions for testing/reset scenarios
+
+## Intelligence Expansion (New - Phase 3)
+
+This fork now includes advanced intelligence features:
+
+### 1. PDF Extractor Module (`src/pdf-extractor.ts`)
+High-fidelity PDF content extraction using multiple strategies:
+- **HTTP-based extraction**: Direct download with text extraction (fast)
+- **Browser-based rendering**: Fallback for complex PDFs
+- **Multiple fallback mechanisms**: Ensures reliability even for problematic sources
+
+**Features:**
+- Extracts text from PDF files with quality validation
+- Automatic fallback between HTTP and browser methods
+- Configurable timeout and content length limits
+- Integration with existing audit logging and telemetry
+
+**Usage Example:**
+```typescript
+import { pdfExtractor } from './pdf-extractor.js';
+
+const result = await pdfExtractor.extractPdfContent('https://example.com/document.pdf');
+console.log(result.text);
+```
+
+### 2. Semantic Cache Layer (`src/semantic-cache.ts`)
+Intelligent caching with semantic similarity matching:
+- **Query meaning matching**: Cache results by query semantic meaning, not just exact match
+- **Automatic cache invalidation**: Based on freshness requirements (configurable TTL)
+- **Memory-efficient storage**: Configurable limits with automatic eviction of oldest entries
+
+**Features:**
+- Fuzzy term matching for similar queries (~70% overlap threshold)
+- Automatic TTL-based expiration (default: 1 hour)
+- LRU-style eviction when cache is full
+- Audit logging for cache hits/misses
+
+**Environment Variables:**
+- `SEMANTIC_CACHE_MAX_SIZE`: Maximum number of cached entries (default: 1000)
+- `SEMANTIC_CACHE_TTL`: Cache TTL in milliseconds (default: 3600000 = 1 hour)
+
+### 3. Enhanced Tool Integration
+All Phase 3 modules are fully integrated with:
+- Existing audit logging system
+- Telemetry collection for performance monitoring
+- Enterprise guardrails (rate limiting, input validation)
+- Graceful error handling and recovery
+
 ## Features
 
 ### Web Search Features
@@ -174,6 +331,18 @@ The server supports several environment variables for configuration:
 ### Performance Tuning
 - **`BROWSER_FALLBACK_THRESHOLD`**: Number of axios failures before using browser fallback (default: 3)
 - **`DEBUG_BROWSER_LIFECYCLE`**: Enable detailed browser lifecycle logging for debugging (default: false)
+
+### Observability Configuration
+- **`DEBUG_AUDIT`**: Enable structured audit logging to stderr (set to `true` to enable). When enabled, all tool calls and errors are logged in JSON format to stderr for debugging and monitoring.
+
+### Enterprise Guardrails Configuration
+- **`MAX_REQUESTS_PER_MINUTE`**: Maximum requests per minute per session (default: 30)
+- **`MAX_OUTPUT_LENGTH`**: Maximum output content length in characters (default: 50000)
+- **`MAX_REQUESTS_PER_SECOND`**: Maximum global requests per second (default: 10)
+
+### Intelligence Expansion Configuration
+- **`SEMANTIC_CACHE_MAX_SIZE`**: Maximum number of cached entries (default: 1000)
+- **`SEMANTIC_CACHE_TTL`**: Cache TTL in milliseconds (default: 3600000 = 1 hour)
 
 ## Performance Optimisations
 
@@ -493,3 +662,69 @@ This is an open source project and we welcome feedback! If you encounter any iss
 
 - Open an issue on GitHub
 - Submit a pull request
+### 6. `get-pdf-content` (PDF Extraction)
+Extract and return text content from a PDF document:
+
+**Features:**
+- HTTP-based extraction for fast, direct downloads
+- Browser fallback for complex PDFs that need rendering
+- Automatic quality validation before returning results
+
+**Use Cases:**
+- Extracting text from research papers (PDF format)
+- Reading documentation that's only available as PDF
+- Getting content from academic sources and technical reports
+
+**Example Usage:**
+```json
+{
+  "name": "get-pdf-content",
+  "arguments": {
+    "url": "https://arxiv.org/pdf/2305.12345.pdf",
+    "maxContentLength": 5000
+  }
+}
+```
+
+**Parameters:**
+- `url`: The URL of the PDF file to extract content from (required)
+- `maxContentLength`: Maximum characters for extracted content (optional, default: no limit)
+
+### 7. `cached-web-search` (Intelligent Caching)
+Search the web using intelligent semantic caching:
+
+**Features:**
+- Checks if similar queries have been recently searched
+- Returns cached results when available (saves time and resources)
+- Fallback to fresh search with automatic cache population
+
+**Use Cases:**
+- Repeated or related queries (cache hit saves API calls)
+- Reducing latency for frequently accessed information
+- Lowering resource usage during development/testing
+
+**Example Usage:**
+```json
+{
+  "name": "cached-web-search",
+  "arguments": {
+    "query": "TypeScript MCP server",
+    "limit": 5,
+    "includeContent": true
+  }
+}
+```
+
+**Parameters:**
+- `query`: The search query to execute (required)
+- `limit`: Maximum number of results (1-10, default: 5)
+- `includeContent`: Whether to fetch full page content (default: true)
+- `maxContentLength`: Maximum characters per result (optional)
+
+## Standalone Usage
+
+You can also run the server directly:
+```bash
+# If running from source
+npm start
+```

@@ -37,11 +37,44 @@ import { isPdfUrl } from './utils.js';
 import { GitHubExtractor } from './github-extractor.js';
 import { openAPIExtractor } from './openapi-extractor.js';
 
+// ============================================================================
+// Import Phase 3 modules (Intelligence Expansion)
+// ============================================================================
+
+import { PdfExtractor, pdfExtractor } from './pdf-extractor.js';
+import { semanticCache } from './semantic-cache.js';
+
+// ============================================================================
+// Import observability module
+// ============================================================================
+
+import { auditLogger, telemetryCollector } from './observability.js';
+
+// ============================================================================
+// Import enterprise guardrails module
+// ============================================================================
+
+import {
+  sessionRateLimiter,
+  inputValidator,
+  outputLimiter,
+  globalThrottler,
+} from './enterprise-guardrails.js';
+
 class WebSearchMCPServer {
   private server: McpServer;
   private searchEngine: SearchEngine;
   private contentExtractor: EnhancedContentExtractor;
   private githubExtractor?: GitHubExtractor;
+
+  /**
+   * Generate a session ID for tracking rate limits
+   */
+  private generateSessionId(args: unknown): string {
+    // Use a simple hash of client info or timestamp for session identification
+    const clientId = process.env.CLIENT_ID || 'default';
+    return `${clientId}-${Date.now()}`;
+  }
 
   /**
    * Helper function to convert errors to McpError with proper codes
@@ -764,6 +797,263 @@ class WebSearchMCPServer {
       }
     );
 
+    // Register the get-pdf-content tool (PDF extraction using multiple strategies)
+    this.server.tool(
+      'get-pdf-content',
+      'Extract and return text content from a PDF document. This tool uses HTTP-based extraction with browser fallback for complex PDFs. Use this when you need to extract readable text from PDF files found during web research.',
+      {
+        url: z.string().url().describe('The URL of the PDF file to extract content from'),
+        maxContentLength: z.union([z.number(), z.string()]).transform((val) => {
+          const num = typeof val === 'string' ? parseInt(val, 10) : val;
+          if (isNaN(num) || num < 0) {
+            throw new Error('Invalid maxContentLength: must be a non-negative number');
+          }
+          return num;
+        }).optional().describe('Maximum characters for the extracted content (0 = no limit).'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: get-pdf-content`);
+        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+        try {
+          // Validate arguments
+          if (typeof args !== 'object' || args === null) {
+            throw new Error('Invalid arguments: args must be an object');
+          }
+          const obj = args as Record<string, unknown>;
+          
+          if (!obj.url || typeof obj.url !== 'string') {
+            throw new Error('Invalid arguments: url is required and must be a string');
+          }
+
+          let maxContentLength: number | undefined;
+          if (obj.maxContentLength !== undefined) {
+            const maxLengthValue = typeof obj.maxContentLength === 'string' ? parseInt(obj.maxContentLength, 10) : obj.maxContentLength;
+            if (typeof maxLengthValue !== 'number' || isNaN(maxLengthValue) || maxLengthValue < 0) {
+              throw new Error('Invalid maxContentLength: must be a non-negative number');
+            }
+            maxContentLength = maxLengthValue === 0 ? undefined : maxLengthValue;
+          }
+
+          console.log(`[MCP] Starting PDF content extraction from: ${obj.url}`);
+          
+          // Use the PDF extractor to get document content
+          const result = await pdfExtractor.extractPdfContent(obj.url, {
+            maxContentLength,
+          });
+
+          console.log(`[MCP] PDF extraction completed: method=${result.extractionMethod}, length=${result.text.length}`);
+
+          // Truncate if needed
+          let textContent = pdfExtractor.truncateText(result.text, maxContentLength);
+
+          // Format the result as text
+          let responseText = `**PDF Content from: ${obj.url}**\n\n`;
+          responseText += `**Extraction Method:** ${result.extractionMethod}\n`;
+          if (result.pageCount !== undefined) {
+            responseText += `**Pages:** ${result.pageCount}\n`;
+          }
+          if (result.fileSize !== undefined) {
+            responseText += `**File Size:** ${result.fileSize} bytes\n`;
+          }
+          responseText += `\n**Content Preview:**\n${textContent}`;
+
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: responseText,
+              },
+            ],
+          };
+        } catch (error) {
+          this.handleError(error, 'get-pdf-content');
+        }
+      }
+    );
+
+    // Register the cached-web-search tool (search with semantic caching)
+    this.server.tool(
+      'cached-web-search',
+      'Search the web using intelligent caching. This tool first checks if similar queries have been recently searched and returns cached results when available. Use this for repeated or related queries to save time and reduce API calls.',
+      {
+        query: z.string().describe('Search query to execute (uses semantic cache)'),
+        limit: z.union([z.number(), z.string()]).transform((val) => {
+          const num = typeof val === 'string' ? parseInt(val, 10) : val;
+          if (isNaN(num) || num < 1 || num > 10) {
+            throw new Error('Invalid limit: must be a number between 1 and 10');
+          }
+          return num;
+        }).default(5).describe('Number of results to return with full content (1-10)'),
+        includeContent: z.union([z.boolean(), z.string()]).transform((val) => {
+          if (typeof val === 'string') {
+            return val.toLowerCase() === 'true';
+          }
+          return Boolean(val);
+        }).default(true).describe('Whether to fetch full page content (default: true)'),
+        maxContentLength: z.union([z.number(), z.string()]).transform((val) => {
+          const num = typeof val === 'string' ? parseInt(val, 10) : val;
+          if (isNaN(num) || num < 0) {
+            throw new Error('Invalid maxContentLength: must be a non-negative number');
+          }
+          return num;
+        }).optional().describe('Maximum characters per result content (0 = no limit).'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: cached-web-search`);
+        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+        try {
+          // Validate and convert arguments
+          if (typeof args !== 'object' || args === null) {
+            throw new Error('Invalid arguments: args must be an object');
+          }
+          const obj = args as Record<string, unknown>;
+          
+          if (!obj.query || typeof obj.query !== 'string') {
+            throw new Error('Invalid arguments: query is required and must be a string');
+          }
+
+          let limit = 5; // default
+          if (obj.limit !== undefined) {
+            const limitValue = typeof obj.limit === 'string' ? parseInt(obj.limit, 10) : obj.limit;
+            if (typeof limitValue !== 'number' || isNaN(limitValue) || limitValue < 1 || limitValue > 10) {
+              throw new Error('Invalid limit: must be a number between 1 and 10');
+            }
+            limit = limitValue;
+          }
+
+          let includeContent = true; // default
+          if (obj.includeContent !== undefined) {
+            if (typeof obj.includeContent === 'string') {
+              includeContent = obj.includeContent.toLowerCase() === 'true';
+            } else {
+              includeContent = Boolean(obj.includeContent);
+            }
+          }
+
+          let maxContentLength: number | undefined;
+          if (obj.maxContentLength !== undefined) {
+            const maxLengthValue = typeof obj.maxContentLength === 'string' ? parseInt(obj.maxContentLength, 10) : obj.maxContentLength;
+            if (typeof maxLengthValue !== 'number' || isNaN(maxLengthValue) || maxLengthValue < 0) {
+              throw new Error('Invalid maxContentLength: must be a non-negative number');
+            }
+            maxContentLength = maxLengthValue === 0 ? undefined : maxLengthValue;
+          }
+
+          const query = obj.query;
+
+          console.log(`[MCP] Checking semantic cache for: "${query}"`);
+
+          // Check if we have cached results for this query
+          const cachedEntry = semanticCache.get(query);
+          
+          if (cachedEntry) {
+            console.log(`[MCP] Cache HIT for: "${query}"`);
+            
+            // Format cached results as text
+            let responseText = `**Cached Results for: "${query}"**\n\n`;
+            responseText += `**Cache Hit:** Yes - returned from cache\n`;
+            responseText += `**Query Meaning Match:** Found similar query in cache\n\n`;
+
+            if (Array.isArray(cachedEntry.results)) {
+              cachedEntry.results.slice(0, limit).forEach((result: SearchResult, idx) => {
+                responseText += `**${idx + 1}. ${result.title}**\n`;
+                responseText += `URL: ${result.url}\n`;
+                responseText += `Description: ${result.description}\n`;
+                
+                if (includeContent && result.fullContent) {
+                  let content = result.fullContent;
+                  if (maxContentLength && maxContentLength > 0 && content.length > maxContentLength) {
+                    content = content.substring(0, maxContentLength) + `\n\n[Content truncated at ${maxContentLength} characters]`;
+                  }
+                  responseText += `\n**Full Content:**\n${content}\n`;
+                }
+                
+                responseText += `\n---\n\n`;
+              });
+            } else {
+              responseText += `No results found in cache.\n`;
+            }
+
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: responseText,
+                },
+              ],
+            };
+          }
+
+          console.log(`[MCP] Cache MISS for: "${query}" - performing fresh search`);
+
+          // Perform the actual web search
+          const searchResponse = await this.searchEngine.search({
+            query,
+            numResults: limit * 2 + 2, // Request extra to account for PDFs
+          });
+
+          const searchResults = searchResponse.results;
+
+          console.log(`[MCP] Search completed, found ${searchResults.length} results`);
+
+          // Extract content from each result if requested
+          let enhancedResults: SearchResult[] = [];
+          if (includeContent) {
+            enhancedResults = await this.contentExtractor.extractContentForResults(searchResults.slice(0, limit), limit);
+          } else {
+            enhancedResults = searchResults.slice(0, limit);
+          }
+
+          // Store results in cache for future similar queries
+          semanticCache.set(query, enhancedResults);
+
+          console.log(`[MCP] Results cached for: "${query}"`);
+
+          // Format the results as text
+          let responseText = `**Search Results for: "${query}"**\n\n`;
+          responseText += `**Cache Hit:** No - performed fresh search\n`;
+          responseText += `**Results Cached:** Yes\n\n`;
+
+          enhancedResults.forEach((searchResult, idx) => {
+            responseText += `**${idx + 1}. ${searchResult.title}**\n`;
+            responseText += `URL: ${searchResult.url}\n`;
+            responseText += `Description: ${searchResult.description}\n`;
+            
+            if (includeContent && searchResult.fullContent) {
+              let content = searchResult.fullContent;
+              if (maxContentLength && maxContentLength > 0 && content.length > maxContentLength) {
+                content = content.substring(0, maxContentLength) + `\n\n[Content truncated at ${maxContentLength} characters]`;
+              }
+              responseText += `\n**Full Content:**\n${content}\n`;
+            } else if (searchResult.contentPreview && searchResult.contentPreview.trim()) {
+              let content = searchResult.contentPreview;
+              if (maxContentLength && maxContentLength > 0 && content.length > maxContentLength) {
+                content = content.substring(0, maxContentLength) + `\n\n[Content truncated at ${maxContentLength} characters]`;
+              }
+              responseText += `\n**Content Preview:**\n${content}\n`;
+            } else if (searchResult.fetchStatus === 'error') {
+              responseText += `\n**Content Extraction Failed:** ${searchResult.error}\n`;
+            }
+            
+            responseText += `\n---\n\n`;
+          });
+
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: responseText,
+              },
+            ],
+          };
+        } catch (error) {
+          this.handleError(error, 'cached-web-search');
+        }
+      }
+    );
+
     // Register the list cached documents tool
     this.server.tool(
       'list-cached-documents',
@@ -901,6 +1191,9 @@ class WebSearchMCPServer {
     
     console.error(`[web-search-mcp] DEBUG: handleWebSearch called with limit=${limit}, includeContent=${includeContent}`);
 
+    // Store search engine name for use in catch block
+    let searchEngineName: string | undefined;
+
     try {
       // Request extra search results to account for potential PDF files that will be skipped
       // Request up to 2x the limit or at least 5 extra results, capped at 10 (Google's max)
@@ -913,6 +1206,9 @@ class WebSearchMCPServer {
         query,
         numResults: searchLimit,
       });
+      
+      // Store engine name for use in catch block
+      searchEngineName = searchResponse.engine;
       const searchResults = searchResponse.results;
       
       // Log search summary
@@ -944,6 +1240,17 @@ class WebSearchMCPServer {
 
       const searchTime = Date.now() - startTime;
 
+      // Record telemetry for successful search
+      telemetryCollector.recordSearchSuccess(searchResponse.engine, searchTime);
+
+      // Log success with structured audit
+      auditLogger.logToolSuccess(
+        'full-web-search',
+        searchTime,
+        enhancedResults.length,
+        enhancedResults.reduce((sum, r) => sum + (r.fullContent?.length || 0), 0)
+      );
+
       return {
         results: enhancedResults,
         total_results: enhancedResults.length,
@@ -954,9 +1261,12 @@ class WebSearchMCPServer {
     } catch (error) {
       // Re-throw McpError directly, otherwise convert to internal error
       if (error instanceof McpError) {
+        auditLogger.logToolError('full-web-search', error.code, error.message, 'McpError');
         throw error;
       }
       const message = error instanceof Error ? error.message : 'Unknown web search error';
+      telemetryCollector.recordSearchFailure(searchEngineName || 'unknown', Date.now() - startTime);
+      auditLogger.logToolError('full-web-search', ERROR_CODES.InternalError, `Web search failed: ${message}`, 'Internal');
       throw new McpError(
         ERROR_CODES.InternalError,
         `Web search failed: ${message}`
