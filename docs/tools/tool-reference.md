@@ -1,0 +1,468 @@
+# MCP Tool Reference
+
+Complete documentation for all available MCP tools in the Web Search server.
+
+---
+
+## Overview
+
+The server provides **8 specialized tools** for different use cases:
+
+| Tool | Type | Use When |
+|------|------|----------|
+| `full-web-search` | Primary | Comprehensive research with full content |
+| `get-web-search-summaries` | Lightweight | Quick search without content extraction |
+| `get-single-web-page-content` | Utility | Extract from known URL |
+| `progressive-web-search` | Advanced | Complex research with query expansion |
+| `cached-web-search` | Intelligent | Repeated or related queries |
+| `get-github-repo-content` | Repository | Analyze GitHub projects |
+| `get-pdf-content` | Document | Extract text from PDFs |
+| `get-openapi-spec` | API Docs | Download OpenAPI specifications |
+
+---
+
+## Tool Details
+
+### 1. full-web-search
+
+**Primary tool for comprehensive web research**
+
+**Description**: Search the web and fetch complete page content from top results. This is the most comprehensive web search tool that searches the web and then follows the resulting links to extract their full page content.
+
+**When to Use**:
+- You need detailed information with full page content
+- Searching for complex topics requiring deep analysis
+- You want to verify information across multiple sources
+
+**Input Schema**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "Search query to execute (required)"
+    },
+    "limit": {
+      "type": "number",
+      "default": 5,
+      "minimum": 1,
+      "maximum": 10
+    },
+    "includeContent": {
+      "type": "boolean",
+      "default": true
+    },
+    "maxContentLength": {
+      "type": "number",
+      "optional": true
+    }
+  },
+  "required": ["query"]
+}
+```
+
+**Example Usage**:
+```json
+{
+  "name": "full-web-search",
+  "arguments": {
+    "query": "TypeScript MCP server implementation guide",
+    "limit": 5,
+    "includeContent": true
+  }
+}
+```
+
+---
+
+### 2. get-web-search-summaries
+
+**Lightweight alternative for quick search results**
+
+**Description**: Search the web and return only search result snippets/descriptions without following links to extract full page content.
+
+**When to Use**:
+- You need quick search results
+- Content extraction is not required
+- You want to save time and resources
+
+**Input Schema**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "Search query to execute (required)"
+    },
+    "limit": {
+      "type": "number",
+      "default": 5,
+      "minimum": 1,
+      "maximum": 10
+    }
+  },
+  "required": ["query"]
+}
+```
+
+**Example Usage**:
+```json
+{
+  "name": "get-web-search-summaries",
+  "arguments": {
+    "query": "latest JavaScript frameworks 2026",
+    "limit": 3
+  }
+}
+```
+
+---
+
+### 3. get-single-web-page-content
+
+**Extract content from a specific URL**
+
+**Description**: Extract and return the full content from a single web page URL. Useful for getting detailed content from a known webpage without performing a search.
+
+**When to Use**:
+- You have a specific URL to extract
+- Content from one known source is needed
+- Quick extraction without search overhead
+
+**Input Schema**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "The URL of the web page (required)"
+    },
+    "maxContentLength": {
+      "type": "number",
+      "optional": true
+    }
+  },
+  "required": ["url"]
+}
+```
+
+**Example Usage**:
+```json
+{
+  "name": "get-single-web-page-content",
+  "arguments": {
+    "url": "https://developer.mozilla.org/docs/Web/API",
+    "maxContentLength": 5000
+  }
+}
+```
+
+---
+
+### 4. progressive-web-search
+
+**Advanced search with automatic query expansion**
+
+**Description**: Advanced web search that first tries the exact user query, then progressively expands using synonyms, related terms, and alternative phrasings if good results aren't found.
+
+**When to Use**:
+- Complex research where exact wording may not match best sources
+- Exploratory searches with不确定 terminology
+- Multi-faceted queries needing different phrasings
+
+**Input Schema**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "Search query to execute (required)"
+    },
+    "maxDepth": {
+      "type": "number",
+      "default": 3,
+      "minimum": 1,
+      "maximum": 5
+    },
+    "limit": {
+      "type": "number",
+      "default": 10,
+      "minimum": 1,
+      "maximum": 20
+    }
+  },
+  "required": ["query"]
+}
+```
+
+**Example Usage**:
+```json
+{
+  "name": "progressive-web-search",
+  "arguments": {
+    "query": "best coding tools for beginners",
+    "maxDepth": 3,
+    "limit": 10
+  }
+}
+```
+
+**How It Works**:
+1. **Stage 1**: Literal search with original query
+2. **Stage 2+**: Semantic expansion (synonyms, related terms)
+3. **Stage 3+**: Topic deepening (related concepts)
+4. Results are scored and sorted by relevance
+
+---
+
+### 5. cached-web-search
+
+**Search with intelligent semantic caching**
+
+**Description**: Search the web using intelligent caching that checks if similar queries have been recently searched and returns cached results when available.
+
+**When to Use**:
+- Repeated or related queries (saves API calls)
+- Reducing latency for frequently accessed information
+- Development/testing to save resources
+
+**Input Schema**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "Search query to execute (required)"
+    },
+    "limit": {
+      "type": "number",
+      "default": 5,
+      "minimum": 1,
+      "maximum": 10
+    },
+    "includeContent": {
+      "type": "boolean",
+      "default": true
+    },
+    "maxContentLength": {
+      "type": "number",
+      "optional": true
+    }
+  },
+  "required": ["query"]
+}
+```
+
+**Example Usage**:
+```json
+{
+  "name": "cached-web-search",
+  "arguments": {
+    "query": "TypeScript MCP server",
+    "limit": 5,
+    "includeContent": true
+  }
+}
+```
+
+---
+
+### 6. get-github-repo-content
+
+**Crawl GitHub repository structure**
+
+**Description**: Extract and return content from a GitHub repository including README.md and code files (.js, .ts, .py, etc.).
+
+**When to Use**:
+- Understanding project structure of a GitHub repo
+- Analyzing codebase contents
+- Getting README documentation
+
+**Input Schema**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "GitHub repository URL (required)"
+    },
+    "maxDepth": {
+      "type": "number",
+      "default": 3,
+      "optional": true
+    },
+    "maxFiles": {
+      "type": "number",
+      "default": 50,
+      "optional": true
+    }
+  },
+  "required": ["url"]
+}
+```
+
+**Example Usage**:
+```json
+{
+  "name": "get-github-repo-content",
+  "arguments": {
+    "url": "https://github.com/microsoft/TypeScript",
+    "maxDepth": 2,
+    "maxFiles": 20
+  }
+}
+```
+
+---
+
+### 7. get-pdf-content
+
+**Extract text from PDF documents**
+
+**Description**: Extract and return text content from a PDF document using HTTP-based extraction with browser fallback.
+
+**When to Use**:
+- Extracting from research papers
+- Reading documentation available as PDF
+- Getting content from academic sources
+
+**Input Schema**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "PDF file URL (required)"
+    },
+    "maxContentLength": {
+      "type": "number",
+      "optional": true
+    }
+  },
+  "required": ["url"]
+}
+```
+
+**Example Usage**:
+```json
+{
+  "name": "get-pdf-content",
+  "arguments": {
+    "url": "https://arxiv.org/pdf/2305.12345.pdf",
+    "maxContentLength": 5000
+  }
+}
+```
+
+---
+
+### 8. get-openapi-spec
+
+**Download OpenAPI specifications**
+
+**Description**: Extract and download OpenAPI/Swagger specifications from API documentation pages, saving them to `docs/technical/openapi/` for future use.
+
+**When to Use**:
+- Downloading API documentation
+- Working with REST APIs
+- Analyzing endpoint structures
+
+**Input Schema**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "API documentation URL (required)"
+    },
+    "forceRefresh": {
+      "type": "boolean",
+      "default": false,
+      "optional": true
+    }
+  },
+  "required": ["url"]
+}
+```
+
+**Example Usage**:
+```json
+{
+  "name": "get-openapi-spec",
+  "arguments": {
+    "url": "https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro/",
+    "forceRefresh": false
+  }
+}
+```
+
+---
+
+## Response Format
+
+All tools return responses in this format:
+
+```json
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Your search results or content here..."
+    }
+  ]
+}
+```
+
+The text content is formatted with markdown-style headers for easy parsing.
+
+---
+
+## Tool Selection Flowchart
+
+```
+Need comprehensive research?
+  └─ YES → Use full-web-search
+  └─ NO → Need quick summaries only?
+        └─ YES → Use get-web-search-summaries
+        └─ NO → Have a specific URL to extract?
+              └─ YES → Use get-single-web-page-content
+              └─ NO → Want query expansion?
+                    └─ YES → Use progressive-web-search
+                    └─ NO → Searching repeated topics?
+                          └─ YES → Use cached-web-search
+                          └─ NO → Extracting GitHub repo?
+                                └─ YES → Use get-github-repo-content
+                                └─ NO → Working with PDF?
+                                      └─ YES → Use get-pdf-content
+                                      └─ NO → Need API docs?
+                                            └─ YES → Use get-openapi-spec
+                                            └─ NO → Reconsider your approach!
+```
+
+---
+
+## Performance Comparison
+
+| Tool | Speed | Content Depth | Resource Usage |
+|------|-------|---------------|----------------|
+| `get-web-search-summaries` | ⚡⚡⚡ Fastest | Low | Low |
+| `get-single-web-page-content` | ⚡⚡ Medium | Medium | Medium |
+| `cached-web-search` | ⚡⚡⚡ Fast* | Medium | Low* |
+| `full-web-search` | ⚡ Medium | High | High |
+| `progressive-web-search` | ⚡ Slow | Very High | High |
+| `get-pdf-content` | ⚡ Medium | Medium | Medium |
+| `get-github-repo-content` | ⚡⚡ Medium | High | Medium |
+
+*When cache hit occurs
