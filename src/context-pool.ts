@@ -133,9 +133,14 @@ export class ContextPool {
     
     const context = await browser.newContext(options as any);
     
-    // Store the context with metadata (using Playwright's internal id property)
+    // Store the context with metadata
     const now = Date.now();
-    const contextId = 'id' in context ? String((context as any).id) : String(Date.now());
+    // Use a more reliable unique ID for the context record
+    const contextId = crypto.randomUUID();
+    
+    // Attach the internal ID to the context object so we can find it later during release
+    (context as any).__pool_id = contextId;
+
     this.contexts.set(contextId, {
       context,
       lastUsed: now,
@@ -187,7 +192,7 @@ export class ContextPool {
   /**
    * Performs a quick health check on a context
    */
-  private healthCheck(record: ContextRecord): boolean {
+  private async healthCheck(record: ContextRecord): Promise<boolean> {
     try {
       // Quick check: verify browser is still connected
       const browser = record.context.browser();
@@ -196,8 +201,9 @@ export class ContextPool {
         return false;
       }
       
-      // Create and immediately close a test page
-      void record.context.newPage().then(page => page.close().catch(() => {})).catch(() => {});
+      // Create and immediately close a test page to ensure context is responsive
+      const page = await record.context.newPage();
+      await page.close();
       
       return true;
     } catch (error) {
@@ -217,9 +223,19 @@ export class ContextPool {
       console.log(`[ContextPool] Error closing context:`, error);
     });
     
-    // Use the same id lookup as when storing
-    const contextId = 'id' in record.context ? String((record.context as any).id) : String(Date.now());
-    this.contexts.delete(contextId);
+    // Use the internal ID we assigned
+    const contextId = (record.context as any).__pool_id;
+    if (contextId) {
+      this.contexts.delete(contextId);
+    } else {
+      // Fallback if for some reason ID is missing
+      for (const [guid, r] of this.contexts.entries()) {
+        if (r === record) {
+          this.contexts.delete(guid);
+          break;
+        }
+      }
+    }
   }
 
   /**
@@ -240,15 +256,19 @@ export class ContextPool {
   }
 
   /**
-   * Returns a context to the pool for reuse
+   * Releases a context back to the pool for reuse
    */
   async releaseContext(context: BrowserContext): Promise<void> {
-    // Use the same id lookup as when storing
-    const contextId = 'id' in context ? String((context as any).id) : String(Date.now());
-    const record = this.contexts.get(contextId);
-    if (record) {
-      record.lastUsed = Date.now();
-      console.log(`[ContextPool] Context released for reuse (${this.contexts.size} total)`);
+    const contextId = (context as any).__pool_id;
+    if (contextId) {
+      const record = this.contexts.get(contextId);
+      if (record) {
+        record.lastUsed = Date.now();
+        console.log(`[ContextPool] Context released for reuse (${this.contexts.size} total)`);
+      }
+    } else {
+      // If it doesn't have a pool ID, it might not be from the pool
+      console.log(`[ContextPool] Attempted to release context without pool ID - likely not from pool`);
     }
   }
 

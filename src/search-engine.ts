@@ -6,7 +6,7 @@ import { RateLimiter } from './rate-limiter.js';
 import { BrowserPool } from './browser-pool.js';
 
 // Import WebKit-first browser engine
-import { createOptimizedBrowser, getEnginePriorityOrder, BrowserEngineType, getHeadlessOption } from './browser-engine.js';
+import { createOptimizedBrowser, getEnginePriorityOrder, BrowserEngineType, getHeadlessOption, getEnvironmentConfig } from './browser-engine.js';
 import pLimit from 'p-limit';
 
 export interface SearchEngineConfig {
@@ -51,13 +51,14 @@ export class SearchEngine {
           const qualityThreshold = parseFloat(process.env.RELEVANCE_THRESHOLD || '0.3');
           
           console.log(`[SearchEngine] Quality checking: ${enableQualityCheck}, threshold: ${qualityThreshold}`);
-
+          
           // WebKit-first engine priority for parallel search
           const enginePriority: BrowserEngineType[] = getEnginePriorityOrder();
           const useParallel = process.env.PARALLEL_SEARCH !== 'false'; // Default to true
           
           if (useParallel) {
             console.log(`[SearchEngine] Running parallel search with engines: ${enginePriority.join(', ')}`);
+            // Pass the timeout through to allow engines to respect the overall budget
             return await this.searchWithParallelEngines(sanitizedQuery, numResults, timeout, enableQualityCheck, qualityThreshold);
           } else {
             console.log(`[SearchEngine] Using sequential search fallback`);
@@ -93,8 +94,9 @@ export class SearchEngine {
     const startTime = Date.now();
     const enginePriority: BrowserEngineType[] = getEnginePriorityOrder();
     
-    // We use a generous timeout for individual engines to account for browser pool queuing
-    const engineTimeout = Math.max(timeout, 25000); 
+     // Optimization: If the overall timeout is tight (e.g. < 20s), don't use a massive 25s engine timeout.
+     // Instead, use a fraction of the remaining time to ensure we don't hang on one engine.
+     const engineTimeout = Math.max(timeout * 0.7, 15000); 
     
     console.log(`[SearchEngine] Starting smart parallel search (priority: ${enginePriority.join(', ')})`);
 
@@ -110,14 +112,18 @@ export class SearchEngine {
           break;
         }
 
-        // Implement a small delay between engine attempts to allow browser resources to settle
-        if (i > 0) {
-          const delay = Math.min(2000, remainingTime / 2);
+        // Optimization: Only delay if we have plenty of time left.
+        if (i > 0 && remainingTime > 4000) {
+          const delay = Math.min(1500, remainingTime / 4);
           console.log(`[SearchEngine] Throttling: waiting ${delay.toFixed(0)}ms before next engine attempt...`);
           await new Promise(resolve => setTimeout(resolve, delay));
         }
 
-        const results = await this.runSearchWithEngine(engineType, query, numResults, Math.min(engineTimeout, remainingTime + 5000));
+     // Use a more realistic timeout for the engine that respects the remaining budget
+     // We add a small buffer to allow the engine to at least start/finish its work
+     // Ensure we have at least 8s to allow for browser launch and initial navigation
+     const currentEngineTimeout = Math.max(Math.min(engineTimeout, remainingTime), 8000);
+     const results = await this.runSearchWithEngine(engineType, query, numResults, currentEngineTimeout);
         
         if (results && results.length > 0) {
           const qualityScore = enableQualityCheck ? this.assessResultQuality(results, query) : 1.0;
@@ -152,6 +158,7 @@ export class SearchEngine {
   ): Promise<SearchResultWithMetadata> {
     // Try multiple approaches to get search results, starting with most reliable
     const approaches = [
+      { method: this.tryApiSearch.bind(this), name: 'API Search' },
       { method: this.tryBrowserBingSearch.bind(this), name: 'Browser Bing' },
       { method: this.tryBrowserBraveSearch.bind(this), name: 'Browser Brave' },
       { method: this.tryDuckDuckGoSearch.bind(this), name: 'Axios DuckDuckGo' }
@@ -219,6 +226,57 @@ export class SearchEngine {
   /**
    * Runs a search with a specific browser engine
    */
+  private async tryApiSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    const apiKey = process.env.SERPER_API_KEY;
+    if (!apiKey) {
+      console.error('[SearchEngine] API search failed: SERPER_API_KEY is not set');
+      return [];
+    }
+
+    console.log(`[SearchEngine] Starting API-based search for: "${query}"`);
+    const timestamp = generateTimestamp();
+    
+    try {
+      const response = await axios.post(
+        'https://google.serper.dev/search',
+        {
+          q: query,
+          num: Math.min(numResults, 10)
+        },
+        {
+          headers: {
+            'X-API-KEY': apiKey,
+            'Content-Type': 'application/json'
+          },
+          timeout: timeout
+        }
+      );
+
+      const organicResults = response.data.organic || [];
+      console.log(`[SearchEngine] API search returned ${organicResults.length} results`);
+
+      return organicResults.map((item: any) => ({
+        title: item.title,
+        url: item.link,
+        description: item.snippet || 'No description available',
+        fullContent: '',
+        contentPreview: '',
+        wordCount: 0,
+        timestamp,
+        fetchStatus: 'success',
+      }));
+    } catch (error) {
+      console.error(`[SearchEngine] API search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      if (axios.isAxiosError(error)) {
+        console.error('[SearchEngine] API Axios error details:', {
+          status: error.response?.status,
+          data: error.response?.data,
+        });
+      }
+      return [];
+    }
+  }
+
   private async runSearchWithEngine(
     engineType: BrowserEngineType,
     query: string,
@@ -227,10 +285,27 @@ export class SearchEngine {
   ): Promise<SearchResult[]> {
     console.log(`[SearchEngine] Starting ${engineType} search for: ${query}`);
     
-    const browser = await createOptimizedBrowser({
-      engineType,
-      headlessMode: 'new', // Use new headless mode
-    });
+    const envConfig = getEnvironmentConfig();
+    let browser;
+    let context;
+    let isFromPool = false;
+
+    if (engineType === 'api') {
+      return await this.tryApiSearch(query, numResults, timeout);
+    }
+
+    // If engine matches the pool's configuration, use the pool to avoid expensive launches
+    if (engineType === envConfig.engineType) {
+      context = await this.browserPool.getContext();
+      browser = context.browser();
+      isFromPool = true;
+    } else {
+      // Fallback engines launch a dedicated browser instance
+      browser = await createOptimizedBrowser({
+        engineType,
+        headlessMode: 'new', // Use new headless mode
+      });
+    }
     
     try {
       // Use appropriate search method based on engine
@@ -244,10 +319,16 @@ export class SearchEngine {
       
       return [];
     } finally {
-      try {
-        await browser.close();
-      } catch (error) {
-        console.log(`[SearchEngine] Error closing ${engineType} browser:`, error);
+      if (isFromPool && context) {
+        // Release the context back to the pool for reuse
+        await this.browserPool.releaseContext(context);
+      } else if (browser) {
+        // For non-pooled browsers, close the instance entirely
+        try {
+          await browser.close();
+        } catch (error) {
+          console.log(`[SearchEngine] Error closing ${engineType} browser:`, error);
+        }
       }
     }
   }
@@ -1079,10 +1160,10 @@ export class SearchEngine {
       const title = $link.text().trim();
       const url = $link.attr('href') || '';
 
-      // Basic validation: must have title and a valid URL, and not be a Bing internal link
-      if (title && url && this.isValidSearchUrl(url) && !url.includes('bing.com/ck/a?!&&p=')) {
-        // 2. Find the snippet for this result. 
-        // We look for the closest container that might hold the snippet.
+       // Basic validation: must have title and a valid URL
+       if (title && url && this.isValidSearchUrl(url)) {
+         // 2. Find the snippet for this result. 
+         // We look for the closest container that might hold the snippet.
         let snippet = '';
         
         // Try common Bing snippet containers relative to the title

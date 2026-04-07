@@ -1,7 +1,7 @@
 import { chromium, firefox, webkit, Browser, LaunchOptions } from 'playwright';
 
 // Export types for browser engine configuration
-export type BrowserEngineType = 'webkit' | 'chromium' | 'firefox';
+export type BrowserEngineType = 'webkit' | 'chromium' | 'firefox' | 'api';
 export type HeadlessMode = 'new' | 'legacy' | 'shell';
 
 export interface BrowserEngineOptions {
@@ -19,16 +19,32 @@ export interface BrowserEngineOptions {
 const DEFAULT_ENGINE_OPTIONS: BrowserEngineOptions = {
   engineType: 'webkit', // WebKit is fastest for search tasks
   headlessMode: 'new' as const,  // New headless mode provides better performance
-  args: [
-    '--no-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-gpu',
+  args: [],
+};
+
+/**
+ * Returns engine-specific arguments to avoid passing Chromium flags to WebKit/Firefox
+ */
+function getEngineSpecificArgs(engineType: BrowserEngineType): string[] {
+  const baseArgs = [
     '--disable-extensions',
     '--disable-background-timer-throttling',
     '--disable-backgrounding-occluded-windows',
     '--disable-renderer-backgrounding',
-  ],
-};
+  ];
+
+  if (engineType === 'chromium') {
+    return [
+      ...baseArgs,
+      '--no-sandbox',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+    ];
+  }
+
+  return baseArgs;
+}
 
 /**
  * Creates an optimized browser instance with the specified engine type
@@ -38,15 +54,21 @@ export async function createOptimizedBrowser(
   options?: BrowserEngineOptions
 ): Promise<Browser> {
   const effectiveOptions = { ...DEFAULT_ENGINE_OPTIONS, ...options };
+  const engineType = effectiveOptions.engineType || 'webkit';
   
-  console.error(`[BrowserEngine] Launching browser with engine: ${effectiveOptions.engineType}, headless mode: ${effectiveOptions.headlessMode}`);
+  console.log(`[BrowserEngine] Launching browser with engine: ${engineType}, headless mode: ${effectiveOptions.headlessMode}`);
   
   // Build launch options based on browser type and headless mode
   // Use default 'new' if undefined to avoid TS error
   const effectiveHeadlessMode = effectiveOptions.headlessMode || 'new';
+  
+  // Merge default engine-specific args with provided args
+  const engineArgs = getEngineSpecificArgs(engineType);
+  const finalArgs = [...new Set([...engineArgs, ...(effectiveOptions.args || [])])];
+
   const launchOptions: LaunchOptions = {
     headless: getHeadlessOption(effectiveHeadlessMode),
-    args: effectiveOptions.args,
+    args: finalArgs,
   };
   
   // Add channel option for Chromium new headless mode
@@ -59,17 +81,17 @@ export async function createOptimizedBrowser(
   try {
     switch (effectiveOptions.engineType) {
       case 'webkit':
-        console.error('[BrowserEngine] Using WebKit engine for optimal speed');
+        console.log('[BrowserEngine] Using WebKit engine for optimal speed');
         browser = await webkit.launch(launchOptions);
         break;
         
       case 'chromium':
-        console.error('[BrowserEngine] Using Chromium engine with new headless mode');
+        console.log('[BrowserEngine] Using Chromium engine with new headless mode');
         browser = await chromium.launch(launchOptions);
         break;
         
       case 'firefox':
-        console.error('[BrowserEngine] Using Firefox engine as fallback');
+        console.log('[BrowserEngine] Using Firefox engine as fallback');
         browser = await firefox.launch(launchOptions);
         break;
         
@@ -78,12 +100,12 @@ export async function createOptimizedBrowser(
         browser = await webkit.launch(launchOptions);
     }
     
-      console.log(`[BrowserEngine] Browser launched successfully, connected: ${browser.isConnected()}`); // Intentionally using log for success to stderr via redirect
-    return browser;
-  } catch (error) {
-    console.log(`[BrowserEngine] Failed to launch ${effectiveOptions.engineType} browser:`, error); // Intentionally using log for errors to stderr via redirect
-    
-    // Try fallback engines if primary fails
+    console.log(`[BrowserEngine] Browser launched successfully, connected: ${browser.isConnected()}`); // Intentionally using log for success to stderr via redirect
+  return browser;
+} catch (error) {
+  console.error(`[BrowserEngine] Failed to launch ${effectiveOptions.engineType} browser:`, error); // Intentionally using log for errors to stderr via redirect
+  
+  // Try fallback engines if primary fails
     if (effectiveOptions.engineType === 'webkit') {
       console.log('[BrowserEngine] Fallback: Trying Chromium...'); // Intentionally using log for debug
       try {
@@ -123,8 +145,9 @@ export function getHeadlessOption(mode: HeadlessMode): boolean {
 export function createOptimizedContextOptions(engineType: BrowserEngineType = 'webkit'): object {
   const userAgents: Record<BrowserEngineType, string> = {
     chromium: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-    firefox: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0',
-    webkit: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+    firefox: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    webkit: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+    api: 'SerperAPI/1.0'
   };
 
   return {
@@ -157,8 +180,8 @@ export function createOptimizedContextOptions(engineType: BrowserEngineType = 'w
  * Gets the recommended browser engine order for performance
  */
 export function getEnginePriorityOrder(): BrowserEngineType[] {
-  // WebKit is fastest, then Chromium (new headless), then Firefox
-  return ['webkit', 'chromium', 'firefox'];
+  // API is fastest and most reliable, then WebKit, then Chromium, then Firefox
+  return ['api', 'webkit', 'chromium', 'firefox'];
 }
 
 /**
@@ -167,13 +190,13 @@ export function getEnginePriorityOrder(): BrowserEngineType[] {
 export function estimateLaunchTime(engineType: BrowserEngineType): number {
   switch (engineType) {
     case 'webkit':
-      return 300; // WebKit is ~30-50% faster than other engines
+      return 1000; // Increased to be more realistic and avoid premature timeouts
     case 'chromium':
-      return 450;
+      return 1200;
     case 'firefox':
-      return 600;
+      return 1500;
     default:
-      return 450;
+      return 1200;
   }
 }
 
@@ -181,7 +204,7 @@ export function estimateLaunchTime(engineType: BrowserEngineType): number {
  * Validates browser engine type
  */
 export function isValidEngineType(type: string): type is BrowserEngineType {
-  return ['webkit', 'chromium', 'firefox'].includes(type);
+  return ['webkit', 'chromium', 'firefox', 'api'].includes(type);
 }
 
 /**
