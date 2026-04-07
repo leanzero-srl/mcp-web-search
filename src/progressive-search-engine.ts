@@ -82,12 +82,23 @@ export class ProgressiveSearchEngine implements IProgressiveSearchEngine {
     this.ingestResults(literalResults, 1, originalQuery, results, seenUrls);
 
     // 1.2 Intent-Based Expansion (Immediate relevance)
-    const intentExpansions = generateIntentBasedExpansions(originalQuery, intent, audience);
-    const semanticExpansions = await this.semanticExpander.expandQuery(originalQuery);
+    // Optimization: Run intent and semantic expansions in parallel to save time in Stage 1
+    const [intentExpansions, semanticExpansions] = await Promise.all([
+      Promise.resolve(generateIntentBasedExpansions(originalQuery, intent, audience)),
+      this.semanticExpander.expandQuery(originalQuery)
+    ]);
+    
     const initialExpansions = Array.from(new Set([...intentExpansions, ...semanticExpansions]));
 
-    for (const expQuery of initialExpansions.slice(0, 3)) {
+    // Optimization: Run expansion searches in parallel with a concurrency limit 
+    // to speed up Stage 1 without overwhelming the browser pool
+    const expansionTasks = initialExpansions.slice(0, 3).map(async (expQuery) => {
       const stageResults = await this.searchWithEngine(expQuery);
+      return { expQuery, stageResults };
+    });
+
+    const expansionOutcomes = await Promise.all(expansionTasks);
+    for (const { expQuery, stageResults } of expansionOutcomes) {
       this.ingestResults(stageResults, 1, expQuery, results, seenUrls);
     }
 
