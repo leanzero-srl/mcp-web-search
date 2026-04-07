@@ -47,7 +47,7 @@ import { EnhancedContentExtractor } from './enhanced-content-extractor.js';
 import { WebSearchToolInput, WebSearchToolOutput, SearchResult, GitHubFile, OpenAPIExtractionResult } from './types.js';
 import { ProgressiveSearchEngine } from './progressive-search-engine.js';
 import { isPdfUrl } from './utils.js';
-import { GitHubExtractor } from './github-extractor.js';
+import { GitHubExtractor, parseGitHubUrl } from './github-extractor.js';
 import { openAPIExtractor } from './openapi-extractor.js';
 
 // ============================================================================
@@ -551,9 +551,9 @@ class WebSearchMCPServer {
             maxFiles 
           });
 
-          console.log(`[MCP] GitHub extraction completed: ${result.repositoryInfo.owner}/${result.repositoryInfo.repo} (${result.files.length} files)`);
-
-          let responseText = `**Repository:** ${result.repositoryInfo.owner}/${result.repositoryInfo.repo}\n\n`;
+           console.log(`[MCP] GitHub extraction completed: ${result.repositoryInfo.owner}/${result.repositoryInfo.repo} (${result.files.length} files)`);
+ 
+           let responseText = `**Repository:** ${result.repositoryInfo.owner}/${result.repositoryInfo.repo}\n\n`;
 
           if (result.readme) {
             responseText += `**README.md:**\n${result.readme}\n\n`;
@@ -580,21 +580,105 @@ class WebSearchMCPServer {
             responseText += `**Files:** No files found or all files were skipped.\n`;
           }
 
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: responseText,
-              },
-            ],
-          };
-        } catch (error) {
-          this.handleError(error, 'get-github-repo-content');
-        }
-      }
-    );
-
-    // Register the OpenAPI specification extraction tool
+           return {
+             content: [
+               {
+                 type: 'text' as const,
+                 text: responseText,
+               },
+             ],
+           };
+         } catch (error) {
+           this.handleError(error, 'get-github-repo-content');
+         }
+       }
+     );
+ 
+     // Register the GitHub directory listing tool
+     this.server.tool(
+       'get-github-directory-contents',
+       'List the files and directories within a specific path of a GitHub repository. This is useful for exploring the repository structure before fetching specific file contents.',
+       {
+         url: z.string().url().describe('The URL of the GitHub repository (e.g., https://github.com/owner/repo)'),
+         path: z.string().optional().describe('The path within the repository to list (e.g., "docs/technical")'),
+         branch: z.string().optional().describe('The branch to use (e.g., "main")'),
+       },
+       async (args: unknown) => {
+         console.log(`[MCP] Tool call received: get-github-directory-contents`);
+         console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+ 
+         try {
+           if (typeof args !== 'object' || args === null) {
+             throw new Error('Invalid arguments: args must be an object');
+           }
+           const obj = args as Record<string, unknown>;
+ 
+           if (!obj.url || typeof obj.url !== 'string') {
+             throw new Error('Invalid arguments: url is required and must be a string');
+           }
+ 
+           const repoInfo = parseGitHubUrl(obj.url);
+           if (!repoInfo) {
+             throw new Error(`Invalid GitHub URL format: ${obj.url}`);
+           }
+ 
+           const targetPath = (obj.path as string) || '';
+           const branch = obj.branch as string | undefined;
+ 
+           if (!this.githubExtractor) {
+             throw new Error('GitHub extractor is not initialized.');
+           }
+ 
+           console.log(`[MCP] Fetching directory contents for ${repoInfo.owner}/${repoInfo.repo}:${targetPath}`);
+           const contents = await this.githubExtractor.getContent(
+             repoInfo.owner,
+             repoInfo.repo,
+             targetPath,
+             branch
+           );
+ 
+           if (contents.length === 0) {
+             return {
+               content: [{ type: 'text' as const, text: `No contents found at path: ${targetPath}` }],
+             };
+           }
+ 
+           let responseText = `**Directory Listing for:** ${obj.url}${targetPath ? ` (${targetPath})` : ''}\n\n`;
+           
+           // Separate directories and files for better presentation
+           const dirs = contents.filter(item => item.type === 'dir').sort((a, b) => a.name.localeCompare(b.name));
+           const files = contents.filter(item => item.type === 'file').sort((a, b) => a.name.localeCompare(b.name));
+ 
+           if (dirs.length > 0) {
+             responseText += `**Directories:**\n`;
+             dirs.forEach(dir => {
+               responseText += `📁 ${dir.name}/\n`;
+             });
+             responseText += `\n`;
+           }
+ 
+           if (files.length > 0) {
+             responseText += `**Files:**\n`;
+             files.forEach(file => {
+               responseText += `📄 ${file.name}\n`;
+             });
+           }
+ 
+           return {
+             content: [
+               {
+                 type: 'text' as const,
+                 text: responseText,
+               },
+             ],
+           };
+         } catch (error) {
+           this.handleError(error, 'get-github-directory-contents');
+         }
+       }
+     );
+ 
+     // Register the OpenAPI specification extraction tool
     this.server.tool(
       'get-openapi-spec',
       'Extract and download OpenAPI/Swagger specifications from API documentation pages. This tool automatically discovers OpenAPI specs by checking HTML link tags, common URL patterns, and versioned swagger files. The spec is saved to docs/technical/openapi/ for future use without re-crawling.',
