@@ -1,5 +1,5 @@
 import { Browser, BrowserContext } from 'playwright';
-import { createOptimizedBrowser, getHeadlessOption, getEnvironmentConfig, isValidEngineType, type BrowserEngineType, type HeadlessMode, type BrowserEngineOptions } from './browser-engine.js';
+import { createOptimizedBrowser, getHeadlessOption, getEnvironmentConfig, isValidEngineType, type BrowserEngineType, type HeadlessMode, type BrowserEngineOptions, createOptimizedContextOptions } from './browser-engine.js';
 
 // Re-export for convenience
 export { getEnvironmentConfig };
@@ -129,18 +129,9 @@ export class ContextPool {
    * Creates a new context and stores it in the pool
    */
   private async createAndStoreContext(browser: Browser): Promise<BrowserContext> {
-    const options = {
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-      viewport: { width: 1366, height: 768 },
-      locale: 'en-US',
-      timezoneId: 'America/New_York',
-      colorScheme: 'light' as const,
-      deviceScaleFactor: 1,
-      hasTouch: false,
-      isMobile: false,
-    };
+    const options = createOptimizedContextOptions(this.engineType as any);
     
-    const context = await browser.newContext(options);
+    const context = await browser.newContext(options as any);
     
     // Store the context with metadata (using Playwright's internal id property)
     const now = Date.now();

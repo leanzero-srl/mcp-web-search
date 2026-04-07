@@ -9,6 +9,9 @@ export enum QueryIntent {
   NAVIGATIONAL = 'navigational',     // "site:example.com X"
   QUESTION = 'question',             // Questions ending with ?
   COMPLEX_TASK = 'complex_task',     // Multi-step requests
+  TECHNICAL = 'technical',           // Code, API, implementation, libraries
+  DEBUGGING = 'debugging',           // "Error in...", "Why does...", "fix..."
+  ACADEMIC = 'academic',             // Research papers, studies, citations
 }
 
 export interface QueryIntentDetector {
@@ -16,42 +19,59 @@ export interface QueryIntentDetector {
 }
 
 /**
- * Standard Intent Detector - Uses regex and keyword patterns to classify queries
+ * Interface for an LLM-powered intent detector.
+ * This allows for easy swapping of the heuristic implementation with a more advanced one.
+ */
+export interface LLMIntentDetector extends QueryIntentDetector {
+  modelName: string;
+  temperature: number;
+}
+
+/**
+ * Standard Intent Detector - Uses regex and keyword patterns to classify queries.
+ * This is a lightweight, fast implementation suitable for local execution.
  */
 export class StandardIntentDetector implements QueryIntentDetector {
   async detectIntent(query: string): Promise<QueryIntent> {
     const lower = query.toLowerCase().trim();
     
-    // Check for question patterns (explicit questions)
+    // 1. Navigational Intent (specific sites/domains)
+    if (/site:|\/|^www\.|^example\.|\^github\.com|^stackoverflow\.com/.test(lower)) {
+      return QueryIntent.NAVIGATIONAL;
+    }
+
+    // 2. Debugging Intent (errors, stack traces, fixing)
+    if (/(error|exception|bug|fail|broken|debug|stack trace|not working|won't work|issue|fix|resolve)/i.test(lower)) {
+      return QueryIntent.DEBUGGING;
+    }
+
+    // 3. Technical Intent (code, implementation, libraries, APIs)
+    if (/(code|api|library|framework|implementation|syntax|function|class|module|package|repo|github|documentation|docs|how to use|example|snippet)/i.test(lower)) {
+      return QueryIntent.TECHNICAL;
+    }
+
+    // 4. Academic Intent (research, papers, studies, science)
+    if (/(research|paper|study|theory|scientific|academic|evidence|cite|citation|journal|published)/i.test(lower)) {
+      return QueryIntent.ACADEMIC;
+    }
+
+    // 5. Complex Task Intent (multi-step or highly specific instructions)
+    if (/(step by step|how can i|help me to|perform|run|execute|setup|configure|implement)/i.test(lower)) {
+      return QueryIntent.COMPLEX_TASK;
+    }
+    
+    // 6. Question Intent (explicitly asking for information)
     if (/[?]/.test(lower) || 
-        /^what is/.test(lower) || 
-        /^what are/.test(lower) ||
-        /^how to/.test(lower) ||
-        /^how do/.test(lower)) {
+        /^(what|how|why|where|when|who|which|can|is|are|do|does|did|should|would|could)\s/.test(lower)) {
       return QueryIntent.QUESTION;
     }
     
-    // Check for commercial intent (recommendations)
-    if (/^(best|top|leading|recommended|favorite|great)/i.test(lower)) {
+    // 7. Commercial Intent (looking for recommendations, reviews, or best options)
+    if (/^(best|top|leading|recommended|favorite|great|cheap|expensive|review|comparison|versus|vs)\b/.test(lower)) {
       return QueryIntent.COMMERCIAL;
     }
     
-    // Check for navigational intent (specific sites)
-    if (/site:|\/|^www\.|^example\./.test(lower)) {
-      return QueryIntent.NAVIGATIONAL;
-    }
-    
-    // Check for temporal queries (contains years/numbers)
-    if (/\b(20\d{2})\b/.test(query) || /\b(19\d{2})\b/.test(query)) {
-      return QueryIntent.INFORMATIONAL; // Temporal queries are informational
-    }
-    
-    // Check for "for me" or audience-specific intent
-    if (/(for me|for beginner|for advanced|for professionals)/i.test(lower)) {
-      return QueryIntent.INFORMATIONAL;
-    }
-    
-    // Default: informational
+    // 8. Informational Intent (Default: general knowledge or temporal queries)
     return QueryIntent.INFORMATIONAL;
   }
 
@@ -116,13 +136,30 @@ export function generateIntentBasedExpansions(
       }
       expansions.push(`${query} explained`, `What is ${query}`);
       expansions.push(`${query} tutorial`, `${query} guide`);
-      break;
+      break
 
+    case QueryIntent.TECHNICAL:
+      expansions.push(`${query} documentation`, `${query} implementation example`);
+      expansions.push(`${query} library usage`, `how to use ${query}`);
+      expansions.push(`${query} api reference`, `${query} tutorial`);
+      break
+
+    case QueryIntent.DEBUGGING:
+      expansions.push(`${query} error`, `${query} troubleshoot`);
+      expansions.push(`${query} fix`, `${query} solution`);
+      expansions.push(`how to fix ${query}`, `${query} common issues`);
+      break
+
+    case QueryIntent.ACADEMIC:
+      expansions.push(`${query} research paper`, `${query} study`);
+      expansions.push(`${query} academic findings`, `${query} scientific explanation`);
+      break
+    
     case QueryIntent.QUESTION:
       expansions.push(`How can I ${query}?`, `Steps to ${query}`);
       expansions.push(`Guide for ${query}`, `${query} complete tutorial`);
-      break;
-
+      break
+    
     case QueryIntent.NAVIGATIONAL:
       expansions.push(`${query} documentation`, `${query} official site`);
       expansions.push(`${query} how to use`, `${query} examples`);

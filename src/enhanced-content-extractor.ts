@@ -1,10 +1,77 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { Page } from 'playwright';
-import { ContentExtractionOptions, SearchResult } from './types.js';
+import { ContentExtractionOptions, SearchResult, ResearchDigest } from './types.js';
 import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
 import { BrowserPool } from './browser-pool.js';
 import { scoreContentQuality, getBestContentSelector, ContentQualityResult, cleanText as qualityCleanText } from './content-quality-scorer.js';
+
+/**
+ * Converts HTML elements to Markdown format for better AI readability.
+ * This implementation preserves structural cues like headings, lists, and links.
+ */
+function convertToMarkdown($: cheerio.CheerioAPI, element: cheerio.Element, depth: number = 0): string {
+  const el = element as any;
+  if (!el.tagName) return '';
+  
+  const tag = el.tagName.toLowerCase();
+  const noiseTags = ['script', 'style', 'noscript', 'iframe', 'img', 'video', 'audio', 'canvas', 'svg', 'object', 'embed', 'applet', 'form', 'input', 'textarea', 'select', 'button', 'label', 'fieldset', 'legend', 'optgroup', 'option', 'nav', 'header', 'footer', 'aside', 'ad', 'advertisement', 'ads', 'social-share', 'share-buttons', 'comments', 'comment-section', 'related-posts', 'recommendations', 'newsletter-signup', 'cookie-notice', 'privacy-notice', 'terms-notice', 'disclaimer', 'legal', 'copyright', 'meta', 'metadata', 'author-info', 'publish-date', 'tags', 'categories', 'navigation', 'pagination', 'search-box', 'search-form', 'login-form', 'signup-form', 'newsletter', 'popup', 'modal', 'overlay', 'tooltip', 'toolbar', 'ribbon', 'banner', 'promo', 'sponsored', 'affiliate', 'tracking', 'analytics', 'pixel', 'beacon'];
+
+  if (noiseTags.includes(tag)) return '';
+
+  let content = '';
+
+  // Handle Headings
+  if (/^h[1-6]$/.test(tag)) {
+    const level = parseInt(tag.substring(1));
+    const prefix = '#'.repeat(Math.min(level, 6));
+    const text = $(element).text().trim();
+    return text ? `\n\n${prefix} ${text}\n\n` : '';
+  }
+
+  // Handle Lists
+  if (tag === 'li') {
+    const text = $(element).text().trim();
+    return text ? `* ${text}\n` : '';
+  }
+  if (tag === 'ul' || tag === 'ol') {
+    // Simplified: just collect children
+    return '\n';
+  }
+
+  // Handle Emphasis
+  if (['strong', 'b'].includes(tag)) {
+    return `**${$(element).text().trim()}**`;
+  }
+  if (['em', 'i'].includes(tag)) {
+    return `*${$(element).text().trim()}*`;
+  }
+
+  // Handle Links
+  if (tag === 'a') {
+    const href = $(element).attr('href');
+    const text = $(element).text().trim();
+    return href ? `[${text}](${href})` : text;
+  }
+
+  // Recurse into children
+  if (el.children && el.children.length > 0) {
+    for (let i = 0; i < el.children.length; i++) {
+      content += convertToMarkdown($, el.children[i], depth + 1);
+    }
+  } else {
+    const text = $(element).text().trim();
+    if (text) content += text;
+  }
+
+  // Add block spacing for structural elements
+  const isBlock = ['p', 'div', 'section', 'article', 'main', 'br', 'hr'].includes(tag);
+  if (isBlock && content.trim()) {
+    return `\n${content.trim()}\n`;
+  }
+
+  return content;
+}
 
 export class EnhancedContentExtractor {
   private readonly defaultTimeout: number;
@@ -34,14 +101,16 @@ export class EnhancedContentExtractor {
     console.log(`[EnhancedContentExtractor] Configuration: timeout=${this.defaultTimeout}, maxContentLength=${this.maxContentLength}, fallbackThreshold=${this.fallbackThreshold}, minContentLength=${this.minContentLength}`);
   }
 
-  async extractContent(options: ContentExtractionOptions): Promise<string> {
+  async extractContent(options: ContentExtractionOptions): Promise<{ content: string; digest?: ResearchDigest }> {
     const { url } = options;
     
     console.log(`[EnhancedContentExtractor] Starting extraction for: ${url}`);
     
+    let content = '';
+    
     // First, try with regular HTTP client (faster)
     try {
-      const content = await this.extractWithAxios(options);
+      content = await this.extractWithAxios(options);
       console.log(`[EnhancedContentExtractor] Successfully extracted with axios: ${content.length} chars`);
       
       // Validate content quality
@@ -49,8 +118,6 @@ export class EnhancedContentExtractor {
       if (!qualityResult.isValid) {
         throw new Error(`Low quality content detected (score: ${qualityResult.score}, length: ${qualityResult.content.length})`);
       }
-      
-      return qualityResult.content;
     } catch (error) {
       console.log(`[EnhancedContentExtractor] Axios failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       
@@ -58,7 +125,7 @@ export class EnhancedContentExtractor {
       if (this.shouldUseBrowser(error, url)) {
         console.log(`[EnhancedContentExtractor] Falling back to headless browser for: ${url}`);
         try {
-          const content = await this.extractWithBrowser(options);
+          content = await this.extractWithBrowser(options);
           console.log(`[EnhancedContentExtractor] Successfully extracted with browser: ${content.length} chars`);
           
           // Validate content quality
@@ -66,8 +133,6 @@ export class EnhancedContentExtractor {
           if (!qualityResult.isValid) {
             throw new Error(`Low quality content detected (score: ${qualityResult.score}, length: ${qualityResult.content.length})`);
           }
-          
-          return qualityResult.content;
         } catch (browserError) {
           console.error(`[EnhancedContentExtractor] Browser extraction also failed:`, browserError);
           throw new Error(`Both axios and browser extraction failed for ${url}`);
@@ -76,6 +141,46 @@ export class EnhancedContentExtractor {
         throw error;
       }
     }
+
+    const digest = this.extractResearchInsights(content);
+    
+    return { content, digest };
+  }
+
+  /**
+   * Extracts high-level research insights (entities, claims, key terms) from text.
+   */
+  private extractResearchInsights(text: string): ResearchDigest {
+    // 1. Entity Extraction (Simple Proper Noun Heuristic)
+    // Looking for capitalized words that are not at the start of a sentence
+    const entityRegex = /(?<![.!?]\s)\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\b/g;
+    const entities = Array.from(new Set(text.match(entityRegex) || []))
+      .filter(e => e.length > 2)
+      .slice(0, 15);
+
+    // 2. Claim Extraction (Assertion Verbs)
+    const claimVerbs = /\b(proves|suggests|demonstrates|states|concludes|argues|claims|shows|indicates|establishes)\b/i;
+    const sentences = text.split(/[.!?]+/).map(s => s.trim()).filter(s => s.length > 30);
+    const claims = sentences
+      .filter(s => claimVerbs.test(s))
+      .slice(0, 5);
+
+    // 3. Key Terms (Frequency-based filtering of non-common words)
+    const commonWords = new Set(['the', 'and', 'this', 'that', 'with', 'from', 'their', 'there', 'which', 'would', 'could', 'should', 'their']);
+    const words = text.toLowerCase()
+      .replace(/[^\w\s]/g, '')
+      .split(/\s+/)
+      .filter(w => w.length > 5 && !commonWords.has(w));
+    
+    const wordFreq: Record<string, number> = {};
+    words.forEach(w => wordFreq[w] = (wordFreq[w] || 0) + 1);
+    
+    const keyTerms = Object.entries(wordFreq)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([word]) => word);
+
+    return { entities, claims, keyTerms };
   }
 
   private async extractWithAxios(options: ContentExtractionOptions): Promise<string> {
@@ -375,11 +480,17 @@ export class EnhancedContentExtractor {
           setTimeout(() => reject(new Error('Content extraction timeout')), 10000);
         });
         
-        const content = await Promise.race([extractionPromise, timeoutPromise]);
-        const cleanedContent = cleanText(content, this.maxContentLength);
+        const contentObj = await Promise.race([extractionPromise, timeoutPromise]);
+        const content = typeof contentObj === 'string' ? contentObj : contentObj.content;
+        const cleanedContent = cleanText(content);
+        
+        // Manually apply maxContentLength if provided
+        const finalContent = this.maxContentLength && cleanedContent.length > this.maxContentLength
+          ? cleanedContent.substring(0, this.maxContentLength)
+          : cleanedContent;
         
         // Validate content quality
-        const qualityResult = scoreContentQuality(cleanedContent);
+        const qualityResult = scoreContentQuality(finalContent);
         if (!qualityResult.isValid) {
           console.log(`[EnhancedContentExtractor] Content quality check failed for ${result.url}`);
           throw new Error('Low quality content');
@@ -429,35 +540,58 @@ export class EnhancedContentExtractor {
     try {
       const $ = cheerio.load(html);
       
-      // Remove all script, style, and other non-content elements
-      $('script, style, noscript, iframe, img, video, audio, canvas, svg, object, embed, applet, form, input, textarea, select, button, label, fieldset, legend, optgroup, option').remove();
+      // 1. Identify the best content area first to reduce noise
+      const bestSelector = getBestContentSelector(html);
+      const $contentArea = $(bestSelector).first();
       
-      // Remove navigation, header, footer, and other non-content elements
-      $('nav, header, footer, .nav, .header, .footer, .sidebar, .menu, .breadcrumb, aside, .ad, .advertisement, .ads, .advertisement-container, .social-share, .share-buttons, .comments, .comment-section, .related-posts, .recommendations, .newsletter-signup, .cookie-notice, .privacy-notice, .terms-notice, .disclaimer, .legal, .copyright, .meta, .metadata, .author-info, .publish-date, .tags, .categories, .navigation, .pagination, .search-box, .search-form, .login-form, .signup-form, .newsletter, .popup, .modal, .overlay, .tooltip, .toolbar, .ribbon, .banner, .promo, .sponsored, .affiliate, .tracking, .analytics, .pixel, .beacon').remove();
+      // If we can't find a specific content area, we'll fallback to body, 
+      // but we'll still clean it up.
+      const target = $contentArea.length > 0 ? $contentArea : $('body');
+
+      // 2. Remove non-content elements within the target area
+      target.find('script, style, noscript, iframe, img, video, audio, canvas, svg, object, embed, applet, form, input, textarea, select, button, label, fieldset, legend, optgroup, option').remove();
       
-      // Remove elements with common ad/tracking classes
-      $('[class*="ad"], [class*="ads"], [class*="advertisement"], [class*="tracking"], [class*="analytics"], [class*="pixel"], [class*="beacon"], [class*="sponsored"], [class*="affiliate"], [class*="promo"], [class*="banner"], [class*="popup"], [class*="modal"], [class*="overlay"], [class*="tooltip"], [class*="toolbar"], [class*="ribbon"]').remove();
+      // 3. Remove structural noise (nav, header, footer, etc.)
+      target.find('nav, header, footer, .nav, .header, .footer, .sidebar, .menu, .breadcrumb, aside, .ad, .advertisement, .ads, .advertisement-container, .social-share, .share-buttons, .comments, .comment-section, .related-posts, .recommendations, .newsletter-signup, .cookie-notice, .privacy-notice, .terms-notice, .disclaimer, .legal, .copyright, .meta, .metadata, .author-info, .publish-date, .tags, .categories, .navigation, .pagination, .search-box, .search-form, .login-form, .signup-form, .newsletter, .popup, .modal, .overlay, .tooltip, .toolbar, .ribbon, .banner, .promo, .sponsored, .affiliate, .tracking, .analytics, .pixel, .beacon').remove();
       
-      // Remove elements with common non-content IDs
-      $('[id*="ad"], [id*="ads"], [id*="advertisement"], [id*="tracking"], [id*="analytics"], [id*="pixel"], [id*="beacon"], [id*="sponsored"], [id*="affiliate"], [id*="promo"], [id*="banner"], [id*="popup"], [id*="modal"], [id*="overlay"], [class*="tooltip"], [class*="toolbar"], [class*="ribbon"], [id*="sidebar"], [id*="navigation"], [id*="menu"], [id*="footer"], [id*="header"]').remove();
+      // 4. Remove common ad/tracking classes/IDs
+      target.find('[class*="ad"], [class*="ads"], [class*="advertisement"], [class*="tracking"], [class*="analytics"], [class*="pixel"], [class*="beacon"], [class*="sponsored"], [class*="affiliate"], [class*="promo"], [class*="banner"], [class*="popup"], [class*="modal"], [class*="overlay"], [class*="tooltip"], [class*="toolbar"], [class*="ribbon"]').remove();
+      target.find('[id*="ad"], [id*="ads"], [id*="advertisement"], [id*="tracking"], [id*="analytics"], [id*="pixel"], [id*="beacon"], [id*="sponsored"], [id*="affiliate"], [id*="promo"], [id*="banner"], [id*="popup"], [id*="modal"], [id*="overlay"], [id*="sidebar"], [id*="navigation"], [id*="menu"], [id*="footer"], [id*="header"]').remove();
       
-      // Remove image-related elements and attributes
-      $('picture, source, figure, figcaption, .image, .img, .photo, .picture, .media, .gallery, .slideshow, .carousel').remove();
-      $('[data-src*="image"], [data-src*="img"], [data-src*="photo"], [data-src*="picture"]').remove();
-      $('[style*="background-image"]').remove();
+      // 5. Remove image-related elements
+      target.find('picture, source, figure, figcaption, .image, .img, .photo, .picture, .media, .gallery, .slideshow, .carousel').remove();
       
-      // Remove empty elements and whitespace-only elements
-      $('*').each((_, element) => {
-        const $element = $(element);
-        if ($element.children().length === 0 && $element.text().trim() === '') {
-          $element.remove();
+      // 6. Extract text with structural cues
+      // We'll manually build a simplified markdown-like text to preserve some structure
+      let extractedText = '';
+      
+       target.find('h1, h2, h3, h4, h5, h6, p, li, a').each((_, el) => {
+         const $el = $(el);
+         const tag = (el as any).tagName.toLowerCase();
+         const text = $el.text().trim();
+        
+        if (!text) return;
+
+        if (tag.startsWith('h')) {
+          const level = parseInt(tag.substring(1));
+          extractedText += `\n\n${'#'.repeat(level)} ${text}\n`;
+        } else if (tag === 'li') {
+          extractedText += `\n* ${text}`;
+        } else if (tag === 'p') {
+          extractedText += `\n${text}\n`;
+        } else if (tag === 'a') {
+          const href = $el.attr('href');
+          extractedText += href ? ` [${text}](${href}) ` : ` ${text} `;
+        } else {
+          extractedText += ` ${text} `;
         }
       });
-      
-      return $('*').text().trim();
+
+      return extractedText.replace(/\n\s*\n/g, '\n\n').trim();
+
     } catch (error) {
       console.log('[EnhancedContentExtractor] parseContent error:', error);
-      // Return raw text as fallback
+      // Fallback to basic text extraction if complex parsing fails
       return html.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
                 .replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, '')
                 .replace(/<[^>]+>/g, ' ')

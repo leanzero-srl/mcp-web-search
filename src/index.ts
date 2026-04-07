@@ -158,7 +158,12 @@ class WebSearchMCPServer {
       version: '0.3.1',
     });
 
-    this.searchEngine = new SearchEngine();
+    const maxRPM = parseInt(process.env.SEARCH_ENGINE_MAX_RPM || '10', 10);
+    const resetMS = parseInt(process.env.SEARCH_ENGINE_RESET_MS || '60000', 10);
+    this.searchEngine = new SearchEngine({
+      maxRequestsPerMinute: maxRPM,
+      resetIntervalMs: resetMS,
+    });
     this.contentExtractor = new EnhancedContentExtractor();
 
     // Initialize GitHub extractor with defaults
@@ -267,6 +272,17 @@ class WebSearchMCPServer {
             responseText += `URL: ${searchResult.url}\n`;
             responseText += `Description: ${searchResult.description}\n`;
             
+            if (searchResult.digest) {
+              const { entities, claims, keyTerms } = searchResult.digest;
+              if (entities.length > 0 || claims.length > 0 || keyTerms.length > 0) {
+                responseText += `\n**Research Digest:**\n`;
+                if (entities.length > 0) responseText += `- **Entities:** ${entities.join(', ')}\n`;
+                if (claims.length > 0) responseText += `- **Key Claims:** ${claims.join(' | ')}\n`;
+                if (keyTerms.length > 0) responseText += `- **Key Terms:** ${keyTerms.join(', ')}\n`;
+                responseText += `\n`;
+              }
+            }
+
             if (searchResult.fullContent && searchResult.fullContent.trim()) {
               let content = searchResult.fullContent;
               if (maxLength && maxLength > 0 && content.length > maxLength) {
@@ -421,33 +437,38 @@ class WebSearchMCPServer {
 
           console.log(`[MCP] Starting single page content extraction for: ${obj.url}`);
           
-          // Use existing content extractor to get page content
-          const content = await this.contentExtractor.extractContent({
-            url: obj.url,
-            maxContentLength,
-          });
+           // Use existing content extractor to get page content
+           const contentObj = await this.contentExtractor.extractContent({
+             url: obj.url,
+             maxContentLength,
+           });
+           const content = contentObj.content;
+ 
+           // Get page title from URL (simple extraction)
+           const urlObj = new URL(obj.url);
+           const title = urlObj.hostname + urlObj.pathname;
+ 
+           // Create content preview and word count
+           // const contentPreview = content.length > 200 ? content.substring(0, 200) + '...' : content; // Unused for now
+           const wordCount = content.split(/\s+/).filter((word: string) => word.length > 0).length;
+ 
+           console.log(`[MCP] Single page content extraction completed, extracted ${content.length} characters`);
+ 
+           // Format the result as text
+           const header = `**Source:** ${obj.url} | **Title:** ${title} | **Words:** ${wordCount}\n\n`;
+           let body = '';
 
-          // Get page title from URL (simple extraction)
-          const urlObj = new URL(obj.url);
-          const title = urlObj.hostname + urlObj.pathname;
-
-          // Create content preview and word count
-          // const contentPreview = content.length > 200 ? content.substring(0, 200) + '...' : content; // Unused for now
-          const wordCount = content.split(/\s+/).filter(word => word.length > 0).length;
-
-          console.log(`[MCP] Single page content extraction completed, extracted ${content.length} characters`);
-
-          // Format the result as text
-          let responseText = `**Page Content from: ${obj.url}**\n\n`;
-          responseText += `**Title:** ${title}\n`;
-          responseText += `**Word Count:** ${wordCount}\n`;
-          responseText += `**Content Length:** ${content.length} characters\n\n`;
-          
-          if (maxContentLength && maxContentLength > 0 && content.length > maxContentLength) {
-            responseText += `**Content (truncated at ${maxContentLength} characters):**\n${content.substring(0, maxContentLength)}\n\n[Content truncated at ${maxContentLength} characters]`;
-          } else {
-            responseText += `**Content:**\n${content}`;
-          }
+           if (maxContentLength && maxContentLength > 0) {
+             const remainingSpace = maxContentLength - header.length - 50;
+             if (content.length > remainingSpace) {
+               body = `**Content (truncated):**\n${content.substring(0, Math.max(0, remainingSpace))}\n\n[Content truncated to respect limit]`;
+             } else {
+               body = `**Content:**\n${content}`;
+             }
+           } else {
+             body = `**Content:**\n${content}`;
+           }
+           const responseText = header + body;
 
           return {
             content: [
@@ -532,24 +553,14 @@ class WebSearchMCPServer {
 
           console.log(`[MCP] GitHub extraction completed: ${result.repositoryInfo.owner}/${result.repositoryInfo.repo} (${result.files.length} files)`);
 
-          // Format the result as text
-          let responseText = `**GitHub Repository Content from: ${obj.url}**\n\n`;
-          responseText += `**Repository:** ${result.repositoryInfo.owner}/${result.repositoryInfo.repo}\n`;
-          responseText += `**Default Branch:** ${result.repositoryInfo.defaultBranch}\n`;
-          responseText += `**Files Extracted:** ${result.files.length}\n\n`;
-          
-          // Add README if available
-          if (result.readme && result.readme.trim()) {
-            let readmeContent = result.readme.trim();
-            const maxLength = maxDepth || maxFiles ? 2000 : 5000;
-            if (readmeContent.length > maxLength) {
-              readmeContent = readmeContent.substring(0, maxLength) + `\n\n[README truncated at ${maxLength} characters]`;
-            }
-            responseText += `**README.md:**\n${readmeContent}\n\n`;
+          let responseText = `**Repository:** ${result.repositoryInfo.owner}/${result.repositoryInfo.repo}\n\n`;
+
+          if (result.readme) {
+            responseText += `**README.md:**\n${result.readme}\n\n`;
           } else {
             responseText += `**README.md:** No README found\n\n`;
           }
-          
+
           // Add file list
           if (result.files.length > 0) {
             responseText += `**Files:**\n`;

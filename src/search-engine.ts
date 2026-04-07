@@ -7,14 +7,31 @@ import { BrowserPool } from './browser-pool.js';
 
 // Import WebKit-first browser engine
 import { createOptimizedBrowser, getEnginePriorityOrder, BrowserEngineType, getHeadlessOption } from './browser-engine.js';
+import pLimit from 'p-limit';
+
+export interface SearchEngineConfig {
+  maxRequestsPerMinute?: number;
+  resetIntervalMs?: number;
+  maxConcurrentSearches?: number;
+}
 
 export class SearchEngine {
   private readonly rateLimiter: RateLimiter;
   private browserPool: BrowserPool;
+  private readonly concurrencyLimiter: ReturnType<typeof pLimit>;
+  private readonly maxConcurrentSearches: number;
 
-  constructor() {
-    this.rateLimiter = new RateLimiter(10); // 10 requests per minute
+  constructor(config: SearchEngineConfig = {}) {
+    const { 
+      maxRequestsPerMinute = 10, 
+      resetIntervalMs = 60000, 
+      maxConcurrentSearches = 3 
+    } = config;
+    
+    this.rateLimiter = new RateLimiter(maxRequestsPerMinute, resetIntervalMs);
     this.browserPool = new BrowserPool();
+    this.maxConcurrentSearches = maxConcurrentSearches;
+    this.concurrencyLimiter = pLimit(maxConcurrentSearches);
     
     console.log(`[SearchEngine] Using WebKit-first engine priority: ${getEnginePriorityOrder().join(' -> ')}`);
   }
@@ -26,26 +43,28 @@ export class SearchEngine {
     console.log(`[SearchEngine] Starting parallel search for query: "${sanitizedQuery}"`);
     
     try {
-      return await this.rateLimiter.execute(async () => {
-        // Configuration from environment variables
-        const enableQualityCheck = process.env.ENABLE_RELEVANCE_CHECKING !== 'false';
-        const qualityThreshold = parseFloat(process.env.RELEVANCE_THRESHOLD || '0.3');
-        const forceMultiEngine = process.env.FORCE_MULTI_ENGINE_SEARCH === 'true';
-        
-        console.log(`[SearchEngine] Quality checking: ${enableQualityCheck}, threshold: ${qualityThreshold}`);
+      // First, respect the concurrency limit for active searches
+      return await this.concurrencyLimiter(() => 
+        this.rateLimiter.execute(async () => {
+          // Configuration from environment variables
+          const enableQualityCheck = process.env.ENABLE_RELEVANCE_CHECKING !== 'false';
+          const qualityThreshold = parseFloat(process.env.RELEVANCE_THRESHOLD || '0.3');
+          
+          console.log(`[SearchEngine] Quality checking: ${enableQualityCheck}, threshold: ${qualityThreshold}`);
 
-        // WebKit-first engine priority for parallel search
-        const enginePriority: BrowserEngineType[] = getEnginePriorityOrder();
-        const useParallel = process.env.PARALLEL_SEARCH !== 'false'; // Default to true
-        
-        if (useParallel) {
-          console.log(`[SearchEngine] Running parallel search with engines: ${enginePriority.join(', ')}`);
-          return await this.searchWithParallelEngines(sanitizedQuery, numResults, timeout, enableQualityCheck, qualityThreshold);
-        } else {
-          console.log(`[SearchEngine] Using sequential search fallback`);
-          return await this.searchWithSequentialFallbacks(sanitizedQuery, numResults, timeout, enableQualityCheck, qualityThreshold);
-        }
-      });
+          // WebKit-first engine priority for parallel search
+          const enginePriority: BrowserEngineType[] = getEnginePriorityOrder();
+          const useParallel = process.env.PARALLEL_SEARCH !== 'false'; // Default to true
+          
+          if (useParallel) {
+            console.log(`[SearchEngine] Running parallel search with engines: ${enginePriority.join(', ')}`);
+            return await this.searchWithParallelEngines(sanitizedQuery, numResults, timeout, enableQualityCheck, qualityThreshold);
+          } else {
+            console.log(`[SearchEngine] Using sequential search fallback`);
+            return await this.searchWithSequentialFallbacks(sanitizedQuery, numResults, timeout, enableQualityCheck, qualityThreshold);
+          }
+        })
+      );
     } catch (error) {
       console.error('[SearchEngine] Search error:', error);
       if (axios.isAxiosError(error)) {
@@ -60,7 +79,9 @@ export class SearchEngine {
   }
 
   /**
-   * Parallel search using Promise.race() - tries multiple engines simultaneously
+   * Implements a smart parallel search strategy that avoids exhausting the browser pool.
+   * Instead of launching all engines at once, it tries them in priority order,
+   * only launching subsequent engines if the previous ones didn't meet quality thresholds.
    */
   private async searchWithParallelEngines(
     query: string,
@@ -70,58 +91,52 @@ export class SearchEngine {
     qualityThreshold: number
   ): Promise<SearchResultWithMetadata> {
     const startTime = Date.now();
-    
-    // Create parallel search promises for each engine
     const enginePriority: BrowserEngineType[] = getEnginePriorityOrder();
-    const searchPromises = enginePriority.map((engineType, index) => ({
-      engineType,
-      promise: this.runSearchWithEngine(engineType, query, numResults, timeout / 3)
-        .then(results => {
-          if (results.length > 0 && enableQualityCheck) {
-            const qualityScore = this.assessResultQuality(results, query);
-            console.log(`[SearchEngine] Parallel ${engineType} found ${results.length} results (quality: ${qualityScore.toFixed(2)})`);
-            
-            // Return early with high-quality results
-            if (qualityScore >= 0.8) {
-              return { results, engine: `${engineType}-parallel`, qualityScore };
-            }
-            
-            // Check if quality meets threshold
-            if (qualityScore >= qualityThreshold || index === enginePriority.length - 1) {
-              return { results, engine: `${engineType}-parallel`, qualityScore };
-            }
-          } else if (results.length > 0) {
-            console.log(`[SearchEngine] Parallel ${engineType} found ${results.length} results`);
-            return { results, engine: `${engineType}-parallel`, qualityScore: 1.0 };
-          }
-          
-          // Return null to indicate this engine didn't produce good enough results
-          return null;
-        })
-        .catch(error => {
-          console.log(`[SearchEngine] Parallel ${engineType} search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-          return null;
-        }),
-    }));
+    
+    // We use a generous timeout for individual engines to account for browser pool queuing
+    const engineTimeout = Math.max(timeout, 25000); 
+    
+    console.log(`[SearchEngine] Starting smart parallel search (priority: ${enginePriority.join(', ')})`);
 
-    // Race all searches and return first successful result
-    for (const { engineType, promise } of searchPromises) {
+    for (let i = 0; i < enginePriority.length; i++) {
+      const engineType = enginePriority[i];
+      console.log(`[SearchEngine] Attempting priority engine ${i + 1}/${enginePriority.length}: ${engineType}`);
+      
       try {
-        const result = await Promise.race([promise, new Promise<null>((_, reject) => 
-          setTimeout(() => reject(new Error('Search timeout')), timeout / 2)
-        )]);
+        // Check if we have exceeded the overall search timeout
+        const remainingTime = timeout - (Date.now() - startTime);
+        if (remainingTime <= 0) {
+          console.log(`[SearchEngine] Search timeout reached before attempting engine ${engineType}`);
+          break;
+        }
+
+        // Implement a small delay between engine attempts to allow browser resources to settle
+        if (i > 0) {
+          const delay = Math.min(2000, remainingTime / 2);
+          console.log(`[SearchEngine] Throttling: waiting ${delay.toFixed(0)}ms before next engine attempt...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+
+        const results = await this.runSearchWithEngine(engineType, query, numResults, Math.min(engineTimeout, remainingTime + 5000));
         
-        if (result && result.qualityScore >= qualityThreshold) {
-          console.log(`[SearchEngine] Parallel search completed in ${Date.now() - startTime}ms using ${engineType}`);
-          return { results: result.results, engine: result.engine };
+        if (results && results.length > 0) {
+          const qualityScore = enableQualityCheck ? this.assessResultQuality(results, query) : 1.0;
+          console.log(`[SearchEngine] Engine ${engineType} returned ${results.length} results (quality: ${qualityScore.toFixed(2)})`);
+
+          if (qualityScore >= qualityThreshold || i === enginePriority.length - 1) {
+            console.log(`[SearchEngine] Smart parallel search completed in ${Date.now() - startTime}ms using ${engineType}`);
+            return { results, engine: `${engineType}-smart-parallel` };
+          }
+          console.log(`[SearchEngine] Quality score ${qualityScore.toFixed(2)} below threshold ${qualityThreshold}, trying next engine...`);
+        } else {
+          console.log(`[SearchEngine] Engine ${engineType} returned no results.`);
         }
       } catch (error) {
-        // Search timed out or failed, continue to next
-        console.log(`[SearchEngine] Parallel search for ${engineType} did not succeed`);
+        console.log(`[SearchEngine] Engine ${engineType} search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
     }
     
-    console.log(`[SearchEngine] All parallel searches completed in ${Date.now() - startTime}ms`);
+    console.log(`[SearchEngine] All priority engines exhausted in ${Date.now() - startTime}ms`);
     return { results: [], engine: 'none' };
   }
 
@@ -237,9 +252,6 @@ export class SearchEngine {
     }
   }
 
-
-
-
   private async tryBrowserBraveSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
     console.log(`[SearchEngine] Trying browser-based Brave search with dedicated browser...`);
     
@@ -308,12 +320,15 @@ export class SearchEngine {
           timeout: timeout
         });
 
-        // Wait for search results to load
-        try {
-          await page.waitForSelector('[data-type="web"]', { timeout: 3000 });
-        } catch {
-          console.log(`[SearchEngine] Browser Brave results selector not found, proceeding anyway`);
-        }
+         // Wait for search results to load with a buffer for hydration
+         try {
+           // Use more specific selectors for Brave and increase timeout/buffer
+           await page.waitForSelector('[data-type="web"], .result, .b_algo, .result__a, [class*="result"], [class*="web"]', { timeout: 12000 });
+           // Extra buffer for Brave's heavy JS hydration to ensure content is rendered
+           await new Promise(resolve => setTimeout(resolve, 5000));
+         } catch {
+           console.log(`[SearchEngine] Browser Brave results selector not found or hydration timed out, proceeding anyway`);
+         }
 
         // Get the page content
         const html = await page.content();
@@ -558,6 +573,20 @@ export class SearchEngine {
     return results;
   }
 
+  /**
+   * Safely retrieves page properties that might fail due to navigation/context destruction
+   */
+  private async getSafePageMetadata(page: any): Promise<{ title: string; url: string }> {
+    try {
+      return {
+        title: await page.title(),
+        url: page.url(),
+      };
+    } catch (e) {
+      return { title: '', url: '' };
+    }
+  }
+
   private async tryDirectBingSearch(page: any, query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
     const debugBing = process.env.DEBUG_BING_SEARCH === 'true';
     console.error(`[SearchEngine] BING: Direct search with enhanced parameters...`);
@@ -570,26 +599,102 @@ export class SearchEngine {
     console.error(`[SearchEngine] BING: Navigating to direct URL: ${searchUrl}`);
     
     const startTime = Date.now();
-    await page.goto(searchUrl, { 
-      waitUntil: 'domcontentloaded',
-      timeout: timeout
-    });
     
-    const loadTime = Date.now() - startTime;
-    const pageTitle = await page.title();
-    const currentUrl = page.url();
-    console.error(`[SearchEngine] BING: Direct page loaded in ${loadTime}ms, title: "${pageTitle}", URL: ${currentUrl}`);
-
-    // Wait for search results to load
-    try {
-      console.error(`[SearchEngine] BING: Waiting for search results to appear...`);
-      await page.waitForSelector('.b_algo, .b_result', { timeout: 3000 });
-      console.error(`[SearchEngine] BING: Search results selector found`);
-    } catch {
-      console.error(`[SearchEngine] BING: Search results selector not found, proceeding with page content anyway`);
+    // Try navigation with retries to handle potential redirection/context destruction
+    let success = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        // Use 'domcontentloaded' initially to be faster and less prone to 'networkidle' timeouts/race conditions
+        await page.goto(searchUrl, { 
+          waitUntil: 'domcontentloaded',
+          timeout: timeout
+        });
+        
+        // Wait for network to settle slightly after domcontentloaded
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        
+        // Then try to wait for networkidle if it's not already stable
+        try {
+          await page.waitForLoadState('networkidle', { timeout: 3000 });
+        } catch {
+          // If networkidle times out, it's fine, we already have domcontentloaded and a buffer
+        }
+ 
+        success = true;
+        break;
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : 'Unknown error';
+        console.warn(`[SearchEngine] BING: Direct navigation attempt ${attempt} failed: ${errMsg}`);
+        if (attempt === 2) {
+          // Final attempt fallback to a faster waitUntil if networkidle fails
+          try {
+            await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: timeout / 2 });
+            success = true;
+            break;
+          } catch (finalE) {
+            console.error(`[SearchEngine] BING: All navigation attempts failed.`);
+          }
+        }
+        // Small delay before retry
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+    
+    if (!success) {
+       console.error(`[SearchEngine] BING: Failed to navigate to search results.`);
+       // We still attempt to parse whatever state the page is in
     }
 
-    const html = await page.content();
+    const loadTime = Date.now() - startTime;
+    // Use the safe metadata getter which handles context destruction
+    const { title: pageTitle, url: currentUrl } = await this.getSafePageMetadata(page);
+    console.error(`[SearchEngine] BING: Page state check in ${loadTime}ms, title: "${pageTitle}", URL: ${currentUrl}`);
+    
+    // Wait for search results to load with a retry mechanism for the selector
+    try {
+      console.error(`[SearchEngine] BING: Waiting for search results to appear...`);
+      // Use a broader set of selectors and a longer timeout
+      await page.waitForSelector('.b_algo, .b_result, [class*="b_algo"], [class*="b_result"], .b_card, [role="main"], .b_search_result', { 
+        timeout: 12000,
+        state: 'visible' 
+      });
+      // Small buffer to allow potential subsequent redirections or hydration to settle
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      console.error(`[SearchEngine] BING: Search results selector found`);
+    } catch (e) {
+      console.error(`[SearchEngine] BING: Search results selector not found or timed out, proceeding with page content anyway`);
+    }
+
+    // Additional check: if we have the page but no results are visible, wait a bit more for hydration
+    const isResultsPresent = await page.$('.b_algo, .b_result, [class*="b_algo"], [class*="b_result"], .b_search_result');
+    if (!isResultsPresent) {
+      console.log(`[SearchEngine] BING: Results not immediately visible, waiting for hydration...`);
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+    
+    // Retry retrieving content if it fails due to context destruction
+    let html = '';
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        html = await page.content();
+        break;
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : 'Unknown error';
+        console.warn(`[SearchEngine] BING: Attempt ${attempt} to get page content failed: ${errMsg}`);
+        if (errMsg.includes('context was destroyed')) {
+          if (attempt === 3) {
+            console.error(`[SearchEngine] BING: Context was destroyed during content retrieval on final attempt. Returning empty results.`);
+            return [];
+          }
+          // If it's not the last attempt, wait a bit and try again
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        } else {
+          // For other errors, break and use whatever we have (or empty)
+          break;
+        }
+      }
+    }
+    
     console.error(`[SearchEngine] BING: Got page HTML with length: ${html.length} characters`);
     
     if (debugBing && html.length < 10000) {
@@ -625,33 +730,68 @@ export class SearchEngine {
   private async tryDuckDuckGoSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
     console.log(`[SearchEngine] Trying DuckDuckGo as fallback...`);
     
+    // Attempt 1: Fast Axios-based HTML scraping
     try {
       const response = await axios.get('https://html.duckduckgo.com/html/', {
-        params: {
-          q: query,
-        },
+        params: { q: query },
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
-          'Accept-Encoding': 'gzip, deflate',
-          'DNT': '1',
-          'Connection': 'keep-alive',
-          'Upgrade-Insecure-Requests': '1',
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
         },
-        timeout,
-        validateStatus: (status: number) => status < 400,
+        timeout: Math.min(timeout, 5000),
+        validateStatus: (status) => status < 400,
       });
 
-      console.log(`[SearchEngine] DuckDuckGo got response with status: ${response.status}`);
-      
       const results = this.parseDuckDuckGoResults(response.data, numResults);
-      console.log(`[SearchEngine] DuckDuckGo parsed ${results.length} results`);
+      if (results.length > 0) {
+        console.log(`[SearchEngine] DuckDuckGo Axios parsed ${results.length} results`);
+        return results;
+      }
+      console.warn(`[SearchEngine] DuckDuckGo Axios returned 0 results, trying browser fallback...`);
+    } catch (error) {
+      console.warn(`[SearchEngine] DuckDuckGo Axios attempt failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+
+    // Attempt 2: Robust Playwright-based search if Axios fails or returns nothing
+    console.log(`[SearchEngine] Attempting robust browser-based DuckDuckGo search...`);
+    let browser;
+    try {
+      const { chromium } = await import('playwright');
+      browser = await chromium.launch({
+        headless: process.env.BROWSER_HEADLESS !== 'false',
+        args: ['--no-sandbox', '--disable-dev-shm-usage']
+      });
+      const context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+      });
+      const page = await context.newPage();
       
+      const searchUrl = `https://duckduckgo.com/?q=${encodeURIComponent(query)}&ia=web`;
+      // Use a more robust navigation strategy for DuckDuckGo browser fallback
+      await page.goto(searchUrl, { 
+        waitUntil: 'load', 
+        timeout: Math.max(timeout, 30000) 
+      });
+      
+      // Wait for results to appear with a more generous timeout and multiple selector options
+      try {
+        await page.waitForSelector('.result__a, .result, [class*="result"]', { timeout: 10000 });
+      } catch (e) {
+        console.warn(`[SearchEngine] DuckDuckGo browser results selector not found or timed out, proceeding anyway`);
+      }
+
+      const html = await page.content();
+      const results = this.parseDuckDuckGoResults(html, numResults);
+      console.log(`[SearchEngine] DuckDuckGo Browser parsed ${results.length} results`);
+      
+      await context.close();
       return results;
-    } catch {
-      console.error(`[SearchEngine] DuckDuckGo search failed`);
+    } catch (error) {
+      console.error(`[SearchEngine] DuckDuckGo browser search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       throw new Error('DuckDuckGo search failed');
+    } finally {
+      if (browser) await browser.close();
     }
   }
 
@@ -801,19 +941,22 @@ export class SearchEngine {
     return results;
   }
 
-  private parseBraveResults(html: string, maxResults: number): SearchResult[] {
-    console.log(`[SearchEngine] Parsing Brave HTML with length: ${html.length}`);
-    
-    const $ = cheerio.load(html);
-    const results: SearchResult[] = [];
-    const timestamp = generateTimestamp();
+   private parseBraveResults(html: string, maxResults: number): SearchResult[] {
+     console.log(`[SearchEngine] Parsing Brave HTML with length: ${html.length}`);
+     
+     const $ = cheerio.load(html);
+     const results: SearchResult[] = [];
+     const timestamp = generateTimestamp();
 
-    // Brave result selectors
-    const resultSelectors = [
-      '[data-type="web"]',     // Main Brave results
-      '.result',               // Alternative format
-      '.fdb'                   // Brave specific format
-    ];
+     // Brave result selectors - expanded to be more robust
+     const resultSelectors = [
+       '[data-type="web"]',     // Main Brave results
+       '.result',               // Alternative format
+       '.fdb',                  // Brave specific format
+       '[class*="result"]',     // Any class containing "result"
+       '[class*="web-result"]', // Any class containing "web-result"
+       'div[role="listitem"]'   // Common list item role
+     ];
     
     let foundResults = false;
     
@@ -917,97 +1060,123 @@ export class SearchEngine {
       console.error(`[SearchEngine] BING: ERROR - Bot detection or access denied detected in page title`);
     }
 
-    // Bing result selectors
-    const resultSelectors = [
-      '.b_algo',     // Main Bing results
-      '.b_result',   // Alternative Bing format
-      '.b_card'      // Card format
-    ];
-    
-    console.error(`[SearchEngine] BING: Checking for result elements...`);
-    
-    // Log counts for all selectors first
-    for (const selector of resultSelectors) {
-      const elements = $(selector);
-      console.error(`[SearchEngine] BING: Found ${elements.length} elements with selector "${selector}"`);
-    }
+    // Bing result parsing - more robust approach
+    // Instead of relying on container selectors which can be inconsistent,
+    // we look for the actual result elements (h2 a is the most reliable Bing pattern)
+    console.error(`[SearchEngine] BING: Starting robust parsing...`);
     
     let foundResults = false;
-    
-    for (const selector of resultSelectors) {
-      if (foundResults && results.length >= maxResults) break;
-      
-      const elements = $(selector);
-      if (elements.length === 0) continue;
-      
-      elements.each((_index, element) => {
-        if (results.length >= maxResults) return false;
 
-        const $element = $(element);
-        
-        // Try multiple title selectors for Bing
-        const titleSelectors = [
-          'h2 a',           // Standard Bing format
-          '.b_title a',     // Alternative format
-          'a[data-seid]'    // Bing specific
-        ];
-        
-        let title = '';
-        let url = '';
-        
-        for (const titleSelector of titleSelectors) {
-          const $titleElement = $element.find(titleSelector).first();
-          if ($titleElement.length) {
-            title = $titleElement.text().trim();
-            url = $titleElement.attr('href') || '';
-            console.log(`[SearchEngine] Bing found title with ${titleSelector}: "${title}"`);
-            break;
-          }
-        }
-        
-        // Try multiple snippet selectors for Bing
-        const snippetSelectors = [
-          '.b_caption p',           // Standard Bing snippet
-          '.b_snippet',             // Alternative format
-          '.b_descript',            // Description format
-          '.b_caption',             // Caption without p tag
-          '.b_caption > span',      // Caption span
-          '.b_excerpt',             // Excerpt format
-          'p',                      // Any paragraph in the result
-          '.b_algo_content p',      // Content paragraph
-          '.b_algo_content',        // Full content area
-          '.b_context'              // Context information
-        ];
-        
+    // 1. Find all potential result links (h2 a is the most reliable Bing pattern)
+    // We also look for other common patterns like h3 a or just any link within a result container
+    const resultLinks = $('h2 a, h3 a, .b_algo a, .b_result a').toArray();
+    console.error(`[SearchEngine] BING: Found ${resultLinks.length} potential result links via combined selectors`);
+
+    for (const linkElement of resultLinks) {
+      if (results.length >= maxResults) break;
+
+      const $link = $(linkElement);
+      const title = $link.text().trim();
+      const url = $link.attr('href') || '';
+
+      // Basic validation: must have title and a valid URL, and not be a Bing internal link
+      if (title && url && this.isValidSearchUrl(url) && !url.includes('bing.com/ck/a?!&&p=')) {
+        // 2. Find the snippet for this result. 
+        // We look for the closest container that might hold the snippet.
         let snippet = '';
-        for (const snippetSelector of snippetSelectors) {
-          const $snippetElement = $element.find(snippetSelector).first();
-          if ($snippetElement.length) {
-            const candidateSnippet = $snippetElement.text().trim();
-            // Skip very short snippets or those that look like metadata
-            if (candidateSnippet.length > 20 && !candidateSnippet.match(/^\d+\s*(min|sec|hour|day|week|month|year)/i)) {
-              snippet = candidateSnippet;
-              console.log(`[SearchEngine] Bing found snippet with ${snippetSelector}: "${snippet.substring(0, 100)}..."`);
-              break;
+        
+        // Try common Bing snippet containers relative to the title
+        const $container = $link.closest('.b_algo, .b_result, .b_card, [class*="b_algo"], [class*="b_result"], .result-item, div[class*="b_algo"], div[class*="b_result"], .b_search_result, .b_item');
+        
+        if ($container.length) {
+          const snippetSelectors = [
+            '.b_caption p',
+            '.b_snippet',
+            '.b_descript',
+            '.b_caption',
+            '.b_excerpt',
+            'p',
+            '.b_algo_content p',
+            '.b_algo_content',
+            '.b_desc',
+            '.b_description'
+          ];
+
+          for (const selector of snippetSelectors) {
+            const $snippetElement = $container.find(selector).first();
+            if ($snippetElement.length) {
+              const candidateSnippet = $snippetElement.text().trim();
+              // Avoid very short snippets or ones that look like timestamps/metadata
+              if (candidateSnippet.length > 20 && !candidateSnippet.match(/^\d+\s*(min|sec|hour|day|week|month|year)/i)) {
+                snippet = candidateSnippet;
+                break;
+              }
+            }
+          }
+        } else {
+          // Fallback: if no container found, try searching the whole document for a paragraph near the title
+          // This is a last resort and might be less accurate.
+          const $allPs = $('p');
+          for (let i = 0; i < $allPs.length; i++) {
+            const $p = $($allPs[i]);
+            if ($p.text().trim().length > 20 && $p.text().trim().includes(title.substring(0, 10))) {
+               snippet = $p.text().trim();
+               break;
             }
           }
         }
-        
-        if (title && url && this.isValidSearchUrl(url)) {
-          console.log(`[SearchEngine] Bing found: "${title}" -> "${url}"`);
-          results.push({
-            title,
-            url: this.cleanBingUrl(url),
-            description: snippet || 'No description available',
-            fullContent: '',
-            contentPreview: '',
-            wordCount: 0,
-            timestamp,
-            fetchStatus: 'success',
-          });
-          foundResults = true;
-        }
-      });
+
+        console.log(`[SearchEngine] Bing found: "${title}" -> "${url}"`);
+        results.push({
+          title,
+          url: this.cleanBingUrl(url),
+          description: snippet || 'No description available',
+          fullContent: '',
+          contentPreview: '',
+          wordCount: 0,
+          timestamp,
+          fetchStatus: 'success',
+        });
+        foundResults = true;
+      }
+    }
+
+    if (!foundResults) {
+      console.error(`[SearchEngine] BING: No results found via primary selectors. Trying fallback container-based approach...`);
+      // Fallback to the old selector-based approach if the primary one fails
+      const fallbackSelectors = [
+        '.b_algo, .b_result, [class*="b_algo"], [class*="b_result"], .b_card, .b_search_result',
+        '.b_item',
+        '.result-item',
+        '[role="listitem"]'
+      ];
+      for (const selector of fallbackSelectors) {
+        if (results.length >= maxResults) break;
+        const elements = $(selector);
+        elements.each((_index, element) => {
+          if (results.length >= maxResults) return false;
+          const $el = $(element);
+          
+          // Try multiple title/link combinations within the container
+          const $titleLink = $el.find('h2 a, h3 a, .b_title a, .result-title a, a[href]').first();
+          const title = $titleLink.text().trim();
+          const url = $titleLink.attr('href') || '';
+          
+          if (title && url && this.isValidSearchUrl(url) && !url.includes('bing.com/ck/a?!&&p=')) {
+             results.push({
+               title,
+               url: this.cleanBingUrl(url),
+               description: $el.text().substring(0, 250).trim(),
+               fullContent: '',
+               contentPreview: '',
+               wordCount: 0,
+               timestamp,
+               fetchStatus: 'success',
+             });
+             foundResults = true;
+          }
+        });
+      }
     }
 
     console.log(`[SearchEngine] Bing found ${results.length} results`);
@@ -1060,8 +1229,6 @@ export class SearchEngine {
            url.startsWith('http://') || 
            url.startsWith('https://') ||
            url.startsWith('//') ||
-           url.startsWith('/search?') ||
-           url.startsWith('/') ||
            url.includes('google.com') ||
            url.length > 10; // Accept any reasonably long URL
   }
@@ -1171,111 +1338,41 @@ export class SearchEngine {
 
       // Check for exact phrase matches (higher value)
       if (queryWords.length >= 2) {
-        const queryPhrases = [];
-        for (let i = 0; i < queryWords.length - 1; i++) {
-          queryPhrases.push(queryWords.slice(i, i + 2).join(' '));
-        }
-        if (queryWords.length >= 3) {
-          queryPhrases.push(queryWords.slice(0, 3).join(' '));
-        }
-
-        for (const phrase of queryPhrases) {
-          if (combinedText.includes(phrase)) {
-            phraseMatches++;
-          }
+        const queryPhrases = queryWords.slice(0, 2).join(' ');
+        if (combinedText.includes(queryPhrases)) {
+          phraseMatches++;
         }
       }
 
-      // Check individual keyword matches
-      for (const keyword of queryWords) {
-        if (combinedText.includes(keyword)) {
-          keywordMatches++;
-        }
-      }
+      // Count keyword matches
+      keywordMatches = queryWords.reduce((acc, word) => {
+        return acc + (combinedText.includes(word) ? 1 : 0);
+      }, 0);
 
-      // Calculate score for this result
-      const keywordRatio = keywordMatches / queryWords.length;
-      const phraseBonus = phraseMatches * 0.3; // Bonus for phrase matches
-      const resultScore = Math.min(1.0, keywordRatio + phraseBonus);
-
-      // Penalty for obvious irrelevant content
-      const irrelevantPatterns = [
-        /recipe/i, /cooking/i, /food/i, /restaurant/i, /menu/i,
-        /weather/i, /temperature/i, /forecast/i,
-        /shopping/i, /sale/i, /price/i, /buy/i, /store/i,
-        /movie/i, /film/i, /tv show/i, /entertainment/i,
-        /sports/i, /game/i, /score/i, /team/i,
-        /fashion/i, /clothing/i, /style/i,
-        /travel/i, /hotel/i, /flight/i, /vacation/i,
-        /car/i, /vehicle/i, /automotive/i,
-        /real estate/i, /property/i, /house/i, /apartment/i
-      ];
-
-      let penalty = 0;
-      for (const pattern of irrelevantPatterns) {
-        if (pattern.test(combinedText)) {
-          penalty += 0.2;
-        }
-      }
-
-      const finalScore = Math.max(0, resultScore - penalty);
-      
-      console.log(`[SearchEngine] Result "${result.title.substring(0, 50)}..." - Score: ${finalScore.toFixed(2)} (keywords: ${keywordMatches}/${queryWords.length}, phrases: ${phraseMatches}, penalty: ${penalty.toFixed(2)})`);
-      
-      totalScore += finalScore;
+      const score = (keywordMatches / queryWords.length) * 0.6 + (phraseMatches > 0 ? 0.4 : 0);
+      totalScore += score;
       scoredResults++;
     }
 
-    const averageScore = scoredResults > 0 ? totalScore / scoredResults : 0;
-    return averageScore;
+    return scoredResults > 0 ? totalScore / scoredResults : 0;
   }
 
-  private async validateBrowserHealth(browser: any): Promise<boolean> {
-    const debugBrowsers = process.env.DEBUG_BROWSER_LIFECYCLE === 'true';
-    
-    try {
-      if (debugBrowsers) console.log(`[SearchEngine] Validating browser health...`);
-      
-      // Check if browser is still connected
-      if (!browser.isConnected()) {
-        if (debugBrowsers) console.log(`[SearchEngine] Browser is not connected`);
-        return false;
-      }
-      
-      // Try to create a simple context to test browser responsiveness
-      const testContext = await browser.newContext();
-      await testContext.close();
-      
-      if (debugBrowsers) console.log(`[SearchEngine] Browser health check passed`);
-      return true;
-    } catch (error) {
-      console.log(`[SearchEngine] Browser health check failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      return false;
-    }
-  }
-
-  private async handleBrowserError(error: any, engineName: string, attemptNumber: number = 1): Promise<void> {
+  private async handleBrowserError(error: any, engineName: string): Promise<void> {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error(`[SearchEngine] ${engineName} browser error (attempt ${attemptNumber}): ${errorMessage}`);
+    console.error(`[SearchEngine] ${engineName} error: ${errorMessage}`);
     
-    // Check for specific browser-related errors
-    if (errorMessage.includes('Target page, context or browser has been closed') ||
-        errorMessage.includes('Browser has been closed') ||
-        errorMessage.includes('Session has been closed')) {
-      
-      console.log(`[SearchEngine] Detected browser session closure, attempting to refresh browser pool`);
-      
-      // Try to refresh the browser pool for subsequent attempts
-      try {
-        await this.browserPool.closeAll();
-        console.log(`[SearchEngine] Browser pool refreshed for ${engineName}`);
-      } catch (refreshError) {
-        console.error(`[SearchEngine] Failed to refresh browser pool: ${refreshError instanceof Error ? refreshError.message : 'Unknown error'}`);
-      }
+    if (errorMessage.includes('context was destroyed')) {
+      console.warn(`[SearchEngine] ${engineName} encountered a destroyed execution context. This is often transient.`);
+    } else if (errorMessage.includes('timeout')) {
+      console.warn(`[SearchEngine] ${engineName} request timed out.`);
     }
   }
 
-  async closeAll(): Promise<void> {
+  /**
+   * Closes all browser instances in the pool and cleans up resources
+   */
+  public async closeAll(): Promise<void> {
+    console.log("[SearchEngine] Closing all browser instances...");
     await this.browserPool.closeAll();
   }
 }
