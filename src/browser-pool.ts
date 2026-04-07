@@ -25,14 +25,14 @@ export class BrowserPool {
     console.log(`[BrowserPool] Configuration: maxBrowsers=${this.maxBrowsers}, headless=${this.headless}, types=${this.browserTypes.join(',')}, legacyMode=${this.legacyMode}`);
   }
 
-  async getBrowser(): Promise<Browser> {
+  async getBrowser(type?: string): Promise<Browser> {
     // Use new context pool if not in legacy mode
     if (!this.legacyMode) {
       return this.getBrowserWithContextPool();
     }
     
     // Fallback to legacy browser pooling
-    return this.getBrowserLegacy();
+    return this.getBrowserLegacy(type);
   }
 
   /**
@@ -63,10 +63,12 @@ export class BrowserPool {
   /**
    * Legacy browser-based pooling (for backward compatibility)
    */
-  private async getBrowserLegacy(): Promise<Browser> {
-    // Rotate between browser types for variety
-    const browserType = this.browserTypes[this.currentBrowserIndex % this.browserTypes.length];
-    this.currentBrowserIndex++;
+  private async getBrowserLegacy(type?: string): Promise<Browser> {
+    // Use provided type or rotate between browser types for variety
+    const browserType = type || this.browserTypes[this.currentBrowserIndex % this.browserTypes.length];
+    if (!type) {
+      this.currentBrowserIndex++;
+    }
     this.lastUsedBrowserType = browserType;
 
     if (this.browsers.has(browserType)) {
@@ -114,6 +116,9 @@ export class BrowserPool {
         '--disable-renderer-backgrounding',
         '--disable-features=TranslateUI',
         '--disable-ipc-flooding-protection',
+        '--disable-infobars',
+        '--window-size=1920,1080',
+        '--start-maximized',
       ],
     };
 

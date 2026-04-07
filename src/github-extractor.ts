@@ -79,6 +79,7 @@ export class GitHubExtractor {
   private readonly apiUrl = 'https://api.github.com';
   private readonly timeout: number;
   private maxDepth: number;
+  private readonly githubToken?: string;
   private maxFiles: number;
   private includeCodeOnly: boolean;
 
@@ -87,8 +88,9 @@ export class GitHubExtractor {
     this.maxDepth = options?.maxDepth ?? 3;
     this.maxFiles = options?.maxFiles ?? 50;
     this.includeCodeOnly = options?.includeCodeOnly ?? true;
+    this.githubToken = process.env.GITHUB_TOKEN;
     
-    console.log(`[GitHubExtractor] Initialized with timeout=${this.timeout}ms, maxDepth=${this.maxDepth}, maxFiles=${this.maxFiles}`);
+    console.log(`[GitHubExtractor] Initialized with timeout=${this.timeout}ms, maxDepth=${this.maxDepth}, maxFiles=${this.maxFiles}${this.githubToken ? ', with token' : ''}`);
   }
 
   /**
@@ -291,11 +293,17 @@ export class GitHubExtractor {
    * Get GitHub API headers
    */
   private getHeaders(): Record<string, string> {
-    return {
+    const headers: Record<string, string> = {
       'Accept': 'application/vnd.github.v3+json',
       'User-Agent': 'Web-Search-MCP',
       'X-GitHub-Api-Version': '2022-11-28'
     };
+
+    if (this.githubToken) {
+      headers['Authorization'] = `token ${this.githubToken}`;
+    }
+
+    return headers;
   }
 
   /**

@@ -99,17 +99,46 @@ export function scoreContentQuality(
     reasons.push(`Avg word length: ${avgWordLength.toFixed(1)} chars`);
   }
   
-  // 3. Sentence structure (20% weight)
+  // 3. Sentence structure (15% weight)
   const sentences = cleanedContent.split(/[.!?]+/).filter(s => s.trim().length > 10);
   if (sentences.length >= 2) {
-    score += 0.2;
+    score += 0.15;
     reasons.push(`Multiple sentences (${sentences.length})`);
   } else if (sentences.length === 1) {
-    score += 0.1;
+    score += 0.05;
     reasons.push(`Single sentence detected`);
   }
   
-  // 4. Keyword relevance (10% weight, optional)
+  // 4. Structural integrity (15% weight)
+  // Check for presence of multiple headings or lists which indicate structured information
+  const hasHeadings = /#{1,6}\s/.test(cleanedContent) || /^[A-Z][^.!?]*\n/.test(cleanedContent);
+  const hasLists = /^\s*[\*\-\+]\s+/.test(cleanedContent) || /^\d+\.\s+/.test(cleanedContent);
+  
+  if (hasHeadings && hasLists) {
+    score += 0.15;
+    reasons.push(`High structural signal (headings + lists)`);
+  } else if (hasHeadings || hasLists) {
+    score += 0.07;
+    reasons.push(`Moderate structural signal`);
+  }
+
+  // 5. Signal vs Noise (15% weight)
+  // Higher score for technical/formal content, lower for heavy marketing/adjective usage
+  const marketingJargon = /\b(amazing|unbelievable|revolutionary|game-changer|limited time|click here|buy now|best ever|must have|unbeatable)\b/gi;
+  const technicalTerms = /\b(implementation|architecture|protocol|framework|specification|concurrency|optimization|asynchronous|parameter|instance|metadata|configuration)\b/gi;
+  
+  const jargonMatches = (cleanedContent.match(marketingJargon) || []).length;
+  const techMatches = (cleanedContent.match(technicalTerms) || []).length;
+  
+  if (techMatches > jargonMatches) {
+    score += 0.15;
+    reasons.push(`High information density (technical signal)`);
+  } else if (jargonMatches > techMatches * 2) {
+    score -= 0.1; // Penalty for excessive marketing fluff
+    reasons.push(`High noise detected (marketing jargon)`);
+  }
+  
+  // 6. Keyword relevance (10% weight, optional)
   if (effectiveConfig.enableKeywordScoring && query && wordCount > 5) {
     const queryKeywords = extractKeywords(query);
     const contentLower = cleanedContent.toLowerCase();

@@ -6,7 +6,7 @@
 import { SearchEngine } from './search-engine.js';
 import { SearchResult } from './types.js';
 import { StandardIntentDetector, QueryIntent, generateIntentBasedExpansions } from './query-intent-detector.js';
-import { SemanticExpander } from './semantic-expander.js';
+import { SemanticExpander, HeuristicSemanticExpander } from './semantic-expander.js';
 
 export interface ProgressiveSearchOptions {
   query: string;
@@ -21,14 +21,14 @@ export interface ProgressiveSearchResult extends SearchResult {
   relevanceScore: number;    // Relevance score (0-1)
 }
 
-export interface ProgressiveSearchEngine {
+export interface IProgressiveSearchEngine {
   search(query: string, options?: ProgressiveSearchOptions): Promise<ProgressiveSearchResult[]>;
 }
 
 /**
  * Multi-Stage Search Engine - Orchestrates progressive search across multiple stages
  */
-export class ProgressiveSearchEngine implements ProgressiveSearchEngine {
+export class ProgressiveSearchEngine implements IProgressiveSearchEngine {
   private readonly intentDetector = new StandardIntentDetector();
   private readonly semanticExpander: SemanticExpander;
 
@@ -48,10 +48,7 @@ export class ProgressiveSearchEngine implements ProgressiveSearchEngine {
       expandSingleWordQueries: true,
     };
     
-    this.semanticExpander = new SemanticExpander({
-      maxExpandedQueries: 5,
-      minResultThreshold: defaults.minResultsPerStage
-    });
+    this.semanticExpander = new SemanticExpander(new HeuristicSemanticExpander());
   }
 
   async search(
@@ -59,11 +56,13 @@ export class ProgressiveSearchEngine implements ProgressiveSearchEngine {
     options: ProgressiveSearchOptions = { query }
   ): Promise<ProgressiveSearchResult[]> {
     const { query: originalQuery } = options;
+    const maxDepth = options.maxDepth || 3;
+    const minResultsPerStage = options.minResultsPerStage || 3;
+    const maxTotalResults = options.maxTotalResults || 15;
     
-    console.log(`[ProgressiveSearchEngine] Starting progressive search for: "${originalQuery}"`);
+    console.log(`[ProgressiveSearchEngine] Starting DEEP research for: "${originalQuery}"`);
     const startTime = Date.now();
     
-    // Detect intent and audience for appropriate expansion
     const intent = await this.intentDetector.detectIntent(originalQuery);
     const audienceRaw = this.intentDetector.detectAudience(originalQuery);
     const audience = audienceRaw ?? undefined;
@@ -72,127 +71,202 @@ export class ProgressiveSearchEngine implements ProgressiveSearchEngine {
     
     const results: ProgressiveSearchResult[] = [];
     const seenUrls = new Set<string>();
+
+    // -------------------------------------------------------------------------
+    // STAGE 1: INITIAL DISCOVERY (Literal + Expansion)
+    // -------------------------------------------------------------------------
+    console.log(`[ProgressiveSearchEngine] Stage 1: Initial Discovery`);
     
-    // Stage 1: Literal search (immediate realm) - ALWAYS runs first
-    console.log(`[ProgressiveSearchEngine] Stage 1: Literal search with original query`);
-    const stage1Results = await this.performLiteralSearch(originalQuery);
-    
-    // Filter and score results
-    const scoredStage1 = stage1Results.map(r => ({
-      ...r,
-      stage: 1,
-      queryUsed: originalQuery,
-      relevanceScore: this.calculateRelevance(r, originalQuery)
-    } as ProgressiveSearchResult));
-    
-    // Check if Stage 1 was successful (enough good results)
-    const goodStage1Results = scoredStage1.filter(r => r.relevanceScore > 0.7);
-    
-    console.log(`[ProgressiveSearchEngine] Stage 1: Found ${stage1Results.length} results, ${goodStage1Results.length} with high relevance`);
-    
-    // Add Stage 1 results
-    for (const result of scoredStage1) {
-      if (!seenUrls.has(result.url)) {
-        seenUrls.add(result.url);
-        results.push(result);
-      }
+    // 1.1 Literal Search
+    const literalResults = await this.performLiteralSearch(originalQuery);
+    this.ingestResults(literalResults, 1, originalQuery, results, seenUrls);
+
+    // 1.2 Intent-Based Expansion (Immediate relevance)
+    const intentExpansions = generateIntentBasedExpansions(originalQuery, intent, audience);
+    const semanticExpansions = await this.semanticExpander.expandQuery(originalQuery);
+    const initialExpansions = Array.from(new Set([...intentExpansions, ...semanticExpansions]));
+
+    for (const expQuery of initialExpansions.slice(0, 3)) {
+      const stageResults = await this.searchWithEngine(expQuery);
+      this.ingestResults(stageResults, 1, expQuery, results, seenUrls);
     }
-    
-    // Check if we have enough good results to stop here
-    if (goodStage1Results.length >= (options.minResultsPerStage || 3) && 
-        results.length >= (options.maxTotalResults || 15)) {
-      console.log(`[ProgressiveSearchEngine] Stage 1 was successful, returning early`);
+
+    // Check if we are already done
+    if (this.isSatisfied(results, minResultsPerStage, maxTotalResults)) {
       return this.sortAndLimitResults(results, options);
     }
-    
-    // Need to expand - proceed to deeper stages
-    let currentQuery = originalQuery;
-    
-    for (let depth = 2; depth <= (options.maxDepth || 3); depth++) {
-      console.log(`[ProgressiveSearchEngine] Stage ${depth}: Expanding query and searching`);
+
+    // -------------------------------------------------------------------------
+    // STAGE 2+: DEEP RESEARCH LOOP (Decomposition + Iterative Refinement)
+    // -------------------------------------------------------------------------
+    for (let depth = 2; depth <= maxDepth; depth++) {
+      console.log(`[ProgressiveSearchEngine] Stage ${depth}: Deepening Research Loop`);
       
-      // Get intent-based expansions
-      const intentExpansions = generateIntentBasedExpansions(currentQuery, intent, audience);
+      // 2.1 Topic Decomposition (The "Planner")
+      const subQueries = await this.decomposeQuery(originalQuery, intent, results);
       
-      // Get semantic expansions (synonyms, rephrasings)
-      const semanticExpansions = await this.semanticExpander.expandQuery(currentQuery);
-      
-      // Combine and deduplicate expansions
-      const allExpandedQueries = Array.from(new Set([
-        currentQuery, // Always include original query
-        ...intentExpansions,
-        ...semanticExpansions.filter(q => q !== currentQuery)
-      ]));
-      
-      console.log(`[ProgressiveSearchEngine] Stage ${depth}: Generated ${allExpandedQueries.length} expanded queries`);
-      
-      let foundNewResults = false;
-      
-      // Search with each expanded query (up to limit)
-      for (const expandedQuery of allExpandedQueries.slice(0, 3)) { // Limit per stage
-        if (results.length >= (options.maxTotalResults || 15)) {
-          break;
-        }
-        
-        try {
-          const stageResults = await this.searchWithEngine(expandedQuery);
-          
-          // Filter out duplicates and score new results
-          for (const result of stageResults) {
-            if (!seenUrls.has(result.url)) {
-              seenUrls.add(result.url);
-              results.push({
-                ...result,
-                stage: depth,
-                queryUsed: expandedQuery,
-                relevanceScore: this.calculateRelevance(result, expandedQuery)
-              });
-              foundNewResults = true;
-            }
-          }
-          
-          console.log(`[ProgressiveSearchEngine] Stage ${depth}: Query "${expandedQuery}" returned ${stageResults.length} results`);
-        } catch (error) {
-          console.warn(`[ProgressiveSearchEngine] Stage ${depth}: Search with "${expandedQuery}" failed:`, error);
-        }
-      }
-      
-      // Check if we have enough good results to stop expanding at this depth
-      const totalGoodResults = results.filter(r => r.relevanceScore > 0.5).length;
-      
-      console.log(`[ProgressiveSearchEngine] Stage ${depth}: Total results: ${results.length}, Good: ${totalGoodResults}`);
-      
-      if (foundNewResults && totalGoodResults >= (options.minResultsPerStage || 3)) {
-        console.log(`[ProgressiveSearchEngine] Found enough good results, stopping expansion`);
+      if (subQueries.length === 0) {
+        console.log(`[ProgressiveSearchEngine] No new sub-topics discovered, ending loop.`);
         break;
       }
+
+      console.log(`[ProgressiveSearchEngine] Stage ${depth}: Decomposed into ${subQueries.length} sub-queries`);
+
+      // 2.2 Parallel Execution of Sub-Queries
+      const stageResults = await this.executeParallelSubQueries(subQueries, depth, results.length, maxTotalResults);
       
-      if (!foundNewResults) {
-        // Try progressive deepening with related topics
-        console.log(`[ProgressiveSearchEngine] No new results found, trying topic-based deepening`);
-        
+      // 2.3 Ingest new findings
+      this.ingestResults(stageResults, depth, 'sub-topic research', results, seenUrls);
+
+      // 2.4 Check Satisfaction (Halting Criteria)
+      if (this.isSatisfied(results, minResultsPerStage, maxTotalResults)) {
+        console.log(`[ProgressiveSearchEngine] Research goal met at stage ${depth}`);
+        break;
+      }
+
+      // 2.5 Check for "Dead End"
+      if (stageResults.length === 0) {
+        console.log(`[ProgressiveSearchEngine] No new information found in this branch, trying fallback deepening`);
         const deepResults = await this.progressiveDeepening(originalQuery, depth);
-        
-        for (const result of deepResults) {
-          if (!seenUrls.has(result.url)) {
-            seenUrls.add(result.url);
-            results.push({
-              ...result,
-              stage: depth,
-              queryUsed: `${originalQuery} related`,
-              relevanceScore: this.calculateRelevance(result, originalQuery)
-            });
-          }
-        }
-        
-        console.log(`[ProgressiveSearchEngine] Deepening returned ${deepResults.length} additional results`);
+        this.ingestResults(deepResults, depth, 'topic-based deepening', results, seenUrls);
       }
     }
     
     const totalTime = Date.now() - startTime;
-    console.log(`[ProgressiveSearchEngine] Progressive search completed in ${totalTime}ms with ${results.length} total results`);
+    console.log(`[ProgressiveSearchEngine] Deep research completed in ${totalTime}ms with ${results.length} total results`);
     
     return this.sortAndLimitResults(results, options);
+  }
+
+  /**
+   * Core Research Logic: Decomposes a query into specific, actionable sub-questions.
+   */
+  private async decomposeQuery(
+    originalQuery: string, 
+    intent: QueryIntent,
+    currentResults: ProgressiveSearchResult[]
+  ): Promise<string[]> {
+    const subQueries: string[] = [];
+
+    switch (intent) {
+      case QueryIntent.COMPLEX_TASK:
+        // Task Decomposition: Break into Setup, Implementation, and Troubleshooting
+        subQueries.push(`how to setup and configure ${originalQuery}`);
+        subQueries.push(`step by step implementation of ${originalQuery}`);
+        subQueries.push(`common challenges when ${originalQuery}`);
+        break;
+
+      case QueryIntent.TECHNICAL:
+        // Technical Decomposition: Architecture, API, and Examples
+        subQueries.push(`${originalQuery} architecture and design patterns`);
+        subQueries.push(`${originalQuery} api reference and documentation`);
+        subQueries.push(`${originalQuery} code examples and best practices`);
+        break;
+
+      case QueryIntent.DEBUGGING:
+        // Debugging Decomposition: Causes, Error Codes, and Fixes
+        subQueries.push(`${originalQuery} common error codes and causes`);
+        subQueries.push(`how to troubleshoot ${originalQuery}`);
+        subQueries.push(`${originalQuery} troubleshooting guide and solutions`);
+        break;
+
+      case QueryIntent.ACADEMIC:
+        // Academic Decomposition: Theories, Studies, and Recent Findings
+        subQueries.push(`${originalQuery} academic research and studies`);
+        subQueries.push(`${originalQuery} theoretical framework and literature review`);
+        subQueries.push(`recent scientific advancements in ${originalQuery}`);
+        break;
+
+      default:
+        // For Informational/Commercial/etc, we perform "Dimension Expansion"
+        const semanticExpansions = await this.semanticExpander.expandQuery(originalQuery);
+        subQueries.push(...semanticExpansions.slice(0, 3));
+        break;
+    }
+
+    // Add "Contradiction/Comparison" queries to resolve ambiguity (Research-grade)
+    // This helps prevent "echo chamber" results in a single search stage
+    if (currentResults.length > 0) {
+      subQueries.push(`${originalQuery} pros and cons`);
+      subQueries.push(`${originalQuery} vs alternative approaches`);
+      subQueries.push(`critical analysis of ${originalQuery}`);
+    }
+
+    // Filter duplicates and limit
+    return Array.from(new Set(subQueries)).slice(0, 6);
+  }
+
+  /**
+   * Executes multiple sub-queries in parallel to accelerate research
+   */
+  private async executeParallelSubQueries(
+    queries: string[],
+    depth: number,
+    currentResultCount: number,
+    maxTotal: number
+  ): Promise<SearchResult[]> {
+    const allResults: SearchResult[] = [];
+    const concurrencyLimit = 3;
+    const subQueryTimeout = 20000; // 20s timeout per sub-query to prevent hanging
+
+    console.log(`[ProgressiveSearchEngine] Executing parallel sub-queries (Total: ${queries.length}, Concurrency: ${concurrencyLimit})`);
+
+    // We process queries in batches to respect concurrency and not overwhelm the browser pool
+    for (let i = 0; i < queries.length; i += concurrencyLimit) {
+      const batch = queries.slice(i, i + concurrencyLimit);
+      console.log(`[ProgressiveSearchEngine] Processing batch ${Math.floor(i / concurrencyLimit) + 1} (${batch.length} queries)`);
+
+      const tasks = batch.map(async (q) => {
+        try {
+          // Implement a timeout for each individual sub-query
+          const result = await Promise.race([
+            this.searchWithEngine(q),
+            new Promise<SearchResult[]>((_, reject) => 
+              setTimeout(() => reject(new Error(`Sub-query timeout for: ${q}`)), subQueryTimeout)
+            )
+          ]);
+          return result;
+        } catch (e) {
+          console.warn(`[ProgressiveSearchEngine] Sub-query failed or timed out: ${q}. Error: ${e instanceof Error ? e.message : 'Unknown error'}`);
+          return [] as SearchResult[];
+        }
+      });
+
+      const outcomes = await Promise.all(tasks);
+      allResults.push(...outcomes.flat());
+
+      // If we've reached the max results needed, stop early
+      if (allResults.length >= maxTotal) {
+        break;
+      }
+    }
+
+    return allResults;
+  }
+
+  private ingestResults(
+    newResults: SearchResult[],
+    stage: number,
+    queryUsed: string,
+    targetList: ProgressiveSearchResult[],
+    seenUrls: Set<string>
+  ): void {
+    for (const res of newResults) {
+      if (!seenUrls.has(res.url)) {
+        seenUrls.add(res.url);
+        targetList.push({
+          ...res,
+          stage,
+          queryUsed,
+          relevanceScore: this.calculateRelevance(res, queryUsed)
+        });
+      }
+    }
+  }
+
+  private isSatisfied(results: ProgressiveSearchResult[], min: number, max: number): boolean {
+    const goodResults = results.filter(r => r.relevanceScore > 0.6).length;
+    return goodResults >= min || results.length >= max;
   }
 
   /**
@@ -242,17 +316,23 @@ export class ProgressiveSearchEngine implements ProgressiveSearchEngine {
    * Search with a specific engine
    */
   private async searchWithEngine(query: string): Promise<SearchResult[]> {
-    try {
-      const primaryEngine = this.searchEngines[0];
-      if (primaryEngine) {
-        const result = await primaryEngine.search({
+    // Since ProgressiveSearchEngine is initialized with an array of SearchEngine instances,
+    // we should attempt to use them. However, each SearchEngine instance itself 
+    // handles parallel/fallback logic. 
+    
+    // We'll try the first engine. If it fails, we'll try the next one in the list.
+    for (const engine of this.searchEngines) {
+      try {
+        const result = await engine.search({
           query,
           numResults: 10
         });
-        return result.results;
+        if (result.results && result.results.length > 0) {
+          return result.results;
+        }
+      } catch (error) {
+        console.warn(`[ProgressiveSearchEngine] Engine search failed for "${query}":`, error);
       }
-    } catch (error) {
-      console.warn(`[ProgressiveSearchEngine] Search failed for "${query}":`, error);
     }
     
     return [];

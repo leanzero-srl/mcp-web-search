@@ -1,3 +1,9 @@
+export interface ResearchDigest {
+  entities: string[];
+  claims: string[];
+  keyTerms: string[];
+}
+
 export interface SearchResult {
   title: string;
   url: string;
@@ -8,6 +14,7 @@ export interface SearchResult {
   timestamp: string;
   fetchStatus: 'success' | 'error' | 'timeout';
   error?: string;
+  digest?: ResearchDigest;
 }
 
 export interface SearchOptions {
@@ -41,6 +48,7 @@ export interface WebSearchToolOutput {
 export interface SearchResultWithMetadata {
   results: SearchResult[];
   engine: string;
+  qualityScore?: number;
 }
 
 // GitHub-related types

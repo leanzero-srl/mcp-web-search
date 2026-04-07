@@ -120,10 +120,16 @@ export function getHeadlessOption(mode: HeadlessMode): boolean {
 /**
  * Creates a browser context with optimized settings for web search
  */
-export function createOptimizedContextOptions(): object {
+export function createOptimizedContextOptions(engineType: BrowserEngineType = 'webkit'): object {
+  const userAgents: Record<BrowserEngineType, string> = {
+    chromium: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    firefox: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0',
+    webkit: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+  };
+
   return {
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-    viewport: { width: 1366, height: 768 },
+    userAgent: userAgents[engineType] || userAgents.webkit,
+    viewport: { width: 1920, height: 1080 },
     locale: 'en-US',
     timezoneId: 'America/New_York',
     colorScheme: 'light',
@@ -131,7 +137,7 @@ export function createOptimizedContextOptions(): object {
     hasTouch: false,
     isMobile: false,
     extraHTTPHeaders: {
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9',
       'Accept-Encoding': 'gzip, deflate, br',
       'DNT': '1',
@@ -139,6 +145,10 @@ export function createOptimizedContextOptions(): object {
       'Sec-Fetch-Dest': 'document',
       'Sec-Fetch-Mode': 'navigate',
       'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Sec-Ch-Ua': '"Not A(Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
     },
   };
 }
