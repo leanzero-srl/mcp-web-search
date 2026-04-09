@@ -135,8 +135,8 @@ function generateFileName(
  */
 function detectDocType(url: string, html?: string): { type: TechnicalDocType; confidence: number } {
   const urlLower = url.toLowerCase();
-  let bestType = TechnicalDocType.REST_API;
-  let bestConfidence = 0.5;
+  const bestType = TechnicalDocType.REST_API;
+  const bestConfidence = 0.5;
   
   // Check URL patterns first (highest confidence)
   if (urlLower.includes('openapi.json') || urlLower.includes('/openapi/') || urlLower.match(/\/v\d+\/openapi/)) {
@@ -162,7 +162,7 @@ function detectDocType(url: string, html?: string): { type: TechnicalDocType; co
     const $ = cheerio.load(html);
     
     // Look for OpenAPI link tags
-    $('link').each((_, element) => {
+    for (const element of $('link').toArray()) {
       const rel = $(element).attr('rel') || '';
       const type = $(element).attr('type') || '';
       const href = $(element).attr('href') || '';
@@ -179,7 +179,7 @@ function detectDocType(url: string, html?: string): { type: TechnicalDocType; co
       if (href.includes('swagger.json')) {
         return { type: TechnicalDocType.SWAGGER_JSON, confidence: 0.85 };
       }
-    });
+    }
     
     // Check title for documentation keywords
     const title = $('title').text().toLowerCase();
@@ -219,7 +219,7 @@ async function discoverOpenAPISpec(
       const $ = cheerio.load(html);
       
       // Check all link tags for OpenAPI references
-      $('link').each((_, element) => {
+      for (const element of $('link').toArray()) {
         const rel = $(element).attr('rel') || '';
         const type = $(element).attr('type') || '';
         const href = $(element).attr('href');
@@ -237,10 +237,10 @@ async function discoverOpenAPISpec(
           const resolvedUrl = new URL(href, urlObj.origin + urlObj.pathname).href;
           return { url: resolvedUrl, type: TechnicalDocType.SWAGGER_JSON };
         }
-      });
+      }
       
       // Also check for script tags that might reference OpenAPI
-      $('script').each((_, element) => {
+      for (const element of $('script').toArray()) {
         const src = $(element).attr('src');
         if (src && 
             (src.includes('swagger') || src.includes('openapi')) &&
@@ -248,7 +248,7 @@ async function discoverOpenAPISpec(
           const resolvedUrl = new URL(src, urlObj.origin + urlObj.pathname).href;
           return { url: resolvedUrl, type: src.toLowerCase().includes('yaml') ? TechnicalDocType.OPENAPI_YAML : TechnicalDocType.OPENAPI_JSON };
         }
-      });
+      }
     } catch (error) {
       console.warn('[OpenAPIExtractor] Error parsing HTML for OpenAPI links:', error);
     }
@@ -558,7 +558,7 @@ export class OpenAPIExtractor {
         specData.metadata.title || specData.metadata.version || 'api-documentation',
         discoveredSpec.type
       );
-      let fileName = fallbackName;
+      const fileName = fallbackName;
       
       // Save to cache
       const saved = this.cache.saveOpenAPISpec(fileName, downloaded.content);
