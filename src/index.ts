@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 
 // Redirect both console.log and console.error to stderr to prevent corruption of MCP protocol over stdout
-const originalConsoleLog = console.log;
-const originalConsoleError = console.error;
 
 console.log = (...args) => {
   const message = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
@@ -44,7 +42,12 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { SearchEngine } from './search-engine.js';
 import { EnhancedContentExtractor } from './enhanced-content-extractor.js';
-import { WebSearchToolInput, WebSearchToolOutput, SearchResult, GitHubFile, OpenAPIExtractionResult } from './types.js';
+import { pdfExtractor as pdfExtractorInstance } from './pdf-extractor.js';
+
+const pdfExtractor = pdfExtractorInstance;
+
+// ============================================================================
+import { WebSearchToolInput, WebSearchToolOutput, SearchResult } from './types.js';
 import { ProgressiveSearchEngine } from './progressive-search-engine.js';
 import { isPdfUrl, fetchSitemapUrls } from './utils.js';
 import { GitHubExtractor, parseGitHubUrl } from './github-extractor.js';
@@ -54,7 +57,6 @@ import { openAPIExtractor } from './openapi-extractor.js';
 // Import Phase 3 modules (Intelligence Expansion)
 // ============================================================================
 
-import { PdfExtractor, pdfExtractor } from './pdf-extractor.js';
 import { semanticCache } from './semantic-cache.js';
 
 // ============================================================================
@@ -68,10 +70,8 @@ import { auditLogger, telemetryCollector } from './observability.js';
 // ============================================================================
 
 import {
-  sessionRateLimiter,
-  inputValidator,
-  outputLimiter,
-  globalThrottler,
+  // Note: These are initialized in the constructor but not used directly here
+  // as they are managed by the server instance.
 } from './enterprise-guardrails.js';
 
 class WebSearchMCPServer {
@@ -450,13 +450,13 @@ class WebSearchMCPServer {
            // Get page title from URL (simple extraction)
            const urlObj = new URL(obj.url);
            const title = urlObj.hostname + urlObj.pathname;
- 
+  
            // Create content preview and word count
            // const contentPreview = content.length > 200 ? content.substring(0, 200) + '...' : content; // Unused for now
            const wordCount = content.split(/\s+/).filter((word: string) => word.length > 0).length;
- 
+  
            console.log(`[MCP] Single page content extraction completed, extracted ${content.length} characters`);
- 
+  
            // Format the result as text
            const header = `**Source:** ${obj.url} | **Title:** ${title} | **Words:** ${wordCount}\n\n`;
            let body = '';
@@ -1067,7 +1067,7 @@ class WebSearchMCPServer {
           console.log(`[MCP] PDF extraction completed: method=${result.extractionMethod}, length=${result.text.length}`);
 
           // Truncate if needed
-          let textContent = pdfExtractor.truncateText(result.text, maxContentLength);
+          const textContent = pdfExtractor.truncateText(result.text, maxContentLength);
 
           // Format the result as text
           let responseText = `**PDF Content from: ${obj.url}**\n\n`;

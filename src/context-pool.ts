@@ -1,5 +1,8 @@
 import { Browser, BrowserContext } from 'playwright';
-import { createOptimizedBrowser, getHeadlessOption, getEnvironmentConfig, isValidEngineType, type BrowserEngineType, type HeadlessMode, type BrowserEngineOptions, createOptimizedContextOptions } from './browser-engine.js';
+import { createOptimizedBrowser, getEnvironmentConfig, type BrowserEngineType, type HeadlessMode, type BrowserEngineOptions, createOptimizedContextOptions } from './browser-engine.js';
+import crypto from 'crypto';
+
+// Re-export for convenience
 
 // Re-export for convenience
 export { getEnvironmentConfig };
