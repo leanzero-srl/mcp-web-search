@@ -2,6 +2,9 @@
  * Utility functions for the web search MCP server
  */
 
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+
 export function cleanText(text: string, maxLength: number = 10000): string {
   return text
     .replace(/\s+/g, ' ') // Replace multiple whitespace with single space
@@ -65,7 +68,7 @@ export function isPdfUrl(url: string): boolean {
     
     // Also check search params for .pdf extensions (e.g., file.pdf?download=1)
     const searchParamsHavePdf = [...parsed.searchParams.entries()].some(
-      ([, value]) => value.toLowerCase().includes('.pdf')
+      (entry) => entry[1].toLowerCase().includes('.pdf')
     );
     
     return pathIsPdf || searchParamsHavePdf;
@@ -73,4 +76,87 @@ export function isPdfUrl(url: string): boolean {
     // If URL parsing fails, check the raw string as fallback
     return url.toLowerCase().endsWith('.pdf');
   }
+}
+
+/**
+ * Fetches and parses a sitemap from a given base URL.
+ * Implements robust discovery via robots.txt, root sitemaps, and recursive index parsing.
+ */
+export async function fetchSitemapUrls(baseUrl: string): Promise<string[]> {
+  const urlObj = new URL(baseUrl);
+  const origin = urlObj.origin;
+  const allUrls = new Set<string>();
+  const visitedSitemaps = new Set<string>();
+
+  console.log(`[Utils] Starting robust sitemap discovery for: ${baseUrl}`);
+
+  // 1. Try to discover sitemaps via robots.txt (The gold standard)
+  try {
+    const robotsUrl = `${origin}/robots.txt`;
+    console.log(`[Utils] Checking robots.txt at: ${robotsUrl}`);
+    const robotsResponse = await axios.get(robotsUrl, { 
+      timeout: 5000, 
+      headers: { 'User-Agent': getRandomUserAgent() } 
+    });
+    const robotsText = robotsResponse.data as string;
+    const sitemapMatches = robotsText.matchAll(/^Sitemap:\s*(https?:\/\/[^\s]+)/gmi);
+    for (const match of sitemapMatches) {
+      allUrls.add(match[1]);
+    }
+  } catch (e) {
+    console.log(`[Utils] No sitemaps found in robots.txt or file missing`);
+  }
+
+  // 2. Try common default locations if robots.txt didn't provide enough
+  const commonLocations = [
+    `${origin}/sitemap.xml`,
+    `${origin}/sitemap_index.xml`,
+    `${origin}/sitemap1.xml`
+  ];
+
+  for (const loc of commonLocations) {
+    allUrls.add(loc);
+  }
+
+  // 3. Recursively process all discovered sitemaps to handle Sitemap Indexes
+  const queue = Array.from(allUrls);
+  let processedCount = 0;
+
+  while (queue.length > 0 && processedCount < 10) { // Limit depth/count to prevent infinite loops
+    const currentSitemapUrl = queue.shift()!;
+    if (visitedSitemaps.has(currentSitemapUrl)) continue;
+    visitedSitemaps.add(currentSitemapUrl);
+    processedCount++;
+
+    try {
+      console.log(`[Utils] Fetching sitemap: ${currentSitemapUrl}`);
+      const response = await axios.get(currentSitemapUrl, { 
+        timeout: 10000, 
+        headers: { 'User-Agent': getRandomUserAgent() } 
+      });
+
+      const $ = cheerio.load(response.data, { xmlMode: true });
+      const locs: string[] = [];
+      
+      $('loc').each((_, el) => {
+        const loc = $(el).text().trim();
+        if (loc) locs.push(loc);
+      });
+
+      for (const loc of locs) {
+        // If the location looks like another sitemap, add it to the queue for processing
+        if (loc.toLowerCase().includes('sitemap')) {
+          queue.push(loc);
+        } else {
+          allUrls.add(loc);
+        }
+      }
+    } catch (error) {
+      console.log(`[Utils] Failed to fetch sitemap ${currentSitemapUrl}: ${error instanceof Error ? error.message : 'Error'}`);
+    }
+  }
+
+  const finalUrls = Array.from(allUrls).filter(url => !url.toLowerCase().includes('sitemap'));
+  console.log(`[Utils] Sitemap discovery completed. Found ${finalUrls.length} page URLs.`);
+  return finalUrls;
 }

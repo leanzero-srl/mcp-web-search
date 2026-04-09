@@ -27,6 +27,7 @@ export interface ContentExtractionOptions {
   url: string;
   timeout?: number;
   maxContentLength?: number;
+  sessionId?: string;
 }
 
 export interface WebSearchToolInput {

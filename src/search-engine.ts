@@ -100,6 +100,10 @@ export class SearchEngine {
     
     console.log(`[SearchEngine] Starting smart parallel search (priority: ${enginePriority.join(', ')})`);
 
+    let bestResults: SearchResult[] = [];
+    let bestEngine = 'none';
+    let highestQuality = -1;
+
     for (let i = 0; i < enginePriority.length; i++) {
       const engineType = enginePriority[i];
       console.log(`[SearchEngine] Attempting priority engine ${i + 1}/${enginePriority.length}: ${engineType}`);
@@ -120,14 +124,19 @@ export class SearchEngine {
         }
 
      // Use a more realistic timeout for the engine that respects the remaining budget
-     // We add a small buffer to allow the engine to at least start/finish its work
-     // Ensure we have at least 8s to allow for browser launch and initial navigation
      const currentEngineTimeout = Math.max(Math.min(engineTimeout, remainingTime), 8000);
      const results = await this.runSearchWithEngine(engineType, query, numResults, currentEngineTimeout);
         
         if (results && results.length > 0) {
           const qualityScore = enableQualityCheck ? this.assessResultQuality(results, query) : 1.0;
           console.log(`[SearchEngine] Engine ${engineType} returned ${results.length} results (quality: ${qualityScore.toFixed(2)})`);
+
+          // Track the best results found so far as a fallback
+          if (qualityScore > highestQuality) {
+            highestQuality = qualityScore;
+            bestResults = results;
+            bestEngine = `${engineType}-fallback`;
+          }
 
           if (qualityScore >= qualityThreshold || i === enginePriority.length - 1) {
             console.log(`[SearchEngine] Smart parallel search completed in ${Date.now() - startTime}ms using ${engineType}`);
@@ -142,7 +151,12 @@ export class SearchEngine {
       }
     }
     
-    console.log(`[SearchEngine] All priority engines exhausted in ${Date.now() - startTime}ms`);
+    if (bestResults.length > 0) {
+      console.log(`[SearchEngine] All priority engines below threshold, returning best available from ${bestEngine} (quality: ${highestQuality.toFixed(2)})`);
+      return { results: bestResults, engine: bestEngine };
+    }
+
+    console.log(`[SearchEngine] All priority engines exhausted in ${Date.now() - startTime}ms with no results`);
     return { results: [], engine: 'none' };
   }
 

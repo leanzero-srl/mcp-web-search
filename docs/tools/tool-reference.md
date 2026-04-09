@@ -6,16 +6,35 @@ Complete documentation for all available MCP tools in the Web Search server.
 
 ## Overview
 
-The server provides **8 specialized tools** for different use cases:
+The server provides **12 specialized tools** for different use cases:
 
+---
+
+### Primary Tools (5)
 | Tool | Type | Use When |
 |------|------|----------|
 | `full-web-search` | Primary | Comprehensive research with full content |
 | `get-web-search-summaries` | Lightweight | Quick search without content extraction |
-| `get-single-web-page-content` | Utility | Extract from known URL |
 | `progressive-web-search` | Advanced | Complex research with query expansion |
 | `cached-web-search` | Intelligent | Repeated or related queries |
 | `get-github-repo-content` | Repository | Analyze GitHub projects |
+
+---
+
+### Discovery & Orchestration Tools (4)
+| Tool | Type | Use When |
+|------|------|----------|
+| `get-website-sitemap` | Discovery | Discover all URLs on a website (Sitemap) |
+| `filter-sitemap-urls` | Orchestration | Filter sitemap URLs by keywords |
+| `get-github-directory-contents` | Repository | List files/directories in GitHub path |
+| `list-cached-documents` | Utility | List all cached documents/specs |
+
+---
+
+### Specialized Tools (3)
+| Tool | Type | Use When |
+|------|------|----------|
+| `get-single-web-page-content` | Utility | Extract from known URL |
 | `get-pdf-content` | Document | Extract text from PDFs |
 | `get-openapi-spec` | API Docs | Download OpenAPI specifications |
 
@@ -429,40 +448,213 @@ The text content is formatted with markdown-style headers for easy parsing.
 
 ---
 
-## Tool Selection Flowchart
-
-```
-Need comprehensive research?
-  └─ YES → Use full-web-search
-  └─ NO → Need quick summaries only?
-        └─ YES → Use get-web-search-summaries
-        └─ NO → Have a specific URL to extract?
-              └─ YES → Use get-single-web-page-content
-              └─ NO → Want query expansion?
-                    └─ YES → Use progressive-web-search
-                    └─ NO → Searching repeated topics?
-                          └─ YES → Use cached-web-search
-                          └─ NO → Extracting GitHub repo?
-                                └─ YES → Use get-github-repo-content
-                                └─ NO → Working with PDF?
-                                      └─ YES → Use get-pdf-content
-                                      └─ NO → Need API docs?
-                                            └─ YES → Use get-openapi-spec
-                                            └─ NO → Reconsider your approach!
-```
-
 ---
 
 ## Performance Comparison
 
+### Search Tools
 | Tool | Speed | Content Depth | Resource Usage |
 |------|-------|---------------|----------------|
 | `get-web-search-summaries` | ⚡⚡⚡ Fastest | Low | Low |
-| `get-single-web-page-content` | ⚡⚡ Medium | Medium | Medium |
 | `cached-web-search` | ⚡⚡⚡ Fast* | Medium | Low* |
 | `full-web-search` | ⚡ Medium | High | High |
 | `progressive-web-search` | ⚡ Slow | Very High | High |
+
+### Extraction Tools
+| Tool | Speed | Content Depth | Resource Usage |
+|------|-------|---------------|----------------|
+| `get-single-web-page-content` | ⚡⚡ Medium | Medium | Medium |
 | `get-pdf-content` | ⚡ Medium | Medium | Medium |
 | `get-github-repo-content` | ⚡⚡ Medium | High | Medium |
 
+### Discovery/Orchestration Tools
+| Tool | Speed | Content Depth | Resource Usage |
+|------|-------|---------------|----------------|
+| `get-website-sitemap` | ⚡⚡⚡ Fastest | Low | Low |
+| `filter-sitemap-urls` | ⚡⚡⚡ Fastest | Low | Low |
+| `list-cached-documents` | ⚡⚡⚡ Fastest | None | None |
+
 *When cache hit occurs
+
+---
+
+### 9. get-website-sitemap
+
+**Discover all URLs on a website (Sitemap)**
+
+**Description**: Discover and list all available page URLs on a website by reading its sitemap.xml file. This is the **RECOMMENDED FIRST STEP** when researching a specific domain, especially for large corporate websites.
+
+**When to Use**:
+- You have a domain URL and need to discover its structure
+- Researching large corporate websites (e.g., Sanofi, Microsoft)
+- You want to understand what pages are available before extracting content
+
+**Input Schema**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Base URL of the website (e.g., https://example.com)"
+    }
+  },
+  "required": ["url"]
+}
+```
+
+**Response Format**:
+- Returns up to 100 URLs with pagination indicator
+- Includes **Tiered Guidance** based on URL count:
+  - **< 20 URLs**: Suggests direct extraction
+  - **20-100 URLs**: Recommends filtering or manual selection
+  - **> 100 URLs**: Strongly recommends using `filter-sitemap-urls`
+
+**Example Usage**:
+```json
+{
+  "name": "get-website-sitemap",
+  "arguments": {
+    "url": "https://www.example-corporate-site.com"
+  }
+}
+```
+
+---
+
+### 10. filter-sitemap-urls
+
+**Filter sitemap URLs by keywords**
+
+**Description**: Filter a website's sitemap to find high-value pages based on specific keywords. This is essential for **orchestrating** research on large sites where extracting all URLs would be inefficient.
+
+**When to Use**:
+- After `get-website-sitemap` returns >100 URLs
+- You need to focus on specific sections (e.g., "about", "products", "strategy")
+- You want to avoid context overflow from too many extractions
+
+**Input Schema**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Base URL of the website"
+    },
+    "keywords": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Keywords to match in URLs (e.g., ['about', 'company', 'strategy'])"
+    },
+    "limit": {
+      "type": "number",
+      "default": 20,
+      "optional": true
+    }
+  },
+  "required": ["url", "keywords"]
+}
+```
+
+**Example Usage**:
+```json
+{
+  "name": "filter-sitemap-urls",
+  "arguments": {
+    "url": "https://www.example-corporate-site.com",
+    "keywords": ["about", "company", "strategy", "mission"],
+    "limit": 15
+  }
+}
+```
+
+---
+
+### 11. get-github-directory-contents
+
+**List files/directories in GitHub repo path**
+
+**Description**: List the files and directories within a specific path of a GitHub repository. This is useful for exploring repository structure before fetching specific file contents.
+
+**When to Use**:
+- You need to explore a GitHub repo structure
+- You want to list contents of a specific directory
+- Preparing to extract specific files from a known path
+
+**Input Schema**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "GitHub repository URL"
+    },
+    "path": {
+      "type": "string",
+      "optional": true,
+      "description": "Path within repository (e.g., 'docs/technical')"
+    },
+    "branch": {
+      "type": "string",
+      "optional": true,
+      "description": "Branch name (default: main)"
+    }
+  },
+  "required": ["url"]
+}
+```
+
+**Example Usage**:
+```json
+{
+  "name": "get-github-directory-contents",
+  "arguments": {
+    "url": "https://github.com/microsoft/TypeScript",
+    "path": "src",
+    "branch": "main"
+  }
+}
+```
+
+---
+
+### 12. list-cached-documents
+
+**List all cached documents/specs**
+
+**Description**: List all documents that have been crawled and saved by this MCP server, including OpenAPI specifications and technical documentation.
+
+**When to Use**:
+- You want to see what has already been downloaded
+- Avoiding re-crawling previously fetched content
+- Managing cache storage
+
+**Input Schema**:
+```json
+{
+  "type": "object",
+  "properties": {
+    "category": {
+      "type": "string",
+      "enum": ["openapi", "technical-md", "all"],
+      "default": "all",
+      "optional": true
+    }
+  }
+}
+```
+
+**Example Usage**:
+```json
+{
+  "name": "list-cached-documents",
+  "arguments": {
+    "category": "openapi"
+  }
+}
+```

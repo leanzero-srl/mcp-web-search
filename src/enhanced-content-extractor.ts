@@ -5,12 +5,13 @@ import { ContentExtractionOptions, SearchResult, ResearchDigest } from './types.
 import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
 import { BrowserPool } from './browser-pool.js';
 import { scoreContentQuality, getBestContentSelector, ContentQualityResult, cleanText as qualityCleanText } from './content-quality-scorer.js';
+import { sessionRateLimiter } from './enterprise-guardrails.js';
 
 /**
  * Converts HTML elements to Markdown format for better AI readability.
  * This implementation preserves structural cues like headings, lists, and links.
  */
-function convertToMarkdown($: cheerio.CheerioAPI, element: cheerio.Element, depth: number = 0): string {
+function convertToMarkdown($: cheerio.CheerioAPI, element: any, depth: number = 0): string {
   const el = element as any;
   if (!el.tagName) return '';
   
@@ -120,6 +121,11 @@ export class EnhancedContentExtractor {
       }
     } catch (error) {
       console.log(`[EnhancedContentExtractor] Axios failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+
+      // Record 404 if applicable
+      if (options.sessionId && error instanceof Error && (error.message.includes('404') || error.message.includes('not found'))) {
+        sessionRateLimiter.record404(options.sessionId, 'enhanced-content-extractor');
+      }
       
       // Check if this looks like a case where browser would help
       if (this.shouldUseBrowser(error, url)) {
@@ -135,6 +141,12 @@ export class EnhancedContentExtractor {
           }
         } catch (browserError) {
           console.error(`[EnhancedContentExtractor] Browser extraction also failed:`, browserError);
+
+          // Record 404 if applicable for browser failure too
+          if (options.sessionId && browserError instanceof Error && (browserError.message.includes('404') || browserError.message.includes('not found'))) {
+            sessionRateLimiter.record404(options.sessionId, 'enhanced-content-extractor');
+          }
+
           throw new Error(`Both axios and browser extraction failed for ${url}`);
         }
       } else {
@@ -458,7 +470,12 @@ export class EnhancedContentExtractor {
     return userAgents[Math.floor(Math.random() * userAgents.length)];
   }
 
-  async extractContentForResults(results: SearchResult[], targetCount: number = results.length): Promise<SearchResult[]> {
+  async extractContentForResults(
+    results: SearchResult[],
+    targetCount: number = results.length,
+    maxContentLength?: number,
+    sessionId?: string
+  ): Promise<SearchResult[]> {
     console.log(`[EnhancedContentExtractor] Processing up to ${results.length} results to get ${targetCount} non-PDF results`);
     
     // Filter out PDF files first
