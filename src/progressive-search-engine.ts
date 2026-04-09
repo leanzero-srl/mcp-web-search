@@ -42,7 +42,7 @@ export class ProgressiveSearchEngine implements IProgressiveSearchEngine {
     }>
   ) {
     const defaults = {
-      maxDepth: 3,
+      maxDepth: 2,
       minResultsPerStage: 3,
       maxTotalResults: 15,
       expandSingleWordQueries: true,
@@ -110,7 +110,13 @@ export class ProgressiveSearchEngine implements IProgressiveSearchEngine {
     // -------------------------------------------------------------------------
     // STAGE 2+: DEEP RESEARCH LOOP (Decomposition + Iterative Refinement)
     // -------------------------------------------------------------------------
+    const GLOBAL_TIMEOUT_MS = 60000; // 60s global budget to prevent MCP timeout
+
     for (let depth = 2; depth <= maxDepth; depth++) {
+      if (Date.now() - startTime > GLOBAL_TIMEOUT_MS) {
+        console.log(`[ProgressiveSearchEngine] Global timeout reached, returning partial results from stage ${depth - 1}`);
+        break;
+      }
       console.log(`[ProgressiveSearchEngine] Stage ${depth}: Deepening Research Loop`);
       
       // 2.1 Topic Decomposition (The "Planner")

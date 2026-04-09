@@ -46,7 +46,7 @@ import { SearchEngine } from './search-engine.js';
 import { EnhancedContentExtractor } from './enhanced-content-extractor.js';
 import { WebSearchToolInput, WebSearchToolOutput, SearchResult, GitHubFile, OpenAPIExtractionResult } from './types.js';
 import { ProgressiveSearchEngine } from './progressive-search-engine.js';
-import { isPdfUrl } from './utils.js';
+import { isPdfUrl, fetchSitemapUrls } from './utils.js';
 import { GitHubExtractor, parseGitHubUrl } from './github-extractor.js';
 import { openAPIExtractor } from './openapi-extractor.js';
 
@@ -81,12 +81,13 @@ class WebSearchMCPServer {
   private githubExtractor?: GitHubExtractor;
 
   /**
-   * Generate a session ID for tracking rate limits
+   * Generate a session ID (clientId). 
+   * In a real MCP environment, the client should ideally provide a stable session ID.
+   * For now, we use CLIENT_ID to allow some continuity if the client provides it.
    */
-  private generateSessionId(args: unknown): string {
-    // Use a simple hash of client info or timestamp for session identification
+  private generateSessionId(): string {
     const clientId = process.env.CLIENT_ID || 'default';
-    return `${clientId}-${Date.now()}`;
+    return clientId;
   }
 
   /**
@@ -191,7 +192,7 @@ class WebSearchMCPServer {
     // Register the main web search tool (primary choice for comprehensive searches)
     this.server.tool(
       'full-web-search',
-      'Search the web and fetch complete page content from top results. This is the most comprehensive web search tool. It searches the web and then follows the resulting links to extract their full page content, providing the most detailed and complete information available. Use get-web-search-summaries for a lightweight alternative.',
+      'Search the web and fetch complete page content from top results. This is the most comprehensive general web search tool. It searches the web and then follows resulting links to extract full page content. Use get-web-search-summaries for a lightweight alternative. For domain-specific research on known companies, consider starting with get-website-sitemap to discover available pages before filtering and extracting.',
       {
         query: z.string().describe('Search query to execute (recommended for comprehensive research)'),
         limit: z.union([z.number(), z.string()]).transform((val) => {
@@ -252,10 +253,11 @@ class WebSearchMCPServer {
           
           console.log(`[MCP] Validated args:`, JSON.stringify(validatedArgs, null, 2));
           
-          console.log(`[MCP] Starting web search...`);
-          const result = await this.handleWebSearch(validatedArgs);
-          
-          console.log(`[MCP] Search completed, found ${result.results.length} results`);
+           console.log(`[MCP] Starting web search...`);
+           const sessionId = this.generateSessionId();
+           const result = await this.handleWebSearch(validatedArgs, sessionId);
+           
+           console.log(`[MCP] Search completed, found ${result.results.length} results`);
           
           // Format the results as a comprehensive text response
           let responseText = `Search completed for "${result.query}" with ${result.total_results} results:\n\n`;
@@ -435,14 +437,15 @@ class WebSearchMCPServer {
             maxContentLength = maxLengthValue === 0 ? undefined : maxLengthValue;
           }
 
-          console.log(`[MCP] Starting single page content extraction for: ${obj.url}`);
-          
-           // Use existing content extractor to get page content
-           const contentObj = await this.contentExtractor.extractContent({
-             url: obj.url,
-             maxContentLength,
-           });
-           const content = contentObj.content;
+           console.log(`[MCP] Starting single page content extraction for: ${obj.url}`);
+           
+            // Use existing content extractor to get page content
+            const contentObj = await this.contentExtractor.extractContent({
+              url: obj.url,
+              maxContentLength,
+              sessionId: this.generateSessionId(),
+            });
+            const content = contentObj.content;
  
            // Get page title from URL (simple extraction)
            const urlObj = new URL(obj.url);
@@ -470,6 +473,76 @@ class WebSearchMCPServer {
            }
            const responseText = header + body;
 
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: responseText,
+                },
+              ],
+            };
+          } catch (error) {
+            this.handleError(error, 'get-single-web-page-content');
+          }
+        }
+      );
+
+    // Register the website sitemap discovery tool
+    this.server.tool(
+      'get-website-sitemap',
+      'Discover all available page URLs on a website by reading its sitemap.xml file. This is the RECOMMENDED FIRST STEP when you have a specific domain URL (e.g., https://company.com). If this tool returns a large number of URLs, it is highly recommended to use filter-sitemap-urls as your next step to narrow down high-value pages before attempting content extraction, as extracting all URLs directly may exceed context limits and reduce precision.',
+      {
+        url: z.string().url().describe('The base URL of the website to discover the sitemap for (e.g., https://example.com)'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: get-website-sitemap`);
+        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+        try {
+          if (typeof args !== 'object' || args === null) {
+            throw new Error('Invalid arguments: args must be an object');
+          }
+          const obj = args as Record<string, unknown>;
+
+          if (!obj.url || typeof obj.url !== 'string') {
+            throw new Error('Invalid arguments: url is required and must be a string');
+          }
+
+          console.log(`[MCP] Starting sitemap discovery for: ${obj.url}`);
+          const urls = await fetchSitemapUrls(obj.url);
+
+          if (urls.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `No URLs found in the sitemap for ${obj.url}. The sitemap might not exist or could be empty.`,
+                },
+              ],
+            };
+          }
+
+          console.log(`[MCP] Sitemap discovery completed, found ${urls.length} URLs`);
+
+          let responseText = `**Sitemap Discovery Results for: ${obj.url}**\n\n`;
+          responseText += `**Total URLs Found:** ${urls.length}\n\n`;
+          responseText += `**URLs:**\n`;
+          
+          // Return first 100 URLs to avoid overwhelming the agent, or all if less than 100
+          const displayUrls = urls.slice(0, 100);
+          displayUrls.forEach((url, idx) => {
+            responseText += `${idx + 1}. ${url}\n`;
+          });
+
+          // Tiered Guidance based on URL count
+          if (urls.length > 100) {
+            responseText += `\n... and ${urls.length - 100} more URLs.\n\n⚠️ **Observation:** This website contains a large number of URLs (${urls.length}). Extracting all of them directly would likely exceed context limits and reduce result precision. To efficiently locate specific information, it is recommended to use the 'filter-sitemap-urls' tool with targeted keywords (e.g., ['about', 'company', 'strategy']) before proceeding with content extraction. This narrows the scope to high-value pages.\n`;
+          } else if (urls.length > 20) {
+            responseText += `\n... and ${urls.length - 100} more URLs.\n\nℹ️ **Note:** The site has a moderate number of URLs (${urls.length}). For better efficiency, consider using 'filter-sitemap-urls' to target specific sections, or proceed with selecting the most relevant pages for extraction.\n`;
+          } else {
+            responseText += `\n\n💡 **Suggestion:** With only ${urls.length} URLs found, you can proceed directly to extracting content from the most promising pages without needing to filter extensively.\n`;
+          }
+
           return {
             content: [
               {
@@ -479,7 +552,60 @@ class WebSearchMCPServer {
             ],
           };
         } catch (error) {
-          this.handleError(error, 'get-single-web-page-content');
+          this.handleError(error, 'get-website-sitemap');
+        }
+      }
+    );
+
+    // Register the sitemap filtering tool for large websites
+    this.server.tool(
+      'filter-sitemap-urls',
+      'Filter a website\'s sitemap to find high-value pages based on keywords. This is a RECOMMENDED next step after get-website-sitemap when many URLs are found, especially for large corporate sites. Example: If researching "what Sanofi does", use keywords like ["about", "company", "strategy", "mission"]. This ensures you extract content from the most authoritative pages rather than random search results.',
+      {
+        url: z.string().url().describe('The base URL of the website'),
+        keywords: z.array(z.string()).describe('Keywords to look for in URLs (e.g., ["about", "strategy", "mission"])'),
+        limit: z.number().optional().default(20).describe('Maximum number of matching URLs to return'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: filter-sitemap-urls`);
+        try {
+          if (typeof args !== 'object' || args === null) throw new Error('Invalid arguments');
+          const obj = args as Record<string, any>;
+          
+          console.log(`[MCP] Filtering sitemap for ${obj.url} with keywords: ${obj.keywords.join(', ')}`);
+          const allUrls = await fetchSitemapUrls(obj.url);
+          
+          if (allUrls.length === 0) {
+            return { content: [{ type: 'text', text: `No URLs found in sitemap for ${obj.url}` }] };
+          }
+
+          // Score URLs based on keyword matches
+          const scoredUrls = allUrls.map(url => {
+            let score = 0;
+            const lowerUrl = url.toLowerCase();
+            obj.keywords.forEach((kw: string) => {
+              if (lowerUrl.includes(kw.toLowerCase())) score++;
+            });
+            return { url, score };
+          })
+          .filter(item => item.score > 0)
+          .sort((a, b) => b.score - a.score);
+
+          const filtered = scoredUrls.slice(0, obj.limit || 20).map(i => i.url);
+
+          if (filtered.length === 0) {
+            return { content: [{ type: 'text', text: `No URLs matched the keywords for ${obj.url}. Found ${allUrls.length} total URLs.` }] };
+          }
+
+          let responseText = `**Filtered Sitemap Results for: ${obj.url}**\n`;
+          responseText += `Found ${filtered.length} high-value pages matching your keywords (out of ${allUrls.length} total):\n\n`;
+          filtered.forEach((url, idx) => {
+            responseText += `${idx + 1}. ${url}\n`;
+          });
+
+          return { content: [{ type: 'text', text: responseText }] };
+        } catch (error) {
+          this.handleError(error, 'filter-sitemap-urls');
         }
       }
     );
@@ -597,7 +723,7 @@ class WebSearchMCPServer {
      // Register the GitHub directory listing tool
      this.server.tool(
        'get-github-directory-contents',
-       'List the files and directories within a specific path of a GitHub repository. This is useful for exploring the repository structure before fetching specific file contents.',
+       'List the files and directories within a specific path of a GitHub repository. This tool is useful for exploring the repository structure before fetching specific file contents.',
        {
          url: z.string().url().describe('The URL of the GitHub repository (e.g., https://github.com/owner/repo)'),
          path: z.string().optional().describe('The path within the repository to list (e.g., "docs/technical")'),
@@ -819,8 +945,8 @@ class WebSearchMCPServer {
           let limit = 10; // default
           if (obj.limit !== undefined) {
             const limitValue = typeof obj.limit === 'string' ? parseInt(obj.limit, 10) : obj.limit;
-            if (typeof limitValue !== 'number' || isNaN(limitValue)) {
-              throw new Error('Invalid limit: must be a number');
+            if (typeof limitValue !== 'number' || isNaN(limitValue) || limitValue < 1 || limitValue > 20) {
+              throw new Error('Invalid limit: must be a number between 1 and 20');
             }
             limit = limitValue;
           }
@@ -1082,27 +1208,33 @@ class WebSearchMCPServer {
             };
           }
 
-          console.log(`[MCP] Cache MISS for: "${query}" - performing fresh search`);
-
-          // Perform the actual web search
-          const searchResponse = await this.searchEngine.search({
-            query,
-            numResults: limit * 2 + 2, // Request extra to account for PDFs
-          });
-
-          const searchResults = searchResponse.results;
-
-          console.log(`[MCP] Search completed, found ${searchResults.length} results`);
-
-          // Extract content from each result if requested
-          let enhancedResults: SearchResult[] = [];
-          if (includeContent) {
-            enhancedResults = await this.contentExtractor.extractContentForResults(searchResults.slice(0, limit), limit);
-          } else {
-            enhancedResults = searchResults.slice(0, limit);
-          }
-
-          // Store results in cache for future similar queries
+           console.log(`[MCP] Cache MISS for: "${query}" - performing fresh search`);
+ 
+           // Perform the actual web search
+           const searchResponse = await this.searchEngine.search({
+             query,
+             numResults: limit * 2 + 2, // Request extra to account for potential PDF files
+           });
+ 
+           const searchResults = searchResponse.results;
+ 
+           console.log(`[MCP] Search completed, found ${searchResults.length} results`);
+ 
+           // Extract content from each result if requested
+           let enhancedResults: SearchResult[] = [];
+           if (includeContent) {
+             const sessionId = this.generateSessionId();
+             enhancedResults = await this.contentExtractor.extractContentForResults(
+               searchResults.slice(0, limit),
+               limit,
+               maxContentLength,
+               sessionId
+             );
+           } else {
+             enhancedResults = searchResults.slice(0, limit);
+           }
+ 
+           // Store results in cache for future similar queries
           semanticCache.set(query, enhancedResults);
 
           console.log(`[MCP] Results cached for: "${query}"`);
@@ -1274,14 +1406,25 @@ class WebSearchMCPServer {
       }
     }
 
+    // Convert maxContentLength to number if it's a string
+    let maxContentLength: number | undefined;
+    if (obj.maxContentLength !== undefined) {
+      const maxLengthValue = typeof obj.maxContentLength === 'string' ? parseInt(obj.maxContentLength, 10) : obj.maxContentLength;
+      if (typeof maxLengthValue !== 'number' || isNaN(maxLengthValue) || maxLengthValue < 0) {
+        throw new Error('Invalid maxContentLength: must be a non-negative number');
+      }
+      maxContentLength = maxLengthValue === 0 ? undefined : maxLengthValue;
+    }
+
     return {
       query: obj.query,
       limit,
       includeContent,
+      maxContentLength,
     };
   }
 
-  private async handleWebSearch(input: WebSearchToolInput): Promise<WebSearchToolOutput> {
+  private async handleWebSearch(input: WebSearchToolInput, sessionId?: string): Promise<WebSearchToolOutput> {
     const startTime = Date.now();
     const { query, limit = 5, includeContent = true } = input;
     
@@ -1314,7 +1457,7 @@ class WebSearchMCPServer {
 
       // Extract content from each result if requested, with target count
       const enhancedResults = includeContent 
-        ? await this.contentExtractor.extractContentForResults(searchResults, limit)
+        ? await this.contentExtractor.extractContentForResults(searchResults, limit, input.maxContentLength, sessionId)
         : searchResults.slice(0, limit); // If not extracting content, just take the first 'limit' results
       
       // Log extraction summary with failure reasons and generate combined status

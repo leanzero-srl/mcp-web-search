@@ -21,6 +21,7 @@ interface SessionRateLimitState {
   requestCount: number;
   lastResetTime: number;
   blockedUntil: number | null;
+  consecutive404Count: number;
 }
 
 // ============================================================================
@@ -79,6 +80,7 @@ export class SessionRateLimiter {
         requestCount: 0,
         lastResetTime: Date.now(),
         blockedUntil: null,
+        consecutive404Count: 0,
       };
       this.sessions.set(sessionId, state);
     }
@@ -93,6 +95,7 @@ export class SessionRateLimiter {
     state.requestCount = 0;
     state.lastResetTime = Date.now();
     state.blockedUntil = null;
+    state.consecutive404Count = 0;
     
     console.error(JSON.stringify({
       timestamp: new Date().toISOString(),
@@ -110,16 +113,16 @@ export class SessionRateLimiter {
     const state = this.getSessionState(sessionId);
     const now = Date.now();
 
-    // Check if session is still blocked from previous rate limit hit
+    // Check if session is still blocked from previous rate limit hit or excessive 404s
     if (state.blockedUntil && state.blockedUntil > now) {
       const waitTime = Math.ceil((state.blockedUntil - now) / 1000);
       auditLogger.logToolError(
         toolName,
         -32009, // RateLimitExceeded
-        `Rate limit exceeded. Please wait ${waitTime} seconds.`,
+        `Session blocked. Please wait ${waitTime} seconds.`,
         'RateLimit'
       );
-      throw new Error(`Rate limit exceeded. Please wait ${waitTime} seconds.`);
+      throw new Error(`Session blocked. Please wait ${waitTime} seconds.`);
     }
 
     // Reset counter if window has passed
@@ -127,6 +130,7 @@ export class SessionRateLimiter {
       state.requestCount = 0;
       state.lastResetTime = now;
       state.blockedUntil = null;
+      state.consecutive404Count = 0;
     }
 
     // Check rate limit
@@ -145,6 +149,39 @@ export class SessionRateLimiter {
 
     // Record the request
     state.requestCount++;
+  }
+
+  /**
+   * Record a consecutive 404 error for a session
+   */
+  public record404(sessionId: string, toolName: string): void {
+    const state = this.getSessionState(sessionId);
+    state.consecutive404Count++;
+
+    console.error(`[Guardrails] Consecutive 404 detected for session ${sessionId}: ${state.consecutive404Count}`);
+
+    // If threshold reached (e.g., 3 consecutive 404s), block the session
+    const threshold = 3;
+    if (state.consecutive404Count >= threshold) {
+      const blockDuration = 30000; // Block for 30 seconds
+      state.blockedUntil = Date.now() + blockDuration;
+      
+      auditLogger.logToolError(
+        toolName,
+        -32602, // InvalidParams
+        `Excessive 404 errors detected (${state.consecutive404Count}). Session temporarily blocked to prevent infinite loops.`,
+        'Guardrail'
+      );
+      console.error(`[Guardrails] Session ${sessionId} blocked due to excessive 404s.`);
+    }
+  }
+
+  /**
+   * Reset consecutive 404 count for a session
+   */
+  public reset404(sessionId: string): void {
+    const state = this.getSessionState(sessionId);
+    state.consecutive404Count = 0;
   }
 
   /**

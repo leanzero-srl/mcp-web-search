@@ -1,152 +1,165 @@
-# Web Search MCP Server - Documentation
+# Web Search MCP Server
 
-**Last Updated:** April 3, 2026  
-**Version:** 0.3.1  
-**Language:** TypeScript (ESM)  
-**Protocol:** Model Context Protocol (MCP)
+**A high-performance, production-ready web search orchestration system specifically engineered for local AI agents.**
 
----
-
-## Quick Start for AI Models
-
-This documentation is designed to help AI models quickly understand and work with the Web Search MCP Server project.
-
-### How to Use This Documentation
-
-1. **For Tool Usage**: See `docs/tools/tool-reference.md`
-2. **For Adding Features**: See `docs/development/adding-new-tools.md`
-3. **For Understanding Architecture**: See `docs/architecture/overview.md`
-4. **For Development Setup**: See `docs/development/setup.md`
-
-### Key Files to Know
-
-| File | Purpose |
-|------|---------|
-| `src/index.ts` | Main entry point - MCP tool definitions |
-| `src/search-engine.ts` | Multi-engine search orchestration |
-| `src/browser-pool.ts` | Browser context pooling |
-| `src/enterprise-guardrails.ts` | Rate limiting and validation |
-| `docs/tools/tool-reference.md` | Complete list of all MCP tools |
-
-### Search Tips for AI Models
-
-To find specific information in this documentation:
-
-- **For tool usage**: Search "tool" + tool name (e.g., "full-web-search", "progressive-web-search")
-- **For configuration**: Search "environment variable" + variable name
-- **For architecture**: Search "architecture" or specific component names
-- **For development**: Search "development setup" or "add new feature"
+> **Note:** This is a fork of [mrkrsl/web-search-mcp](https://github.com/mrkrsl/web-search-mcp) with significantly enhanced orchestration, enterprise guardrails, and intelligent content extraction capabilities.
 
 ---
 
-## What is This Project?
+## 🎯 Who Is This For?
 
-A TypeScript-based MCP (Model Context Protocol) server that provides comprehensive web search capabilities using direct browser connections (no API keys required). It includes multiple search engines, content extraction tools, and enterprise-grade features.
+This server is built for **Local AI Users**—individuals running Large Language Models (LLMs) on their own hardware or via private instances.
 
-**Note:** This project is part of the **[LeanZero](https://leanzero.atlascrafted.com)** ecosystem from AtlasCraft - a suite of production-ready AI tools designed for seamless integration into AI workflows.
-
-### Core Capabilities
-
-| Category | Features |
-|----------|----------|
-| **Search** | Multi-engine parallel search (Bing, Brave, DuckDuckGo) |
-| **Content Extraction** | Web pages, PDFs, GitHub repos, OpenAPI specs |
-| **Intelligence** | Progressive query expansion, semantic caching |
-| **Enterprise** | Rate limiting, input validation, audit logging |
+- ✅ **Cline / Roo Code Users**: Perfect for autonomous coding agents that need to research documentation or libraries.
+- ✅ **Claude Desktop Users**: Seamlessly add web browsing capabilities to your local Claude interface.
+- ✅ **Privacy-First Researchers**: Perform deep web research without sending your entire prompt history to third-party search APIs.
+- ✅ **Agent Developers**: A robust, modular foundation for building complex AI agents with built-in rate limiting and quality control.
 
 ---
 
-## Project Structure
+## 🚀 What It Does (The Technical Edge)
 
-```
-mcp-web-search/
-├── src/                      # Source code
-│   ├── index.ts             # Main entry point & MCP tools
-│   ├── search-engine.ts     # Multi-engine search orchestration
-│   ├── browser-pool.ts      # Browser context pooling
-│   ├── progressive-search-engine.ts  # Query expansion system
-│   └── [module].ts          # Individual feature modules
-├── tests/                    # Test files
-│   ├── integration/         # Integration tests
-│   └── setup/               # Test utilities
-├── docs/                     # This documentation
-│   ├── README.md           # This file (root project)
-│   ├── architecture/       # System design docs
-│   ├── tools/              # Tool reference guide
-│   ├── modules/            # Feature module docs
-│   ├── development/        # Contributing guide
-│   └── reference/          # Type definitions & configs
-└── scripts/                  # Build and deployment scripts
+Unlike simple search tools that just return a list of links, this MCP server acts as an **intelligent orchestration layer** between your AI agent and the web.
+
+### 🛠️ The Orchestration Workflow
+
+1.  **Intent Detection**: Analyzes the query to determine if it requires a simple summary or deep content extraction.
+2.  **Intelligent Engine Selection**: Automatically routes requests through Bing, Brave, or DuckDuckGo, with automatic failover if one engine is blocked or rate-limited.
+3.  **Multi-Stage Extraction**: 
+    -   **Stage 1 (Fast)**: Uses high-speed HTTP clients (Axios) for standard pages.
+    -   **Stage 2 (Stealth)**: If Stage 1 fails (e.g., due to bot detection), it automatically spins up a headless browser (Playwright) to bypass protections.
+4.  **Content Intelligence**:
+    -   **Semantic Caching**: Remembers previous searches to provide instant, relevant results for similar queries.
+    -   **Quality Scoring**: Evaluates the relevance and "noise" of extracted content before handing it to your AI.
+    -   **Markdown Conversion**: Converts messy HTML into clean, structured Markdown optimized for LLM context windows.
+
+---
+
+## ⚙️ Setup & Configuration
+
+### 1. Installation
+
+```bash
+# Clone and install dependencies
+cd mcp-web-search
+npm install
+npm run build
 ```
 
----
+### 2. Configuring your MCP Client (Crucial)
 
-## Quick Reference
+To use this with your local AI agent, you must add it to your client's configuration file.
 
-### MCP Tools Available
+#### For Claude Desktop
+Edit your `claude_desktop_config.json` (usually in `%APPDATA%\Claude` on Windows or `~/Library/Application Support/Claude` on macOS):
 
-| Tool Name | Purpose |
-|-----------|---------|
-| `full-web-search` | Comprehensive search with full content extraction |
-| `get-web-search-summaries` | Lightweight search (snippets only) |
-| `get-single-web-page-content` | Extract from single URL |
-| `progressive-web-search` | Smart query expansion system |
-| `cached-web-search` | Search with semantic caching |
-| `get-github-repo-content` | Crawl GitHub repositories |
-| `get-pdf-content` | Extract content from PDFs |
-| `get-openapi-spec` | Download OpenAPI specifications |
+```json
+{
+  "mcpServers": {
+    "web-search": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/mcp-web-search/dist/index.js"],
+      "env": {
+        "SERPER_API_KEY": "your_key_here",
+        "SEARCH_ENGINE": "bing",
+        "BROWSER_HEADLESS": "true"
+      }
+    }
+  }
+}
+```
 
-### Common Development Tasks
+#### For Cline / Roo Code (VS Code)
+Add the following to your MCP settings in the extension:
 
-| Task | Command |
-|------|---------|
-| Install dependencies | `npm install` |
-| Build project | `npm run build` |
-| Run tests | `npm test` |
-| Run integration tests | `npm run test:integration` |
-| Start dev server | `npm run dev` |
-
----
-
-## Getting Started
-
-1. **Read the quick start** above if you're new to this project
-2. **Check tools documentation** for using specific MCP tools
-3. **Review architecture docs** to understand how components fit together
-4. **See development guide** if you want to contribute or modify
-
----
-
-## About AtlasCraft & LeanZero
-
-This Web Search MCP Server is part of the **[LeanZero](https://leanzero.atlascrafted.com)** ecosystem from **AtlasCraft** - a collection of production-ready tools designed for AI integration.
-
-### Other Tools in the LeanZero Ecosystem
-
-| Tool | Description |
-|------|-------------|
-| **Web Search** (this project) | Comprehensive web search with multiple engines |
-| **Search Aggregator** | Combine results from multiple sources |
-| **Knowledge Base** | Build and query vector databases |
-| **RAG Engine** | Retrieval-Augmented Generation framework |
-
-### Why LeanZero?
-
-- **Open Source**: Transparent, community-driven development
-- **Production Ready**: Enterprise-grade features included
-- **Easy Integration**: Standardized MCP protocol
-- **No API Keys Required**: Direct browser connections
+```json
+{
+  "mcpServers": {
+    "web-search": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/mcp-web-search/dist/index.js"],
+      "env": {
+        "SEARCH_ENGINE": "brave",
+        "MAX_CONTENT_LENGTH": "100000"
+      }
+    }
+  }
+}
+```
 
 ---
 
-## Need More Help?
+## 🔧 Configuration Deep Dive
 
-- **For tool-specific questions**: Check `docs/tools/`
-- **For understanding behavior**: Check `docs/architecture/`
-- **For coding questions**: Check `docs/development/`
+You can fine-tune the server's behavior using **Environment Variables**. These are passed via the `env` block in your MCP client configuration.
+
+### 🔍 Search & API Settings
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SEARCH_ENGINE` | `bing` | `bing`, `brave`, `duckduckgo`, or `serper` |
+| `SERPER_API_KEY` | *none* | Required if using `serper` engine |
+| `SEARCH_ENGINE_MAX_RPM` | `10` | Max requests per minute to the search engine |
+| `SEARCH_ENGINE_RESET_MS` | `60000` | Reset window for RPM in milliseconds |
+| `DEBUG_BING_SEARCH` | `false` | Set to `true` for verbose Bing parsing logs |
+
+### 📄 Content Extraction & Quality
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_CONTENT_LENGTH` | `500000` | Max bytes per page (prevents context overflow) |
+| `MIN_CONTENT_LENGTH` | `200` | Minimum bytes required for a valid result |
+| `DEFAULT_TIMEOUT` | `6000` | Timeout for extraction in ms |
+| `BROWSER_FALLBACK_THRESHOLD`| `3` | Failures before switching to headless browser |
+| `ENABLE_RELEVANCE_CHECKING` | `true` | Enables AI-ready quality scoring |
+| `RELEVANCE_THRESHOLD` | `0.3` | Minimum score (0.0-1.0) for valid content |
+
+### 🌐 Browser & Stealth Management
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BROWSER_HEADLESS` | `true` | Set to `false` to see the browser in action |
+| `BROWSER_TYPES` | `chromium,firefox`| Comma-separated list of browsers to use |
+| `MAX_BROWSERS` | `3` | Max concurrent browser instances |
+| `CONTEXT_POOL_SIZE` | `10` | Max browser contexts kept in memory |
+| `CONTEXT_MAX_AGE` | `60000` | How long a context stays alive (ms) |
+| `USE_LEGACY_POOL` | `false` | Use the older, more stable pool implementation |
+
+### 🛡️ Enterprise Guardrails
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_REQUESTS_PER_MINUTE` | `30` | Global session rate limit |
+| `MAX_REQUESTS_PER_SECOND` | `10` | Global server throttle (prevents CPU spikes) |
+| `MAX_OUTPUT_LENGTH` | `50000` | Max characters returned in a single tool response |
+
+### 📂 GitHub & Repository Extraction
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GITHUB_TOKEN` | *none* | Personal Access Token for deeper repo access |
+| `GITHUB_MAX_DEPTH` | `3` | Max directory depth to crawl |
+| `GITHUB_MAX_FILES` | `50` | Max files to extract per repository |
 
 ---
 
-## License
+## 🛠️ MCP Tools Reference
 
-This project is part of the LeanZero ecosystem by AtlasCraft. See LICENSE file for details.
+### Primary Search Tools
+- `full-web-search`: Comprehensive research. Returns top results with full, cleaned Markdown content.
+- `get-web-search-summaries`: Lightweight search. Returns snippets/descriptions without heavy extraction.
+- `progressive-web-search`: Advanced research. Uses query expansion and multiple engines for complex topics.
+- `cached-web-search`: Intelligent search. Uses semantic caching to provide instant results for similar queries.
+
+### Specialized Extractors
+- `get-single-web-page-content`: Targeted extraction from a specific URL.
+- `get-github-repo-content`: Deeply crawls and extracts code/READMEs from GitHub repositories.
+- `get-pdf-content`: Extracts readable text from PDF documents (with browser fallback).
+- `get-openapi-spec`: Automatically discovers and downloads OpenAPI/Swagger specifications.
+
+### Discovery & Management
+- `get-website-sitemap`: Discovers all available URLs on a domain via its sitemap.
+- `filter-sitemap-urls`: Filters sitemap results by keywords to find high-value pages.
+- `get-github-directory-contents`: Lists files/folders within a specific GitHub path.
+- `list-cached-documents`: Lists all previously crawled documents and specs stored in the local cache.
+
+---
+
+## ⚖️ License
+
+This project is part of the [LeanZero](https://leanzero.atlascrafted.com) ecosystem by AtlasCraft. See LICENSE file for details.
