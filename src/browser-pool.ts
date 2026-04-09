@@ -1,5 +1,5 @@
 import { chromium, firefox, webkit, Browser, BrowserContext } from 'playwright';
-import { ContextPool, ContextPoolConfig, ContextPoolOptions, getEnvironmentConfig } from './context-pool.js';
+import { ContextPool, ContextPoolConfig, getEnvironmentConfig } from './context-pool.js';
 
 export class BrowserPool {
   private contextPool: ContextPool | null = null;

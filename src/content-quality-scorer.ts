@@ -79,7 +79,7 @@ export function scoreContentQuality(
   
   // Calculate quality score components
   let score = 0;
-  let reasons: string[] = [];
+  const reasons = [];
   
   // 1. Length check (40% weight)
   if (cleanedContent.length >= effectiveConfig.minContentLength) {
@@ -112,7 +112,7 @@ export function scoreContentQuality(
   // 4. Structural integrity (15% weight)
   // Check for presence of multiple headings or lists which indicate structured information
   const hasHeadings = /#{1,6}\s/.test(cleanedContent) || /^[A-Z][^.!?]*\n/.test(cleanedContent);
-  const hasLists = /^\s*[\*\-\+]\s+/.test(cleanedContent) || /^\d+\.\s+/.test(cleanedContent);
+  const hasLists = /^\s*[*+-]\s+/.test(cleanedContent) || /^\d+\.\s+/.test(cleanedContent);
   
   if (hasHeadings && hasLists) {
     score += 0.15;

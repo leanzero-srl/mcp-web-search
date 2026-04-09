@@ -10,7 +10,7 @@
 import { BrowserPool } from './browser-pool.js';
 import { auditLogger, telemetryCollector } from './observability.js';
 
-// Create a global browser pool instance for PDF extraction
+// ============================================================================
 const browserPool = new BrowserPool();
 
 // ============================================================================
