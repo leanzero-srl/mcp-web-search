@@ -41,20 +41,20 @@ export class BrowserPool {
   private async getBrowserWithContextPool(): Promise<Browser> {
     if (!this.contextPool) {
       const envConfig = getEnvironmentConfig();
-      
+
       const config: ContextPoolConfig = {
         maxSize: parseInt(process.env.CONTEXT_POOL_SIZE || '10', 10),
-        reuseTimeoutMs: parseInt(process.env.CONTEXT_REUSE_TIMEOUT || '30000', 10),
+        reuseTimeoutMs: parseInt(process.env.CONTEXT_REUSE_TIMEOUT || '20000', 10),
         maxAgeMs: parseInt(process.env.CONTEXT_MAX_AGE || '60000', 10),
       };
-      
+
       this.contextPool = new ContextPool({
         engineType: envConfig.engineType,
         headlessMode: envConfig.headlessMode,
         config,
       });
     }
-    
+
     // Note: This method returns a browser for compatibility
     // The actual context pooling is handled in getContext() method
     return await this.contextPool['getBrowser']();
@@ -168,20 +168,20 @@ export class BrowserPool {
   async getContext(): Promise<BrowserContext> {
     if (!this.contextPool) {
       const envConfig = getEnvironmentConfig();
-      
+
       const config: ContextPoolConfig = {
         maxSize: parseInt(process.env.CONTEXT_POOL_SIZE || '10', 10),
-        reuseTimeoutMs: parseInt(process.env.CONTEXT_REUSE_TIMEOUT || '30000', 10),
+        reuseTimeoutMs: parseInt(process.env.CONTEXT_REUSE_TIMEOUT || '20000', 10),
         maxAgeMs: parseInt(process.env.CONTEXT_MAX_AGE || '60000', 10),
       };
-      
+
       this.contextPool = new ContextPool({
         engineType: envConfig.engineType,
         headlessMode: envConfig.headlessMode,
         config,
       });
     }
-    
+
     return await this.contextPool.getContext();
   }
 

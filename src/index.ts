@@ -40,6 +40,8 @@ class McpError extends Error {
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import * as fs from 'fs';
+import * as path from 'path';
 import { SearchEngine } from './search-engine.js';
 import { EnhancedContentExtractor } from './enhanced-content-extractor.js';
 import { pdfExtractor as pdfExtractorInstance } from './pdf-extractor.js';
@@ -159,7 +161,7 @@ class WebSearchMCPServer {
       version: '0.3.1',
     });
 
-    const maxRPM = parseInt(process.env.SEARCH_ENGINE_MAX_RPM || '10', 10);
+    const maxRPM = parseInt(process.env.SEARCH_ENGINE_MAX_RPM || '50', 10);
     const resetMS = parseInt(process.env.SEARCH_ENGINE_RESET_MS || '60000', 10);
     this.searchEngine = new SearchEngine({
       maxRequestsPerMinute: maxRPM,
@@ -486,6 +488,447 @@ class WebSearchMCPServer {
           }
         }
       );
+
+    // Helper function to sanitize content (remove excessive links and noise)
+    const sanitizeContent = (content: string, sourceUrl: string): string => {
+      let sanitized = content;
+      
+      // If source is Wikipedia, apply Wikipedia-specific cleanup
+      if (sourceUrl.includes('wikipedia.org')) {
+        // Remove Wikipedia-style links like [1], [2], etc. at end of content
+        sanitized = sanitized.replace(/\[\d+\](#cite_.*)?/g, '');
+        // Remove reference numbers within text like [1]
+        sanitized = sanitized.replace(/\[\d+\]/g, '');
+        // Clean up excessive whitespace from removed links
+        sanitized = sanitized.replace(/\n{3,}/g, '\n\n');
+      }
+      
+      // Remove excessive newlines
+      sanitized = sanitized.replace(/\n{4,}/g, '\n\n\n');
+      
+      // Remove very long words that are likely noise (over 100 chars)
+      const words = sanitized.split(/\s+/);
+      const cleanedWords = words.filter(word => word.length <= 100);
+      sanitized = cleanedWords.join(' ');
+      
+      return sanitized.trim();
+    };
+
+    // Helper function to calculate reading time
+    const calculateReadingTime = (content: string): string => {
+      const wordsPerMinute = 200;
+      const wordCount = content.split(/\s+/).filter(w => w.length > 0).length;
+      const minutes = Math.ceil(wordCount / wordsPerMinute);
+      return `${minutes} min read`;
+    };
+
+    // Helper function to calculate content quality score
+    const calculateQualityScore = (content: string, digest: { entities?: string[]; claims?: string[]; keyTerms?: string[] } | undefined): number => {
+      let score = 50; // Base score
+      
+      // Length score (0-20 points)
+      const wordCount = content.split(/\s+/).filter(w => w.length > 0).length;
+      if (wordCount > 500) score += 10;
+      if (wordCount > 1000) score += 5;
+      if (wordCount > 2000) score += 5;
+      
+      // Digest quality (0-20 points)
+      if (digest) {
+        if (digest.entities && digest.entities.length > 0) score += Math.min(7, digest.entities.length);
+        if (digest.claims && digest.claims.length > 0) score += Math.min(7, digest.claims.length);
+        if (digest.keyTerms && digest.keyTerms.length > 0) score += Math.min(6, digest.keyTerms.length);
+      }
+      
+      // Structure quality (0-10 points)
+      const hasParagraphs = content.includes('\n\n');
+      const hasProperLength = wordCount > 300 && wordCount < 50000;
+      if (hasParagraphs) score += 5;
+      if (hasProperLength) score += 5;
+      
+      return Math.min(100, score);
+    };
+
+    // Helper function for cleanup old research files
+    const cleanupOldFiles = (outputDir: string, maxFiles: number): void => {
+      if (!fs.existsSync(outputDir)) return;
+      
+      const files = fs.readdirSync(outputDir)
+        .filter(f => f.endsWith('.md') && f.startsWith('research-'))
+        .map(f => ({
+          name: f,
+          path: path.join(outputDir, f),
+          time: fs.statSync(path.join(outputDir, f)).mtime.getTime()
+        }))
+        .sort((a, b) => b.time - a.time); // Newest first
+      
+      // Remove old files if exceeding maxFiles
+      if (files.length > maxFiles) {
+        const filesToDelete = files.slice(maxFiles);
+        filesToDelete.forEach(f => {
+          fs.unlinkSync(f.path);
+          console.log(`[MCP] Cleaned up old research file: ${f.name}`);
+        });
+      }
+    };
+
+    // Helper function to find existing research file matching the prefix
+    const findExistingResearchFile = (outputDir: string, prefix?: string): string | undefined => {
+      if (!fs.existsSync(outputDir)) return undefined;
+
+      const files = fs.readdirSync(outputDir)
+        .filter(f => f.endsWith('.md'));
+
+      // Filter by prefix if provided
+      const matchingFiles = prefix
+        ? files.filter(f => f.startsWith(prefix) || f.includes(prefix.replace(/-$/, '')))
+        : files;
+
+      if (matchingFiles.length === 0) return undefined;
+
+      // Sort by modification time (newest first)
+      const sortedFiles = matchingFiles
+        .map(f => ({
+          name: f,
+          path: path.join(outputDir, f),
+          time: fs.statSync(path.join(outputDir, f)).mtime.getTime()
+        }))
+        .sort((a, b) => b.time - a.time);
+
+      return sortedFiles[0].path;
+    };
+
+    // Helper function to render custom markdown template
+    const renderTemplate = (
+      template: string,
+      data: {
+        title: string;
+        url: string;
+        timestamp: string;
+        wordCount: number;
+        readingTime: string;
+        qualityScore: number;
+        entities: string[];
+        claims: string[];
+        keyTerms: string[];
+        content: string;
+      }
+    ): string => {
+      let result = template;
+
+      // Replace all placeholders
+      result = result.replace(/\{title\}/g, data.title);
+      result = result.replace(/\{url\}/g, data.url);
+      result = result.replace(/\{timestamp\}/g, data.timestamp);
+      result = result.replace(/\{wordCount\}/g, String(data.wordCount));
+      result = result.replace(/\{readingTime\}/g, data.readingTime);
+      result = result.replace(/\{qualityScore\}/g, String(data.qualityScore));
+      result = result.replace(/\{entities\}/g, data.entities.length > 0 ? data.entities.join('\n- ') : '*None detected*');
+      result = result.replace(/\{claims\}/g, data.claims.length > 0 ? data.claims.join('\n- ') : '*None detected*');
+      result = result.replace(/\{keyTerms\}/g, data.keyTerms.length > 0 ? data.keyTerms.join('\n- ') : '*None detected*');
+      result = result.replace(/\{content\}/g, data.content);
+
+      return result;
+    };
+
+    // Helper function to extract content with retry
+    const extractContentWithRetry = async (url: string, sessionId: string, maxRetries: number = 3): Promise<{ content: string; digest?: { entities?: string[]; claims?: string[]; keyTerms?: string[] } }> => {
+      let lastError: Error | undefined;
+      
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          console.log(`[MCP] Content extraction attempt ${attempt}/${maxRetries} for: ${url}`);
+          const result = await this.contentExtractor.extractContent({
+            url,
+            sessionId,
+          });
+          
+          if (result.content && result.content.trim().length > 0) {
+            return result;
+          }
+          
+          lastError = new Error('Extracted content is empty');
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error));
+          console.log(`[MCP] Attempt ${attempt} failed: ${lastError.message}`);
+          
+          if (attempt < maxRetries) {
+            // Wait before retry (exponential backoff)
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+          }
+        }
+      }
+      
+      throw lastError || new Error('Failed to extract content after retries');
+    };
+
+    // Register the research and save to markdown tool
+    this.server.tool(
+      'research_and_save_to_markdown',
+      'Research web pages and save their content, research digest (entities, claims, terms), and source information into structured markdown files in the /docs/research-output directory for future reference. Supports batch research, content sanitization, quality scoring, and auto-cleanup of old files.',
+      {
+        url: z.union([z.string().url(), z.array(z.string().url())]).describe('The URL of the web page(s) to research and save. Can be a single URL or an array of URLs for batch processing.'),
+        maxContentLength: z.union([z.number(), z.string()]).transform((val) => {
+          const num = typeof val === 'string' ? parseInt(val, 10) : val;
+          if (isNaN(num) || num < 0) {
+            throw new Error('Invalid maxContentLength: must be a non-negative number');
+          }
+          return num;
+        }).optional().describe('Maximum characters per result content (0 = no limit)'),
+        maxFiles: z.union([z.number(), z.string()]).transform((val) => {
+          const num = typeof val === 'string' ? parseInt(val, 10) : val;
+          if (isNaN(num) || num < 1) {
+            throw new Error('Invalid maxFiles: must be a positive number');
+          }
+          return num;
+        }).default(50).describe('Maximum number of research files to keep. Oldest files are auto-deleted when limit is reached.'),
+        filenamePrefix: z.string().optional().describe('Custom prefix for the output filename (e.g., "my-research" creates "my-research-2026-01-01-...")'),
+        template: z.string().optional().describe('Custom markdown template for the research file. Use placeholders: {title}, {url}, {timestamp}, {wordCount}, {readingTime}, {qualityScore}, {entities}, {claims}, {keyTerms}, {content}. If not provided, default template is used.'),
+        appendToExisting: z.union([z.boolean(), z.string()]).transform((val) => {
+          if (typeof val === 'string') {
+            return val.toLowerCase() === 'true';
+          }
+          return Boolean(val);
+        }).default(false).describe('Whether to append to an existing research file instead of creating a new one. If true, will find and update the most recent file matching the filenamePrefix, or create new if none exists.'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: research_and_save_to_markdown`);
+        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+        try {
+          if (typeof args !== 'object' || args === null) {
+            throw new Error('Invalid arguments: args must be an object');
+          }
+          const obj = args as Record<string, unknown>;
+          
+          // Handle both single URL and array of URLs
+          let urls: string[] = [];
+          if (Array.isArray(obj.url)) {
+            urls = obj.url.filter((u): u is string => typeof u === 'string' && u.length > 0);
+          } else if (obj.url && typeof obj.url === 'string') {
+            urls = [obj.url];
+          }
+          
+          if (urls.length === 0) {
+            throw new Error('Invalid arguments: at least one valid URL is required');
+          }
+
+          // Parse optional parameters
+          let maxContentLength: number | undefined;
+          if (obj.maxContentLength !== undefined) {
+            const maxLengthValue = typeof obj.maxContentLength === 'string' ? parseInt(obj.maxContentLength, 10) : obj.maxContentLength;
+            if (typeof maxLengthValue !== 'number' || isNaN(maxLengthValue) || maxLengthValue < 0) {
+              throw new Error('Invalid maxContentLength: must be a non-negative number');
+            }
+            maxContentLength = maxLengthValue === 0 ? undefined : maxLengthValue;
+          }
+
+          const maxFiles = typeof obj.maxFiles === 'string' ? parseInt(obj.maxFiles, 10) : (obj.maxFiles as number) || 50;
+          const filenamePrefix = typeof obj.filenamePrefix === 'string' ? obj.filenamePrefix : undefined;
+
+          // Parse template parameter
+          const customTemplate = typeof obj.template === 'string' && obj.template.length > 0 ? obj.template : undefined;
+
+          // Parse appendToExisting parameter
+          let appendToExisting = false;
+          if (obj.appendToExisting !== undefined) {
+            if (typeof obj.appendToExisting === 'string') {
+              appendToExisting = obj.appendToExisting.toLowerCase() === 'true';
+            } else {
+              appendToExisting = Boolean(obj.appendToExisting);
+            }
+          }
+
+          console.log(`[MCP] Starting research for ${urls.length} URL(s)`);
+
+          const sessionId = this.generateSessionId();
+          const timestamp = new Date().toISOString();
+          
+          // Ensure directory exists
+          const isCwdProjectRoot = fs.existsSync(path.join(process.cwd(), 'package.json'));
+          const projectRoot = isCwdProjectRoot ? process.cwd() : path.resolve(__dirname, '..', '..');
+          const outputDir = path.join(projectRoot, 'docs', 'research-output');
+          
+          console.log(`[MCP] Resolved output directory: ${outputDir}`);
+
+          if (!fs.existsSync(outputDir)) {
+            console.log(`[MCP] Creating directory: ${outputDir}`);
+            fs.mkdirSync(outputDir, { recursive: true });
+          }
+
+          // Cleanup old files if needed
+          cleanupOldFiles(outputDir, maxFiles);
+
+          const results: Array<{ url: string; filePath: string; success: boolean; error?: string }> = [];
+
+          // Process each URL
+          for (let i = 0; i < urls.length; i++) {
+            const currentUrl = urls[i];
+            console.log(`[MCP] Processing URL ${i + 1}/${urls.length}: ${currentUrl}`);
+
+            try {
+              // Extract content with retry
+              const extractionResult = await extractContentWithRetry(currentUrl, sessionId);
+              
+              let { content, digest } = extractionResult;
+              
+              if (!content || content.trim().length === 0) {
+                throw new Error('Extracted content is empty');
+              }
+
+              // Sanitize content
+              content = sanitizeContent(content, currentUrl);
+
+              // Apply content length limit if specified
+              if (maxContentLength && maxContentLength > 0) {
+                if (content.length > maxContentLength) {
+                  content = content.substring(0, maxContentLength) + '\n\n[Content truncated to respect limit]';
+                }
+              }
+
+              // Prepare metadata
+              const urlObj = new URL(currentUrl);
+              const displayTitle = `${urlObj.hostname}${urlObj.pathname.replace(/\/$/, '')}`;
+              
+              // Create slug for filename
+              const dateSlug = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+              const urlSlug = currentUrl.replace(/[^a-z0-9]/gi, '-').toLowerCase().substring(0, 50);
+              const prefix = filenamePrefix ? `${filenamePrefix}-` : '';
+              const filename = `${prefix}research-${dateSlug}-${urlSlug}.md`;
+              const filePath = path.join(outputDir, filename);
+
+              // Calculate metadata
+              const wordCount = content.split(/\s+/).filter(w => w.length > 0).length;
+              const readingTime = calculateReadingTime(content);
+              const qualityScore = calculateQualityScore(content, digest);
+
+              // Prepare digest data for template
+              const entities = digest?.entities || [];
+              const claims = digest?.claims || [];
+              const keyTerms = digest?.keyTerms || [];
+
+              // Build Markdown content
+              let mdContent: string;
+
+              if (customTemplate) {
+                // Use custom template
+                mdContent = renderTemplate(customTemplate, {
+                  title: displayTitle,
+                  url: currentUrl,
+                  timestamp,
+                  wordCount,
+                  readingTime,
+                  qualityScore,
+                  entities,
+                  claims,
+                  keyTerms,
+                  content
+                });
+              } else {
+                // Use default template
+                mdContent = `# Research Report: ${displayTitle}\n\n`;
+                mdContent += `**Source URL:** ${currentUrl}\n`;
+                mdContent += `**Research Timestamp:** ${timestamp}\n`;
+                mdContent += `**Word Count:** ${wordCount}\n`;
+                mdContent += `**Reading Time:** ${readingTime}\n`;
+                mdContent += `**Quality Score:** ${qualityScore}/100\n\n`;
+
+                if (digest) {
+                  mdContent += `## 🧠 Research Digest\n\n`;
+
+                  mdContent += `### 🔍 Entities\n`;
+                  if (digest.entities && digest.entities.length > 0) {
+                    mdContent += `- ${digest.entities.join('\n- ')}\n`;
+                  } else {
+                    mdContent += `*None detected*\n`;
+                  }
+                  mdContent += '\n';
+
+                  mdContent += `### 📢 Key Claims\n`;
+                  if (digest.claims && digest.claims.length > 0) {
+                    mdContent += `- ${digest.claims.join('\n- ')}\n`;
+                  } else {
+                    mdContent += `*None detected*\n`;
+                  }
+                  mdContent += '\n';
+
+                  mdContent += `### 🔑 Key Terms\n`;
+                  if (digest.keyTerms && digest.keyTerms.length > 0) {
+                    mdContent += `- ${digest.keyTerms.join('\n- ')}\n`;
+                  } else {
+                    mdContent += `*None detected*\n`;
+                  }
+                  mdContent += '\n';
+                }
+
+                mdContent += `---\n\n`;
+                mdContent += `## 📝 Full Content\n\n`;
+                mdContent += content + '\n';
+              }
+
+              // Handle appendToExisting
+              let finalFilePath = filePath;
+              if (appendToExisting) {
+                const existingFilePath = findExistingResearchFile(outputDir, filenamePrefix);
+                if (existingFilePath) {
+                  // Append to existing file
+                  const separator = '\n\n---\n\n';
+                  const existingContent = fs.readFileSync(existingFilePath, 'utf8');
+                  fs.writeFileSync(existingFilePath, existingContent + separator + mdContent, 'utf8');
+                  finalFilePath = existingFilePath;
+                  console.log(`[MCP] Successfully appended research to existing file: ${existingFilePath}`);
+                } else {
+                  // No existing file, create new one
+                  fs.writeFileSync(filePath, mdContent, 'utf8');
+                  console.log(`[MCP] Successfully saved research to: ${filePath}`);
+                }
+              } else {
+                // Default behavior - write new file
+                fs.writeFileSync(filePath, mdContent, 'utf8');
+                console.log(`[MCP] Successfully saved research to: ${filePath}`);
+              }
+
+              results.push({ url: currentUrl, filePath: finalFilePath, success: true });
+            } catch (error) {
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              console.error(`[MCP] Failed to process ${currentUrl}: ${errorMessage}`);
+              results.push({ url: currentUrl, filePath: '', success: false, error: errorMessage });
+            }
+          }
+
+          // Generate response
+          const successfulResults = results.filter(r => r.success);
+          const failedResults = results.filter(r => !r.success);
+
+          let responseText = `Research complete! Processed ${results.length} URL(s).\n\n`;
+          
+          if (successfulResults.length > 0) {
+            responseText += `**✅ Successful (${successfulResults.length}):**\n`;
+            successfulResults.forEach(r => {
+              responseText += `- ${r.url} → \`${r.filePath}\`\n`;
+            });
+            responseText += '\n';
+          }
+          
+          if (failedResults.length > 0) {
+            responseText += `**❌ Failed (${failedResults.length}):**\n`;
+            failedResults.forEach(r => {
+              responseText += `- ${r.url}: ${r.error}\n`;
+            });
+          }
+
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: responseText,
+              },
+            ],
+          };
+        } catch (error) {
+          this.handleError(error, 'research_and_save_to_markdown');
+        }
+      }
+    );
 
     // Register the website sitemap discovery tool
     this.server.tool(
