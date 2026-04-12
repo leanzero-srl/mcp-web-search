@@ -213,14 +213,14 @@ export function isValidEngineType(type: string): type is BrowserEngineType {
 export function getEnvironmentConfig(): BrowserEngineOptions {
   const engineType = process.env.BROWSER_ENGINE as BrowserEngineType;
   const headlessMode = process.env.HEADLESS_MODE as HeadlessMode;
-  
+
   return {
     engineType: isValidEngineType(engineType) ? engineType : 'webkit',
     headlessMode: ['new', 'legacy', 'shell'].includes(headlessMode || '') ? headlessMode! : 'new',
     args: [],
     contextPoolConfig: {
       maxSize: parseInt(process.env.CONTEXT_POOL_SIZE || '10', 10),
-      reuseTimeoutMs: parseInt(process.env.CONTEXT_REUSE_TIMEOUT || '30000', 10),
+      reuseTimeoutMs: parseInt(process.env.CONTEXT_REUSE_TIMEOUT || '20000', 10),
       maxAgeMs: parseInt(process.env.CONTEXT_MAX_AGE || '60000', 10),
     },
   };

@@ -9,6 +9,9 @@ import { BrowserPool } from './browser-pool.js';
 import { createOptimizedBrowser, getEnginePriorityOrder, BrowserEngineType, getHeadlessOption, getEnvironmentConfig } from './browser-engine.js';
 import pLimit from 'p-limit';
 
+// Import semantic cache for result caching
+import { semanticCache } from './semantic-cache.js';
+
 export interface SearchEngineConfig {
   maxRequestsPerMinute?: number;
   resetIntervalMs?: number;
@@ -22,12 +25,12 @@ export class SearchEngine {
   private readonly maxConcurrentSearches: number;
 
   constructor(config: SearchEngineConfig = {}) {
-    const { 
-      maxRequestsPerMinute = 10, 
-      resetIntervalMs = 60000, 
-      maxConcurrentSearches = 3 
+    const {
+      maxRequestsPerMinute = 50,
+      resetIntervalMs = 60000,
+      maxConcurrentSearches = 3
     } = config;
-    
+
     this.rateLimiter = new RateLimiter(maxRequestsPerMinute, resetIntervalMs);
     this.browserPool = new BrowserPool();
     this.maxConcurrentSearches = maxConcurrentSearches;
@@ -39,23 +42,64 @@ export class SearchEngine {
   async search(options: SearchOptions): Promise<SearchResultWithMetadata> {
     const { query, numResults = 5, timeout = 10000 } = options;
     const sanitizedQuery = sanitizeQuery(query);
-    
-    console.log(`[SearchEngine] Starting parallel search for query: "${sanitizedQuery}"`);
-    
+
+    console.log(`[SearchEngine] Starting search for query: "${sanitizedQuery}"`);
+
+    // OPTIMIZATION 1: Check semantic cache FIRST, before any rate limiting or concurrency overhead
+    const cacheEnabled = process.env.SEMANTIC_CACHE_ENABLED !== 'false';
+    if (cacheEnabled) {
+      const cached = semanticCache.get(sanitizedQuery);
+      if (cached && Array.isArray(cached.results) && cached.results.length > 0) {
+        console.log(`[SearchEngine] ⚡ Cache HIT for query: "${sanitizedQuery}" - returning immediately`);
+        return { 
+          results: cached.results as SearchResult[], 
+          engine: 'semantic-cache',
+          total_results: cached.results.length
+        };
+      }
+    }
+
+    // OPTIMIZATION 2: By default, use Serper-only mode for maximum performance
+    // Browser fallbacks are opt-in via ENABLE_BROWSER_FALLBACKS=true
+    const enableBrowserFallbacks = process.env.ENABLE_BROWSER_FALLBACKS === 'true';
+    const useSerperOnly = !enableBrowserFallbacks;
+
+    console.log(`[SearchEngine] Serper-only mode: ${useSerperOnly} (enableBrowserFallbacks: ${enableBrowserFallbacks})`);
+
+    // Fast path: Skip browser engines entirely for maximum performance
+    if (useSerperOnly) {
+      try {
+        // Skip rate limiter for cache hits, but still use it for actual API calls
+        const results = await this.tryApiSearch(sanitizedQuery, numResults, timeout);
+        if (results.length > 0) {
+          console.log(`[SearchEngine] ✓ Serper returned ${results.length} results directly`);
+          return { results, engine: 'serper-only' };
+        }
+      } catch (error) {
+        console.error('[SearchEngine] Serper API failed:', error instanceof Error ? error.message : 'Unknown');
+      }
+      // If Serper fails, optionally try browser fallbacks
+      if (!enableBrowserFallbacks) {
+        console.log('[SearchEngine] Serper failed, but browser fallbacks disabled. Returning empty results.');
+        return { results: [], engine: 'serper-failed-no-fallback' };
+      }
+    }
+
+    // Only proceed to browser engines if fallbacks are enabled
     try {
       // First, respect the concurrency limit for active searches
-      return await this.concurrencyLimiter(() => 
+      return await this.concurrencyLimiter(() =>
         this.rateLimiter.execute(async () => {
           // Configuration from environment variables
           const enableQualityCheck = process.env.ENABLE_RELEVANCE_CHECKING !== 'false';
           const qualityThreshold = parseFloat(process.env.RELEVANCE_THRESHOLD || '0.3');
-          
+
           console.log(`[SearchEngine] Quality checking: ${enableQualityCheck}, threshold: ${qualityThreshold}`);
-          
+
           // WebKit-first engine priority for parallel search
           const enginePriority: BrowserEngineType[] = getEnginePriorityOrder();
           const useParallel = process.env.PARALLEL_SEARCH !== 'false'; // Default to true
-          
+
           if (useParallel) {
             console.log(`[SearchEngine] Running parallel search with engines: ${enginePriority.join(', ')}`);
             // Pass the timeout through to allow engines to respect the overall budget
@@ -93,11 +137,11 @@ export class SearchEngine {
   ): Promise<SearchResultWithMetadata> {
     const startTime = Date.now();
     const enginePriority: BrowserEngineType[] = getEnginePriorityOrder();
-    
-     // Optimization: If the overall timeout is tight (e.g. < 20s), don't use a massive 25s engine timeout.
-     // Instead, use a fraction of the remaining time to ensure we don't hang on one engine.
-     const engineTimeout = Math.max(timeout * 0.7, 15000); 
-    
+
+     // Optimization: Use a reasonable fraction of the timeout, but cap it to leave room for fallbacks
+     // With early return, we typically only need one engine's worth of time
+     const engineTimeout = Math.min(Math.max(timeout * 0.6, 8000), timeout);
+
     console.log(`[SearchEngine] Starting smart parallel search (priority: ${enginePriority.join(', ')})`);
 
     let bestResults: SearchResult[] = [];
@@ -107,7 +151,7 @@ export class SearchEngine {
     for (let i = 0; i < enginePriority.length; i++) {
       const engineType = enginePriority[i];
       console.log(`[SearchEngine] Attempting priority engine ${i + 1}/${enginePriority.length}: ${engineType}`);
-      
+
       try {
         // Check if we have exceeded the overall search timeout
         const remainingTime = timeout - (Date.now() - startTime);
@@ -117,16 +161,17 @@ export class SearchEngine {
         }
 
         // Optimization: Only delay if we have plenty of time left.
+        // Reduced max delay to 500ms since early return should skip most browser attempts
         if (i > 0 && remainingTime > 4000) {
-          const delay = Math.min(1500, remainingTime / 4);
+          const delay = Math.min(500, remainingTime / 8);
           console.log(`[SearchEngine] Throttling: waiting ${delay.toFixed(0)}ms before next engine attempt...`);
           await new Promise(resolve => setTimeout(resolve, delay));
         }
 
      // Use a more realistic timeout for the engine that respects the remaining budget
-     const currentEngineTimeout = Math.max(Math.min(engineTimeout, remainingTime), 8000);
+     const currentEngineTimeout = Math.max(Math.min(engineTimeout, remainingTime), 5000);
      const results = await this.runSearchWithEngine(engineType, query, numResults, currentEngineTimeout);
-        
+
         if (results && results.length > 0) {
           const qualityScore = enableQualityCheck ? this.assessResultQuality(results, query) : 1.0;
           console.log(`[SearchEngine] Engine ${engineType} returned ${results.length} results (quality: ${qualityScore.toFixed(2)})`);
@@ -136,6 +181,13 @@ export class SearchEngine {
             highestQuality = qualityScore;
             bestResults = results;
             bestEngine = `${engineType}-fallback`;
+          }
+
+          // Early return optimization: If API engine returns good results, skip browser engines
+          // This avoids expensive browser launches when Serper already succeeded
+          if (engineType === 'api' && qualityScore >= 0.5) {
+            console.log(`[SearchEngine] API returned quality results (${qualityScore.toFixed(2)}), skipping browser engines for speed`);
+            return { results, engine: `${engineType}-early-return` };
           }
 
           if (qualityScore >= qualityThreshold || i === enginePriority.length - 1) {
@@ -150,7 +202,7 @@ export class SearchEngine {
         console.log(`[SearchEngine] Engine ${engineType} search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
     }
-    
+
     if (bestResults.length > 0) {
       console.log(`[SearchEngine] All priority engines below threshold, returning best available from ${bestEngine} (quality: ${highestQuality.toFixed(2)})`);
       return { results: bestResults, engine: bestEngine };
@@ -186,36 +238,47 @@ export class SearchEngine {
       const approach = approaches[i];
       try {
         console.log(`[SearchEngine] Attempting ${approach.name} (${i + 1}/${approaches.length})...`);
+
+        // Give API search more time (Serper can take 5-10s), browser searches get less
+        const isApiSearch = approach.name === 'API Search';
+        const approachTimeout = isApiSearch 
+          ? Math.min(timeout * 0.6, 12000)  // API gets up to 12s or 60% of budget
+          : Math.min(timeout / 4, 5000);    // Browser fallbacks get max 5s
         
-        // Use more aggressive timeouts for faster fallback
-        const approachTimeout = Math.min(timeout / 3, 4000); // Max 4 seconds per approach
         const results = await approach.method(query, numResults, approachTimeout);
         if (results.length > 0) {
           console.log(`[SearchEngine] Found ${results.length} results with ${approach.name}`);
-          
+
           // Validate result quality to detect irrelevant results
           const qualityScore = enableQualityCheck ? this.assessResultQuality(results, query) : 1.0;
           console.log(`[SearchEngine] ${approach.name} quality score: ${qualityScore.toFixed(2)}/1.0`);
-          
+
           // Track the best results so far
           if (qualityScore > bestQuality) {
             bestResults = results;
             bestEngine = approach.name;
             bestQuality = qualityScore;
           }
-          
+
+          // Early return: If API search returns good results, skip browser fallbacks entirely
+          // This is the key optimization for Serper performance
+          if (isApiSearch && qualityScore >= 0.5) {
+            console.log(`[SearchEngine] API returned quality results (${qualityScore.toFixed(2)}), skipping browser fallbacks`);
+            return { results, engine: approach.name };
+          }
+
           // If quality is excellent, return immediately
           if (qualityScore >= 0.8) {
             console.log(`[SearchEngine] Excellent quality results from ${approach.name}, returning immediately`);
             return { results, engine: approach.name };
           }
-          
+
           // If quality is acceptable and this isn't first engine, return
           if (qualityScore >= qualityThreshold && approach.name !== 'Browser Bing') {
             console.log(`[SearchEngine] Good quality results from ${approach.name}, using as primary`);
             return { results, engine: approach.name };
           }
-          
+
           // If this is the last engine or quality is acceptable, prepare to return
           if (i === approaches.length - 1) {
             if (bestQuality >= qualityThreshold || !enableQualityCheck) {
@@ -247,9 +310,19 @@ export class SearchEngine {
       return [];
     }
 
+    // Check cache first for repeated/similar queries
+    const cacheEnabled = process.env.SEMANTIC_CACHE_ENABLED !== 'false';
+    if (cacheEnabled) {
+      const cached = semanticCache.get(query);
+      if (cached && Array.isArray(cached.results)) {
+        console.log(`[SearchEngine] Cache HIT for query: "${query}"`);
+        return cached.results as SearchResult[];
+      }
+    }
+
     console.log(`[SearchEngine] Starting API-based search for: "${query}"`);
     const timestamp = generateTimestamp();
-    
+
     try {
       const response = await axios.post(
         'https://google.serper.dev/search',
@@ -269,7 +342,7 @@ export class SearchEngine {
       const organicResults = response.data.organic || [];
       console.log(`[SearchEngine] API search returned ${organicResults.length} results`);
 
-      return organicResults.map((item: any) => ({
+      const results = organicResults.map((item: any) => ({
         title: item.title,
         url: item.link,
         description: item.snippet || 'No description available',
@@ -279,6 +352,15 @@ export class SearchEngine {
         timestamp,
         fetchStatus: 'success',
       }));
+
+      // Cache the results for future use
+      if (cacheEnabled && results.length > 0) {
+        const cacheTtl = parseInt(process.env.SEMANTIC_CACHE_TTL || '3600000', 10);
+        semanticCache.set(query, results, cacheTtl);
+        console.log(`[SearchEngine] Cached results for query: "${query}"`);
+      }
+
+      return results;
     } catch (error) {
       console.error(`[SearchEngine] API search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       if (axios.isAxiosError(error)) {
@@ -415,12 +497,15 @@ export class SearchEngine {
           timeout: timeout
         });
 
-         // Wait for search results to load with a buffer for hydration
+         // Wait for search results to load with dynamic timeout based on budget
          try {
-           // Use more specific selectors for Brave and increase timeout/buffer
-           await page.waitForSelector('[data-type="web"], .result, .b_algo, .result__a, [class*="result"], [class*="web"]', { timeout: 12000 });
-           // Extra buffer for Brave's heavy JS hydration to ensure content is rendered
-           await new Promise(resolve => setTimeout(resolve, 5000));
+           // Use more specific selectors for Brave and use dynamic timeout
+           const dynamicTimeout = Math.min(timeout * 0.7, 10000);
+           await page.waitForSelector('[data-type="web"], .result, .b_algo, .result__a, [class*="result"], [class*="web"]', { 
+             timeout: dynamicTimeout 
+           });
+           // Reduced buffer for Brave's JS hydration
+           await new Promise(resolve => setTimeout(resolve, 1000));
          } catch {
            console.log(`[SearchEngine] Browser Brave results selector not found or hydration timed out, proceeding anyway`);
          }
@@ -706,11 +791,11 @@ export class SearchEngine {
         });
         
         // Wait for network to settle slightly after domcontentloaded
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        
+        await new Promise(resolve => setTimeout(resolve, 500));
+
         // Then try to wait for networkidle if it's not already stable
         try {
-          await page.waitForLoadState('networkidle', { timeout: 3000 });
+          await page.waitForLoadState('networkidle', { timeout: 2000 });
         } catch {
           // If networkidle times out, it's fine, we already have domcontentloaded and a buffer
         }
@@ -748,13 +833,14 @@ export class SearchEngine {
     // Wait for search results to load with a retry mechanism for the selector
     try {
       console.error(`[SearchEngine] BING: Waiting for search results to appear...`);
-      // Use a broader set of selectors and a longer timeout
-      await page.waitForSelector('.b_algo, .b_result, [class*="b_algo"], [class*="b_result"], .b_card, [role="main"], .b_search_result', { 
-        timeout: 12000,
-        state: 'visible' 
+      // Use dynamic timeout based on remaining budget, capped at 8s
+      const dynamicTimeout = Math.min(timeout * 0.7, 8000);
+      await page.waitForSelector('.b_algo, .b_result, [class*="b_algo"], [class*="b_result"], .b_card, [role="main"], .b_search_result', {
+        timeout: dynamicTimeout,
+        state: 'visible'
       });
       // Small buffer to allow potential subsequent redirections or hydration to settle
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      await new Promise(resolve => setTimeout(resolve, 1000));
       console.error(`[SearchEngine] BING: Search results selector found`);
     } catch (e) {
       console.error(`[SearchEngine] BING: Search results selector not found or timed out, proceeding with page content anyway`);
@@ -863,15 +949,17 @@ export class SearchEngine {
       const page = await context.newPage();
       
       const searchUrl = `https://duckduckgo.com/?q=${encodeURIComponent(query)}&ia=web`;
-      // Use a more robust navigation strategy for DuckDuckGo browser fallback
-      await page.goto(searchUrl, { 
-        waitUntil: 'load', 
-        timeout: Math.max(timeout, 30000) 
+      // Use a reasonable timeout based on the passed parameter, capped at 20s
+      await page.goto(searchUrl, {
+        waitUntil: 'load',
+        timeout: Math.min(timeout, 20000)
       });
-      
-      // Wait for results to appear with a more generous timeout and multiple selector options
+
+      // Wait for results to appear with a timeout that respects the budget
       try {
-        await page.waitForSelector('.result__a, .result, [class*="result"]', { timeout: 10000 });
+        await page.waitForSelector('.result__a, .result, [class*="result"]', { 
+          timeout: Math.min(timeout * 0.8, 10000) 
+        });
       } catch (e) {
         console.warn(`[SearchEngine] DuckDuckGo browser results selector not found or timed out, proceeding anyway`);
       }

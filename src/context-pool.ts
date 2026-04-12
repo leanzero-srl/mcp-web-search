@@ -31,7 +31,7 @@ export interface ContextPoolOptions extends BrowserEngineOptions {
 // Default configuration
 const DEFAULT_CONFIG: ContextPoolConfig = {
   maxSize: 10,
-  reuseTimeoutMs: 30000,
+  reuseTimeoutMs: 20000,
   maxAgeMs: 60000,
 };
 
@@ -330,7 +330,7 @@ export class ContextPool {
       ...envConfig,
       config: {
         maxSize: parseInt(process.env.CONTEXT_POOL_SIZE || '10', 10),
-        reuseTimeoutMs: parseInt(process.env.CONTEXT_REUSE_TIMEOUT || '30000', 10),
+        reuseTimeoutMs: parseInt(process.env.CONTEXT_REUSE_TIMEOUT || '20000', 10),
         maxAgeMs: parseInt(process.env.CONTEXT_MAX_AGE || '60000', 10),
       },
     };

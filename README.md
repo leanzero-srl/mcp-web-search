@@ -98,9 +98,11 @@ You can fine-tune the server's behavior using **Environment Variables**. These a
 |----------|---------|-------------|
 | `SEARCH_ENGINE` | `bing` | `bing`, `brave`, `duckduckgo`, or `serper` |
 | `SERPER_API_KEY` | *none* | Required if using `serper` engine |
-| `SEARCH_ENGINE_MAX_RPM` | `10` | Max requests per minute to the search engine |
+| `SEARCH_ENGINE_MAX_RPM` | `50` | Max requests per minute to the search engine (increased from 10) |
 | `SEARCH_ENGINE_RESET_MS` | `60000` | Reset window for RPM in milliseconds |
 | `DEBUG_BING_SEARCH` | `false` | Set to `true` for verbose Bing parsing logs |
+| `USE_SERPER_ONLY` | `false` | **Performance**: Skip browser engines when Serper API succeeds |
+| `PARALLEL_SEARCH` | `true` | Enable parallel engine searches (disable for faster single-engine) |
 
 ### 📄 Content Extraction & Quality
 | Variable | Default | Description |
@@ -120,6 +122,7 @@ You can fine-tune the server's behavior using **Environment Variables**. These a
 | `MAX_BROWSERS` | `3` | Max concurrent browser instances |
 | `CONTEXT_POOL_SIZE` | `10` | Max browser contexts kept in memory |
 | `CONTEXT_MAX_AGE` | `60000` | How long a context stays alive (ms) |
+| `CONTEXT_REUSE_TIMEOUT` | `20000` | Time before context reuse attempt (default: 20s) |
 | `USE_LEGACY_POOL` | `false` | Use the older, more stable pool implementation |
 
 ### 🛡️ Enterprise Guardrails
@@ -135,6 +138,18 @@ You can fine-tune the server's behavior using **Environment Variables**. These a
 | `GITHUB_TOKEN` | *none* | Personal Access Token for deeper repo access |
 | `GITHUB_MAX_DEPTH` | `3` | Max directory depth to crawl |
 | `GITHUB_MAX_FILES` | `50` | Max files to extract per repository |
+
+### ⚡ Performance Optimizations
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SEMANTIC_CACHE_ENABLED` | `true` | Enable caching for repeated/similar queries |
+| `SEMANTIC_CACHE_MAX_SIZE` | `1000` | Max cached search results |
+| `SEMANTIC_CACHE_TTL` | `3600000` | Cache TTL in milliseconds (default: 1 hour) |
+
+**Performance Tips:**
+- Set `USE_SERPER_ONLY=true` for fastest Serper API responses (skips browser fallbacks)
+- Increase `SEARCH_ENGINE_MAX_RPM` if you have a higher Serper tier limit
+- Use `SEMANTIC_CACHE_ENABLED=false` to disable caching and always fetch fresh results
 
 ---
 
