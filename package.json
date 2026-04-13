@@ -37,6 +37,8 @@
     "@modelcontextprotocol/node": "^2.0.0-alpha.2",
     "@modelcontextprotocol/sdk": "^1.15.0",
     "@modelcontextprotocol/server": "^2.0.0-alpha.2",
+    "@upstash/semantic-cache": "^1.0.5",
+    "@upstash/vector": "^1.2.3",
     "axios": "^1.6.8",
     "cheerio": "^1.0.0-rc.12",
     "p-limit": "^6.2.0",

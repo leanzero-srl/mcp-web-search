@@ -11,8 +11,8 @@ try {
     bundle: true,
     platform: 'node',
     target: 'node18',
-    format: 'esm',
-    outfile: 'dist/bundle.js',
+    format: 'cjs',
+      outfile: 'dist/bundle.cjs',
     external: [
       // Node.js built-in modules that should not be bundled
       'util',
@@ -26,7 +26,6 @@ try {
       'zlib',
       'querystring',
       'events',
-      'buffer',
       'process',
       'os',
       'child_process',
@@ -60,7 +59,7 @@ try {
     }
   });
   
-  console.log('✅ Bundle created: dist/bundle.js');
+  console.log('✅ Bundle created: dist/bundle.cjs');
 } catch (error) {
   console.error('❌ Bundle failed:', error);
   process.exit(1);

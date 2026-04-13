@@ -50,6 +50,7 @@ export interface SearchResultWithMetadata {
   results: SearchResult[];
   engine: string;
   qualityScore?: number;
+  total_results?: number;
 }
 
 // GitHub-related types

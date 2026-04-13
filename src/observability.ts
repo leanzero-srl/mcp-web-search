@@ -62,7 +62,9 @@ export type AuditEventType =
   | 'browser_launch'
   | 'context_pool_hit'
   | 'cache_hit'
-  | 'cache_miss';
+  | 'cache_miss'
+  | 'cache_set'
+  | 'cache_clear_requested';
 
 /**
  * Audit log entry structure

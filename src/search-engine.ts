@@ -48,7 +48,7 @@ export class SearchEngine {
     // OPTIMIZATION 1: Check semantic cache FIRST, before any rate limiting or concurrency overhead
     const cacheEnabled = process.env.SEMANTIC_CACHE_ENABLED !== 'false';
     if (cacheEnabled) {
-      const cached = semanticCache.get(sanitizedQuery);
+      const cached = await semanticCache.get(sanitizedQuery);
       if (cached && Array.isArray(cached.results) && cached.results.length > 0) {
         console.log(`[SearchEngine] ⚡ Cache HIT for query: "${sanitizedQuery}" - returning immediately`);
         return { 
@@ -313,7 +313,7 @@ export class SearchEngine {
     // Check cache first for repeated/similar queries
     const cacheEnabled = process.env.SEMANTIC_CACHE_ENABLED !== 'false';
     if (cacheEnabled) {
-      const cached = semanticCache.get(query);
+      const cached = await semanticCache.get(query);
       if (cached && Array.isArray(cached.results)) {
         console.log(`[SearchEngine] Cache HIT for query: "${query}"`);
         return cached.results as SearchResult[];
@@ -356,7 +356,7 @@ export class SearchEngine {
       // Cache the results for future use
       if (cacheEnabled && results.length > 0) {
         const cacheTtl = parseInt(process.env.SEMANTIC_CACHE_TTL || '3600000', 10);
-        semanticCache.set(query, results, cacheTtl);
+        await semanticCache.set(query, results, cacheTtl);
         console.log(`[SearchEngine] Cached results for query: "${query}"`);
       }
 
