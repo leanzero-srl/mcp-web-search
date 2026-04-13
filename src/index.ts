@@ -1611,7 +1611,7 @@ class WebSearchMCPServer {
           console.log(`[MCP] Checking semantic cache for: "${query}"`);
 
           // Check if we have cached results for this query
-          const cachedEntry = semanticCache.get(query);
+          const cachedEntry = await semanticCache.get(query);
           
           if (cachedEntry) {
             console.log(`[MCP] Cache HIT for: "${query}"`);
@@ -1678,7 +1678,7 @@ class WebSearchMCPServer {
            }
  
            // Store results in cache for future similar queries
-          semanticCache.set(query, enhancedResults);
+          await semanticCache.set(query, enhancedResults);
 
           console.log(`[MCP] Results cached for: "${query}"`);
 

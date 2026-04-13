@@ -7,7 +7,8 @@
  * - Memory-efficient storage with configurable limits
  */
 
-import { crawlCache } from './crawl-cache.js';
+import { SemanticCache as UpstashSemanticCache } from "@upstash/semantic-cache";
+import { Index } from "@upstash/vector";
 import { auditLogger } from './observability.js';
 
 // ============================================================================
@@ -15,51 +16,36 @@ import { auditLogger } from './observability.js';
 // ============================================================================
 
 /**
- * Semantic cache entry structure
+ * Semantic cache entry structure (maintaining compatibility with existing callers)
  */
 export interface SemanticCacheEntry {
-  /** Unique identifier for the cache entry */
   id: string;
-  
-  /** Original query string */
   query: string;
-  
-  /** Cached results data */
-  results: unknown;
-  
-  /** Timestamp when entry was created/updated */
+  results: any;
   createdAt: number;
-  
-  /** Timestamp when entry expires */
   expiresAt?: number;
-  
-  /** Semantic hash of the query for similarity matching */
-  semanticHash: string;
+  semanticHash: string; // Kept for backward compatibility, though Upstash handles similarity internally
 }
 
 /**
  * Semantic cache configuration
  */
 export interface SemanticCacheConfig {
-  /** Maximum number of entries in cache */
   maxSize?: number;
-  
-  /** Default TTL in milliseconds (default: 1 hour) */
   defaultTtl?: number;
-  
-  /** Enable/disable caching */
   enabled?: boolean;
+  minProximity?: number;
 }
 
 // ============================================================================
-// Semantic Cache Implementation
+// Semantic Cache Implementation (Powered by Upstash)
 // ============================================================================
 
 /**
- * Semantic cache for storing and retrieving search results by query meaning
+ * Semantic cache for storing and retrieving search results using vector similarity
  */
 export class SemanticCache {
-  private cache: Map<string, SemanticCacheEntry> = new Map();
+  private upstashCache?: UpstashSemanticCache;
   private readonly config: SemanticCacheConfig;
 
   constructor(config: Partial<SemanticCacheConfig> = {}) {
@@ -67,179 +53,115 @@ export class SemanticCache {
       maxSize: config.maxSize || 1000,
       defaultTtl: config.defaultTtl || 3600000, // 1 hour
       enabled: config.enabled !== undefined ? config.enabled : true,
+      minProximity: config.minProximity ?? 0.9,
     };
+
+    const vectorUrl = process.env.UPSTASH_VECTOR_REST_URL;
+    const vectorToken = process.env.UPSTASH_VECTOR_REST_TOKEN;
+
+    if (vectorUrl && vectorToken) {
+      try {
+        const vectorIndex = new Index({
+          url: vectorUrl,
+          token: vectorToken,
+        });
+
+        this.upstashCache = new UpstashSemanticCache({
+          index: vectorIndex as any, // Bypass potential type mismatch with protected properties
+          minProximity: this.config.minProximity ?? 0.9,
+        });
+        console.log('[SemanticCache] Initialized successfully');
+      } catch (error) {
+        console.warn('[SemanticCache] Failed to initialize:', error);
+      }
+    } else {
+      console.log('[SemanticCache] Skipping initialization - UPSTASH_VECTOR_REST_URL or UPSTASH_VECTOR_REST_TOKEN not set');
+    }
   }
 
-  /**
-   * Compute a semantic hash for a query based on its key terms
-   */
-  private computeSemanticHash(query: string): string {
-    // Tokenize and normalize the query
-    const normalized = query.toLowerCase().replace(/[^\w\s]/g, '');
-    const terms = normalized.split(/\s+/).filter(t => t.length > 0);
-    
-    // Sort terms for consistent hash regardless of order
-    terms.sort();
-    
-    // Join sorted terms to create a consistent semantic signature
-    return terms.join('|');
+  private getCache(): UpstashSemanticCache | null {
+    return this.upstashCache ?? null;
   }
 
   /**
    * Get a cached entry if it exists and is valid
    */
-  public get(query: string): SemanticCacheEntry | null {
+  public async get(query: string): Promise<SemanticCacheEntry | null> {
     if (!this.config.enabled) return null;
 
-    const semanticHash = this.computeSemanticHash(query);
-    
-    // Check for exact match first
-    const exactMatch = this.cache.get(semanticHash);
-    if (exactMatch && !this.isExpired(exactMatch)) {
-      auditLogger.logCacheHit(`query:${query}`, new Date(exactMatch.createdAt).toISOString());
-      return exactMatch;
-    }
+    const cache = this.getCache();
+    if (!cache) return null;
 
-    // If no exact match, check for similar queries using semantic matching
-    const similarEntry = this.findSimilarEntry(query);
-    if (similarEntry && !this.isExpired(similarEntry)) {
-      auditLogger.logCacheHit(`similar:${query}`, new Date(similarEntry.createdAt).toISOString());
-      return similarEntry;
-    }
+    try {
+      // Upstash SemanticCache.get returns the value stored in 'set'
+      const cached = await cache.get(query);
 
-    auditLogger.logCacheMiss(`query:${query}`);
-    return null;
+      if (cached) {
+        // If we stored as a JSON string, parse it back to an object
+        const entry = typeof cached === 'string' ? JSON.parse(cached) : cached;
+        auditLogger.logCacheHit(`semantic:${query}`, new Date().toISOString());
+        return entry as SemanticCacheEntry;
+      }
+
+      auditLogger.logCacheMiss(`query:${query}`);
+      return null;
+    } catch (error) {
+      console.error(`[SemanticCache] Error during get for "${query}":`, error);
+      return null;
+    }
   }
 
   /**
    * Store a result in the cache
    */
-  public set(query: string, results: unknown, ttl?: number): void {
+  public async set(query: string, results: any, ttl?: number): Promise<void> {
     if (!this.config.enabled) return;
 
-    const semanticHash = this.computeSemanticHash(query);
-    const now = Date.now();
-    
-    // Create new entry
-    const entry: SemanticCacheEntry = {
-      id: `${semanticHash}-${now}`,
-      query,
-      results,
-      createdAt: now,
-      expiresAt: ttl ? now + ttl : now + this.config.defaultTtl!,
-      semanticHash,
-    };
+    const cache = this.getCache();
+    if (!cache) return;
 
-    // Evict oldest entries if cache is full
-    while (this.cache.size >= this.config.maxSize!) {
-      const oldestEntry = this.getOldestEntry();
-      if (oldestEntry) {
-        this.cache.delete(oldestEntry.id);
-      } else {
-        break;
-      }
-    }
+    try {
+      const entry: SemanticCacheEntry = {
+        id: `${Date.now()}-${Math.random().toString(36).substring(7)}`,
+        query,
+        results,
+        createdAt: Date.now(),
+        expiresAt: ttl ? Date.now() + ttl : Date.now() + this.config.defaultTtl!,
+        semanticHash: '', // Not used by Upstash implementation
+      };
 
-    this.cache.set(semanticHash, entry);
-    
-    auditLogger.log({
-      timestamp: new Date().toISOString(),
-      level: 'debug',
-      event: 'cache_miss',
-      query: `stored:${query}`,
-      metadata: { cache_size: this.cache.size },
-    });
-  }
-
-  /**
-   * Check if an entry has expired
-   */
-  private isExpired(entry: SemanticCacheEntry): boolean {
-    return entry.expiresAt !== undefined && Date.now() > entry.expiresAt;
-  }
-
-  /**
-   * Find a similar entry using fuzzy matching on query terms
-   */
-  private findSimilarEntry(query: string): SemanticCacheEntry | null {
-    const queryTerms = this.tokenizeQuery(query);
-    
-    for (const [_, entry] of this.cache) {
-      if (this.isExpired(entry)) continue;
-
-      const entryTerms = this.tokenizeQuery(entry.query);
+      // Store as JSON string to ensure compatibility with all cache provider versions
+      await cache.set(query, JSON.stringify(entry));
       
-      // Calculate term overlap ratio
-      const overlapRatio = this.calculateTermOverlap(queryTerms, entryTerms);
-      
-      // If more than 70% overlap, consider it similar enough to use cached results
-      if (overlapRatio >= 0.7) {
-        return entry;
-      }
+      auditLogger.log({
+        timestamp: new Date().toISOString(),
+        level: 'debug',
+        event: 'cache_set',
+        query: `stored:${query}`,
+        metadata: { provider: 'upstash' },
+      });
+    } catch (error) {
+      console.error(`[SemanticCache] Error during set for "${query}":`, error);
     }
-
-    return null;
-  }
-
-  /**
-   * Tokenize a query into terms for comparison
-   */
-  private tokenizeQuery(query: string): Set<string> {
-    const normalized = query.toLowerCase().replace(/[^\w\s]/g, '');
-    const terms = new Set(normalized.split(/\s+/).filter(t => t.length > 0));
-    return terms;
-  }
-
-  /**
-   * Calculate overlap ratio between two sets of terms
-   */
-  private calculateTermOverlap(terms1: Set<string>, terms2: Set<string>): number {
-    if (terms1.size === 0 || terms2.size === 0) return 0;
-
-    let intersection = 0;
-    for (const term of terms1) {
-      if (terms2.has(term)) {
-        intersection++;
-      }
-    }
-
-    const unionSize = Math.max(terms1.size, terms2.size);
-    return unionSize > 0 ? intersection / unionSize : 0;
-  }
-
-  /**
-   * Get the oldest entry in the cache
-   */
-  private getOldestEntry(): SemanticCacheEntry | null {
-    let oldest: SemanticCacheEntry | null = null;
-
-    for (const [_, entry] of this.cache) {
-      if (!oldest || entry.createdAt < oldest.createdAt) {
-        oldest = entry;
-      }
-    }
-
-    return oldest;
   }
 
   /**
    * Clear all cache entries
    */
-  public clear(): void {
-    const sizeBefore = this.cache.size;
-    this.cache.clear();
-    
+  public async clear(): Promise<void> {
+    // Note: Upstash SemanticCache doesn't have a direct 'clear all' in the JS SDK 
+    // as it's managed via the vector index. For this implementation, we log the intent.
+    console.warn('[SemanticCache] Clear requested - manual cleanup of Upstash index may be required.');
     auditLogger.log({
       timestamp: new Date().toISOString(),
       level: 'info',
-      event: 'cache_miss',
-      query: 'clear',
-      metadata: { cleared_entries: sizeBefore },
+      event: 'cache_clear_requested',
+      query: 'all',
     });
   }
 
   /**
-   * Get cache statistics
+   * Get cache statistics (Note: Upstash-specific stats are limited in the client)
    */
   public getStats(): {
     size: number;
@@ -247,7 +169,7 @@ export class SemanticCache {
     enabled: boolean;
   } {
     return {
-      size: this.cache.size,
+      size: 0, // Exact size not easily available from client side
       maxSize: this.config.maxSize!,
       enabled: this.config.enabled!,
     };

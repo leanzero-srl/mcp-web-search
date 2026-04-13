@@ -8,11 +8,24 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { fileURLToPath } from 'url';
 
-// Get __dirname equivalent in ES modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Get the directory where this module is located
+// In CommonJS: use __dirname directly
+// In ES modules: resolve from import.meta.url (not available in CJS bundle)
+const getModuleDir = (): string => {
+  if (typeof __dirname !== 'undefined') {
+    return __dirname;
+  }
+  // Fallback to resolving from the file
+  try {
+    const url = new URL('file:' + __filename);
+    return path.dirname(url.pathname);
+  } catch {
+    return path.resolve();
+  }
+};
+
+const moduleDir = getModuleDir();
 
 export interface CrawlCacheEntry {
   url: string;
@@ -30,7 +43,8 @@ export interface CacheIndex {
   totalEntries: number;
 }
 
-const DEFAULT_CACHE_DIR = path.join(__dirname, '../../docs/technical');
+// Default cache directory (relative to this module's location)
+const DEFAULT_CACHE_DIR = path.join(moduleDir, '../../docs/technical');
 const CACHE_FILE = 'crawl-cache.json';
 const DEFAULT_TTL_MS = 86400000; // 24 hours
 
