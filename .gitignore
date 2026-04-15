@@ -93,3 +93,6 @@ jspm_packages/
 
 # DynamoDB Local files
 .dynamodb/ 
+# Qwen Code review reports and cache
+.qwen/reviews/
+.qwen/review-cache/

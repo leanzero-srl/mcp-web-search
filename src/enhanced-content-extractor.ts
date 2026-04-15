@@ -1,21 +1,99 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import { Page } from 'playwright';
 import { ContentExtractionOptions, SearchResult, ResearchDigest } from './types.js';
-import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
+import { cleanText, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
 import { BrowserPool } from './browser-pool.js';
-import { scoreContentQuality, getBestContentSelector, ContentQualityResult, cleanText as qualityCleanText } from './content-quality-scorer.js';
+import { scoreContentQuality, getBestContentSelector, cleanText as qualityCleanText } from './content-quality-scorer.js';
 import { sessionRateLimiter } from './enterprise-guardrails.js';
+
+/**
+ * Parses a GitHub URL to extract owner, repo, and path information.
+ * Handles github.com, raw.githubusercontent.com, and tree/branch formats.
+ */
+function parseGitHubUrl(url: string): { owner: string; repo: string; path?: string } | null {
+  try {
+    const urlObj = new URL(url);
+
+    // Handle raw.githubusercontent.com format - use GitHub API directly
+    if (urlObj.hostname.includes('raw.githubusercontent.com')) {
+      const match = urlObj.pathname.match(/^\/([^/]+)\/([^/]+)\/[^/]+\/(.*)$/);
+      if (match) {
+        return { owner: match[1], repo: match[2], path: match[3] };
+      }
+    }
+
+    // Handle github.com format
+    const match = urlObj.pathname.match(/^\/([^/]+)\/([^/]+)(?:\/(.*))?$/);
+    if (match) {
+      return {
+        owner: match[1],
+        repo: match[2],
+        path: match[3] ? match[3].replace('blob/', '') : undefined
+      };
+    }
+
+    // Also try github.com/owner/repo/tree/branch/path format
+    const treeMatch = urlObj.pathname.match(/^\/([^/]+)\/([^/]+)\/tree\/[^/]+(\/.*)?$/);
+    if (treeMatch) {
+      return {
+        owner: treeMatch[1],
+        repo: treeMatch[2],
+        path: treeMatch[3] ? treeMatch[3].substring(1) : undefined
+      };
+    }
+
+    return null;
+  } catch (error) {
+    console.error(`[EnhancedContentExtractor] Error parsing GitHub URL ${url}:`, error);
+    return null;
+  }
+}
+
+/**
+ * Extracts content from GitHub raw URLs using the GitHub API directly.
+ * This is faster and more reliable than browser fallback for GitHub files.
+ */
+async function extractRawGitHubContent(url: string): Promise<string | null> {
+  const parsed = parseGitHubUrl(url);
+  if (!parsed) {
+    return null;
+  }
+
+  const { owner, repo, path } = parsed;
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+
+  try {
+    console.log(`[EnhancedContentExtractor] Using GitHub API to fetch raw file: ${url}`);
+
+    const response = await axios.get(apiUrl, {
+      headers: {
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'Web-Search-MCP',
+        'X-GitHub-Api-Version': '2022-11-28'
+      },
+      timeout: 10000,
+    });
+
+    // Decode base64 content
+    const content = Buffer.from(response.data.content, 'base64').toString('utf8');
+    console.log(`[EnhancedContentExtractor] Successfully fetched raw GitHub file (${content.length} chars)`);
+
+    return content;
+  } catch (error) {
+    console.error(`[EnhancedContentExtractor] Failed to fetch raw GitHub file:`, error);
+    return null;
+  }
+}
 
 /**
  * Converts HTML elements to Markdown format for better AI readability.
  * This implementation preserves structural cues like headings, lists, and links.
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function convertToMarkdown($: cheerio.CheerioAPI, element: any, depth: number = 0): string {
-  const el = element as any;
-  if (!el.tagName) return '';
-  
-  const tag = el.tagName.toLowerCase();
+  if (!element.tagName) return '';
+
+  const tag = element.tagName.toLowerCase();
   const noiseTags = ['script', 'style', 'noscript', 'iframe', 'img', 'video', 'audio', 'canvas', 'svg', 'object', 'embed', 'applet', 'form', 'input', 'textarea', 'select', 'button', 'label', 'fieldset', 'legend', 'optgroup', 'option', 'nav', 'header', 'footer', 'aside', 'ad', 'advertisement', 'ads', 'social-share', 'share-buttons', 'comments', 'comment-section', 'related-posts', 'recommendations', 'newsletter-signup', 'cookie-notice', 'privacy-notice', 'terms-notice', 'disclaimer', 'legal', 'copyright', 'meta', 'metadata', 'author-info', 'publish-date', 'tags', 'categories', 'navigation', 'pagination', 'search-box', 'search-form', 'login-form', 'signup-form', 'newsletter', 'popup', 'modal', 'overlay', 'tooltip', 'toolbar', 'ribbon', 'banner', 'promo', 'sponsored', 'affiliate', 'tracking', 'analytics', 'pixel', 'beacon'];
 
   if (noiseTags.includes(tag)) return '';
@@ -56,9 +134,9 @@ function convertToMarkdown($: cheerio.CheerioAPI, element: any, depth: number = 
   }
 
   // Recurse into children
-  if (el.children && el.children.length > 0) {
-    for (let i = 0; i < el.children.length; i++) {
-      content += convertToMarkdown($, el.children[i], depth + 1);
+  if (element.children && element.children.length > 0) {
+    for (let i = 0; i < element.children.length; i++) {
+      content += convertToMarkdown($, element.children[i], depth + 1);
     }
   } else {
     const text = $(element).text().trim();
@@ -104,11 +182,21 @@ export class EnhancedContentExtractor {
 
   async extractContent(options: ContentExtractionOptions): Promise<{ content: string; digest?: ResearchDigest }> {
     const { url } = options;
-    
+
     console.log(`[EnhancedContentExtractor] Starting extraction for: ${url}`);
-    
+
+    // Check if this is a GitHub raw URL - use direct API instead of browser fallback
+    if (url.includes('raw.githubusercontent.com')) {
+      console.log(`[EnhancedContentExtractor] Detected GitHub raw URL, using direct API`);
+      const githubContent = await extractRawGitHubContent(url);
+      if (githubContent) {
+        return { content: githubContent };
+      }
+      // If GitHub API fails, fall through to normal extraction
+    }
+
     let content = '';
-    
+
     // First, try with regular HTTP client (faster)
     try {
       content = await this.extractWithAxios(options);
@@ -355,11 +443,11 @@ export class EnhancedContentExtractor {
         if ($content.length > 0) {
           mainContent = $content.text().trim();
         }
-      } catch (parseError) {
+      } catch (parseError: unknown) {
         console.log(`[BrowserExtractor] Selector parsing failed, using body content`);
         // Re-load HTML after catching error
         const $$ = cheerio.load(html);
-        mainContent = ($$ as any)('body').text().trim();
+        mainContent = $$('#body').text().trim();
       }
 
       await context.close();
@@ -401,6 +489,11 @@ export class EnhancedContentExtractor {
       url.includes('reddit.com'),
       url.includes('medium.com'),
     ];
+
+    // GitHub raw URLs should NOT use browser fallback - they have direct API
+    if (url.includes('raw.githubusercontent.com')) {
+      return false;
+    }
 
     return indicators.some(indicator => indicator === true);
   }
@@ -474,7 +567,7 @@ export class EnhancedContentExtractor {
     results: SearchResult[],
     targetCount: number = results.length,
     maxContentLength?: number,
-    sessionId?: string
+    _sessionId?: string
   ): Promise<SearchResult[]> {
     console.log(`[EnhancedContentExtractor] Processing up to ${results.length} results to get ${targetCount} non-PDF results`);
     
@@ -502,8 +595,8 @@ export class EnhancedContentExtractor {
         const cleanedContent = cleanText(content);
         
         // Manually apply maxContentLength if provided
-        const finalContent = this.maxContentLength && cleanedContent.length > this.maxContentLength
-          ? cleanedContent.substring(0, this.maxContentLength)
+        const finalContent = maxContentLength && cleanedContent.length > maxContentLength
+          ? cleanedContent.substring(0, maxContentLength)
           : cleanedContent;
         
         // Validate content quality
