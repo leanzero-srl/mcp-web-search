@@ -458,10 +458,22 @@ export class OpenAPIExtractor {
     options?: OpenAPIExtractionOptions | undefined
   ): Promise<OpenAPIExtractionResult> {
     console.log(`[OpenAPIExtractor] Processing URL: ${url}`);
-    
+
     const maxContentLength = options?.maxContentLength || this.defaultMaxContentLength;
     const downloadDir = options?.downloadDir;
-    
+
+    // Validate URL format first
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(url);
+    } catch (error) {
+      return {
+        success: false,
+        url,
+        error: `Invalid URL format: ${url}`,
+      };
+    }
+
     // Check cache first (unless force refresh)
     if (!options?.forceRefresh) {
       const cachedEntry = this.cache.get(url);

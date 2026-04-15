@@ -59,6 +59,8 @@ Edit your `claude_desktop_config.json` (usually in `%APPDATA%\Claude` on Windows
     "web-search": {
       "command": "node",
       "args": ["/ABSOLUTE/PATH/TO/mcp-web-search/dist/index.js"],
+      "timeout": 120000,
+      "trust": true,
       "env": {
         "SERPER_API_KEY": "your_key_here",
         "SEARCH_ENGINE": "bing",
@@ -78,6 +80,8 @@ Add the following to your MCP settings in the extension:
     "web-search": {
       "command": "node",
       "args": ["/ABSOLUTE/PATH/TO/mcp-web-search/dist/index.js"],
+      "timeout": 120000,
+      "trust": true,
       "env": {
         "SEARCH_ENGINE": "brave",
         "MAX_CONTENT_LENGTH": "100000"
@@ -172,6 +176,40 @@ You can fine-tune the server's behavior using **Environment Variables**. These a
 - `filter-sitemap-urls`: Filters sitemap results by keywords to find high-value pages.
 - `get-github-directory-contents`: Lists files/folders within a specific GitHub path.
 - `list-cached-documents`: Lists all previously crawled documents and specs stored in the local cache.
+
+---
+
+## 🛠️ Troubleshooting
+
+### Timeout Errors in Qwen Code / MCP Clients
+
+If you see **"Request timed out" (-32001)** errors:
+
+**Cause:** The default timeout may be too short for complex web searches or large content extractions.
+
+**Solution:** Add a `timeout` setting to your MCP server configuration. This is **milliseconds**, not seconds!
+
+#### Correct Configuration Example:
+```json
+{
+  "mcpServers": {
+    "web-search": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/mcp-web-search/dist/index.js"],
+      "timeout": 120000,
+      "trust": true,
+      "env": {
+        "SEARCH_ENGINE": "brave"
+      }
+    }
+  }
+}
+```
+
+**Key Points:**
+- `timeout` is in **milliseconds**: `60000` = 60 seconds, `120000` = 2 minutes
+- Set higher timeouts (e.g., `120000`) for swarm operations or large repo crawling
+- Without this setting, Qwen Code uses a default of ~30 seconds which is often too short
 
 ---
 

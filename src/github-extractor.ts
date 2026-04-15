@@ -1,14 +1,50 @@
-import axios from 'axios';
+import axios, { AxiosRequestConfig, AxiosResponse } from 'axios';
 import { GitHubFile } from './types.js';
 
 /**
  * GitHub Repository Extractor
- * 
+ *
  * This module provides functionality to crawl GitHub repositories and extract:
  * - README.md content
  * - Code file contents (.js, .ts, .py, .java, .go, etc.)
  * - Directory structure information
  */
+
+// Create axios instance with token masking interceptor
+function createGitHubAxiosClient(githubToken?: string) {
+  const client = axios.create({
+    timeout: 10000,
+    headers: {
+      'Accept': 'application/vnd.github.v3+json',
+      'User-Agent': 'Web-Search-MCP',
+      'X-GitHub-Api-Version': '2022-11-28'
+    }
+  });
+
+  // Request interceptor to mask token in logs
+  client.interceptors.request.use((config) => {
+    if (githubToken && config.headers?.Authorization) {
+      const originalValue = String(config.headers.Authorization);
+      // Mask the token value while keeping the structure visible for debugging
+      config.headers.Authorization = `token ***${originalValue.slice(-8)}***`;
+    }
+    return config;
+  });
+
+  // Response interceptor to mask any exposed tokens in error messages
+  client.interceptors.response.use(
+    (response) => response,
+    (error) => {
+      if (error.message && githubToken) {
+        // Mask token in error message
+        error.message = error.message.replace(githubToken, '***token-masked***');
+      }
+      return Promise.reject(error);
+    }
+  );
+
+  return client;
+}
 
 export interface GitHubRepository {
   owner: string;
@@ -82,6 +118,7 @@ export class GitHubExtractor {
   private readonly githubToken?: string;
   private maxFiles: number;
   private includeCodeOnly: boolean;
+  private axiosClient: ReturnType<typeof createGitHubAxiosClient>;
 
   constructor(options?: { timeout?: number; maxDepth?: number; maxFiles?: number; includeCodeOnly?: boolean }) {
     this.timeout = options?.timeout ?? 10000;
@@ -89,8 +126,11 @@ export class GitHubExtractor {
     this.maxFiles = options?.maxFiles ?? 50;
     this.includeCodeOnly = options?.includeCodeOnly ?? true;
     this.githubToken = process.env.GITHUB_TOKEN;
-    
-    console.log(`[GitHubExtractor] Initialized with timeout=${this.timeout}ms, maxDepth=${this.maxDepth}, maxFiles=${this.maxFiles}${this.githubToken ? ', with token' : ''}`);
+
+    // Create axios client with token masking
+    this.axiosClient = createGitHubAxiosClient(this.githubToken);
+
+    console.log(`[GitHubExtractor] Initialized with timeout=${this.timeout}ms, maxDepth=${this.maxDepth}, maxFiles=${this.maxFiles}${this.githubToken ? ', with token (masked)' : ''}`);
   }
 
   /**
@@ -98,11 +138,11 @@ export class GitHubExtractor {
    */
   async getRepositoryInfo(owner: string, repo: string): Promise<{ defaultBranch: string; description?: string }> {
     const url = `${this.apiUrl}/repos/${owner}/${repo}`;
-    
+
     try {
       console.log(`[GitHubExtractor] Fetching repository info for ${owner}/${repo}`);
-      
-      const response = await axios.get(url, {
+
+      const response = await this.get(url, {
         headers: this.getHeaders(),
         timeout: this.timeout,
       });
@@ -123,11 +163,11 @@ export class GitHubExtractor {
   async getReadme(owner: string, repo: string, branch?: string): Promise<string> {
     const url = `${this.apiUrl}/repos/${owner}/${repo}/readme`;
     const params = branch ? { ref: branch } : {};
-    
+
     try {
       console.log(`[GitHubExtractor] Fetching README for ${owner}/${repo}`);
-      
-      const response = await axios.get(url, {
+
+      const response = await this.get(url, {
         headers: this.getHeaders(),
         params,
         timeout: this.timeout,
@@ -136,7 +176,7 @@ export class GitHubExtractor {
       // Decode base64 content
       const content = Buffer.from(response.data.content, 'base64').toString('utf8');
       console.log(`[GitHubExtractor] Successfully fetched README (${content.length} chars)`);
-      
+
       return content;
     } catch (error) {
       console.error(`[GitHubExtractor] Failed to get README for ${owner}/${repo}:`, error);
@@ -151,11 +191,11 @@ export class GitHubExtractor {
   async getContent(owner: string, repo: string, path: string = '', branch?: string): Promise<GitHubFile[]> {
     const url = `${this.apiUrl}/repos/${owner}/${repo}/contents/${path}`;
     const params = branch ? { ref: branch } : {};
-    
+
     try {
       console.log(`[GitHubExtractor] Fetching contents for ${owner}/${repo}:${path}`);
-      
-      const response = await axios.get(url, {
+
+      const response = await this.get(url, {
         headers: this.getHeaders(),
         params,
         timeout: this.timeout,
@@ -190,11 +230,11 @@ export class GitHubExtractor {
   async getFileContent(owner: string, repo: string, path: string, branch?: string): Promise<string> {
     const url = `${this.apiUrl}/repos/${owner}/${repo}/contents/${path}`;
     const params = branch ? { ref: branch } : {};
-    
+
     try {
       console.log(`[GitHubExtractor] Fetching file content for ${owner}/${repo}:${path}`);
-      
-      const response = await axios.get(url, {
+
+      const response = await this.get(url, {
         headers: this.getHeaders(),
         params,
         timeout: this.timeout,
@@ -214,10 +254,11 @@ export class GitHubExtractor {
    */
   async crawlRepository(owner: string, repo: string, branch?: string): Promise<GitHubRepository> {
     const files: GitHubFile[] = [];
-    
+
     // Use a helper method instead of inline function to properly access 'this'
-    await this.crawlDirectory(owner, repo, '', 0, branch, files);
-    
+    // Initialize with an empty Set to track processed paths and prevent duplicates
+    await this.crawlDirectory(owner, repo, '', 0, branch, files, new Set<string>());
+
     return {
       owner,
       repo,
@@ -235,7 +276,8 @@ export class GitHubExtractor {
     currentPath: string,
     depth: number,
     branch?: string,
-    accumulatedFiles: GitHubFile[] = []
+    accumulatedFiles: GitHubFile[] = [],
+    processedPaths: Set<string> = new Set()
   ): Promise<GitHubFile[]> {
     // Check limits
     if (depth > this.maxDepth) return accumulatedFiles;
@@ -243,24 +285,30 @@ export class GitHubExtractor {
 
     try {
       const contents = await this.getContent(owner, repo, currentPath, branch);
-      
+
       for (const item of contents) {
         if (item.type === 'dir') {
           // Recursively crawl directories
-          await this.crawlDirectory(owner, repo, item.path, depth + 1, branch, accumulatedFiles);
+          await this.crawlDirectory(owner, repo, item.path, depth + 1, branch, accumulatedFiles, processedPaths);
         } else if (item.type === 'file') {
+          // Skip if already processed (prevents duplicate file fetching)
+          if (processedPaths.has(item.path)) {
+            continue;
+          }
+
           // Check if we should include this file
           if (!this.includeCodeOnly || this.isCodeFile(item.name)) {
             try {
               const content = await this.getFileContent(owner, repo, item.path, branch);
+              processedPaths.add(item.path);
               accumulatedFiles.push({
                 ...item,
                 content,
                 size: content.length
               });
-              
+
               console.log(`[GitHubExtractor] Added file: ${item.path} (${content.length} chars)`);
-              
+
               if (accumulatedFiles.length >= this.maxFiles) return accumulatedFiles;
             } catch (fileError) {
               console.warn(`[GitHubExtractor] Failed to fetch ${item.path}:`, fileError);
@@ -290,7 +338,7 @@ export class GitHubExtractor {
   }
 
   /**
-   * Get GitHub API headers
+   * Get GitHub API headers (deprecated, now handled by axios interceptor)
    */
   private getHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
@@ -300,6 +348,7 @@ export class GitHubExtractor {
     };
 
     if (this.githubToken) {
+      // Token masking is now handled by axios interceptor
       headers['Authorization'] = `token ${this.githubToken}`;
     }
 
@@ -307,19 +356,29 @@ export class GitHubExtractor {
   }
 
   /**
+   * Mask GitHub token for safe logging
+   */
+  private maskToken(token: string): string {
+    if (!token || token.length <= 8) {
+      return '***';
+    }
+    const prefix = token.slice(0, 4);
+    const suffix = token.slice(-4);
+    return `${prefix}...${suffix}`;
+  }
+
+  /**
+   * Execute a GET request with axios client (uses interceptor for token masking)
+   */
+  private async get(url: string, config?: AxiosRequestConfig): Promise<AxiosResponse> {
+    return this.axiosClient.get(url, config);
+  }
+
+  /**
    * Get error message from axios error
    */
   private getErrorMessage(error: unknown): string {
     if (axios.isAxiosError(error)) {
-      if (error.response?.status === 403) {
-        return 'Rate limit exceeded or access denied';
-      }
-      if (error.response?.status === 404) {
-        return 'Repository or file not found';
-      }
-      if (error.code === 'ECONNABORTED') {
-        return 'Request timeout';
-      }
       return error.message || `HTTP ${error.response?.status || 'unknown'}`;
     }
     return error instanceof Error ? error.message : 'Unknown error';

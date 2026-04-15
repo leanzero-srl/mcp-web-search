@@ -48,12 +48,27 @@ import { pdfExtractor as pdfExtractorInstance } from './pdf-extractor.js';
 
 const pdfExtractor = pdfExtractorInstance;
 
-// ============================================================================
 import { WebSearchToolInput, WebSearchToolOutput, SearchResult } from './types.js';
 import { ProgressiveSearchEngine } from './progressive-search-engine.js';
 import { isPdfUrl, fetchSitemapUrls } from './utils.js';
 import { GitHubExtractor, parseGitHubUrl } from './github-extractor.js';
 import { openAPIExtractor } from './openapi-extractor.js';
+
+// ============================================================================
+// Import Phase 4 modules (Swarm Orchestration)
+// ============================================================================
+
+import { deviceRegistry } from './services/device-registry.js';
+import { aggregateResults, SubtaskResult as SwarmSubtaskResult, aggregateResults as aggregateSwarmResults } from './utils/result-aggregator.js';
+import { swarmSubagent, Subtask as SwarmTask } from './services/swarm-subagent.js';
+import { detectQueryComplexity, decomposeQuery } from './utils/query-complexity-detector.js';
+
+// ============================================================================
+// Import Phase 5 modules (Research Plan Tool)
+// ============================================================================
+
+import { researchPlanManager } from './research-plan-manager.js';
+import { reviewResearch } from './review-research.js';
 
 // ============================================================================
 // Import Phase 3 modules (Intelligence Expansion)
@@ -197,26 +212,9 @@ class WebSearchMCPServer {
       'Search the web and fetch complete page content from top results. This is the most comprehensive general web search tool. It searches the web and then follows resulting links to extract full page content. Use get-web-search-summaries for a lightweight alternative. For domain-specific research on known companies, consider starting with get-website-sitemap to discover available pages before filtering and extracting.',
       {
         query: z.string().describe('Search query to execute (recommended for comprehensive research)'),
-        limit: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 1 || num > 10) {
-            throw new Error('Invalid limit: must be a number between 1 and 10');
-          }
-          return num;
-        }).default(5).describe('Number of results to return with full content (1-10)'),
-        includeContent: z.union([z.boolean(), z.string()]).transform((val) => {
-          if (typeof val === 'string') {
-            return val.toLowerCase() === 'true';
-          }
-          return Boolean(val);
-        }).default(true).describe('Whether to fetch full page content (default: true)'),
-        maxContentLength: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 0) {
-            throw new Error('Invalid maxContentLength: must be a non-negative number');
-          }
-          return num;
-        }).optional().describe('Maximum characters per result content (0 = no limit). Usually not needed - content length is automatically optimized.'),
+        limit: z.number().optional().default(5).describe('Number of results to return with full content (1-10)'),
+        includeContent: z.boolean().optional().default(true).describe('Whether to fetch full page content (default: true)'),
+        maxContentLength: z.number().optional().describe('Maximum characters per result content (0 = no limit). Usually not needed - content length is automatically optimized.'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: full-web-search`);
@@ -326,13 +324,7 @@ class WebSearchMCPServer {
       'Search the web and return only the search result snippets/descriptions without following links to extract full page content. This is a lightweight alternative to full-web-search for when you only need brief search results. For comprehensive information, use full-web-search instead.',
       {
         query: z.string().describe('Search query to execute (lightweight alternative)'),
-        limit: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 1 || num > 10) {
-            throw new Error('Invalid limit: must be a number between 1 and 10');
-          }
-          return num;
-        }).default(5).describe('Number of search results to return (1-10)'),
+        limit: z.number().optional().default(5).describe('Number of search results to return (1-10)'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-web-search-summaries`);
@@ -406,13 +398,7 @@ class WebSearchMCPServer {
       'Extract and return the full content from a single web page URL. This tool follows a provided URL and extracts the main page content. Useful for getting detailed content from a specific webpage without performing a search.',
       {
         url: z.string().url().describe('The URL of the web page to extract content from'),
-        maxContentLength: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 0) {
-            throw new Error('Invalid maxContentLength: must be a non-negative number');
-          }
-          return num;
-        }).optional().describe('Maximum characters for the extracted content (0 = no limit, undefined = use default limit). Usually not needed - content length is automatically optimized.'),
+        maxContentLength: z.number().optional().describe('Maximum characters for the extracted content (0 = no limit). Usually not needed - content length is automatically optimized.'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-single-web-page-content`);
@@ -424,20 +410,12 @@ class WebSearchMCPServer {
             throw new Error('Invalid arguments: args must be an object');
           }
           const obj = args as Record<string, unknown>;
-          
+
           if (!obj.url || typeof obj.url !== 'string') {
             throw new Error('Invalid arguments: url is required and must be a string');
           }
 
-          let maxContentLength: number | undefined;
-          if (obj.maxContentLength !== undefined) {
-            const maxLengthValue = typeof obj.maxContentLength === 'string' ? parseInt(obj.maxContentLength, 10) : obj.maxContentLength;
-            if (typeof maxLengthValue !== 'number' || isNaN(maxLengthValue) || maxLengthValue < 0) {
-              throw new Error('Invalid maxContentLength: must be a non-negative number');
-            }
-            // If maxContentLength is 0, treat it as "no limit" (undefined)
-            maxContentLength = maxLengthValue === 0 ? undefined : maxLengthValue;
-          }
+          const maxContentLength = (obj.maxContentLength as number | undefined) ?? undefined;
 
            console.log(`[MCP] Starting single page content extraction for: ${obj.url}`);
            
@@ -667,28 +645,11 @@ class WebSearchMCPServer {
       'Research web pages and save their content, research digest (entities, claims, terms), and source information into structured markdown files in the /docs/research-output directory for future reference. Supports batch research, content sanitization, quality scoring, and auto-cleanup of old files.',
       {
         url: z.union([z.string().url(), z.array(z.string().url())]).describe('The URL of the web page(s) to research and save. Can be a single URL or an array of URLs for batch processing.'),
-        maxContentLength: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 0) {
-            throw new Error('Invalid maxContentLength: must be a non-negative number');
-          }
-          return num;
-        }).optional().describe('Maximum characters per result content (0 = no limit)'),
-        maxFiles: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 1) {
-            throw new Error('Invalid maxFiles: must be a positive number');
-          }
-          return num;
-        }).default(50).describe('Maximum number of research files to keep. Oldest files are auto-deleted when limit is reached.'),
+        maxContentLength: z.number().optional().describe('Maximum characters per result content (0 = no limit)'),
+        maxFiles: z.number().optional().default(50).describe('Maximum number of research files to keep. Oldest files are auto-deleted when limit is reached.'),
         filenamePrefix: z.string().optional().describe('Custom prefix for the output filename (e.g., "my-research" creates "my-research-2026-01-01-...")'),
         template: z.string().optional().describe('Custom markdown template for the research file. Use placeholders: {title}, {url}, {timestamp}, {wordCount}, {readingTime}, {qualityScore}, {entities}, {claims}, {keyTerms}, {content}. If not provided, default template is used.'),
-        appendToExisting: z.union([z.boolean(), z.string()]).transform((val) => {
-          if (typeof val === 'string') {
-            return val.toLowerCase() === 'true';
-          }
-          return Boolean(val);
-        }).default(false).describe('Whether to append to an existing research file instead of creating a new one. If true, will find and update the most recent file matching the filenamePrefix, or create new if none exists.'),
+        appendToExisting: z.boolean().optional().default(false).describe('Whether to append to an existing research file instead of creating a new one. If true, will find and update the most recent file matching the filenamePrefix, or create new if none exists.'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: research_and_save_to_markdown`);
@@ -712,31 +673,18 @@ class WebSearchMCPServer {
             throw new Error('Invalid arguments: at least one valid URL is required');
           }
 
-          // Parse optional parameters
-          let maxContentLength: number | undefined;
-          if (obj.maxContentLength !== undefined) {
-            const maxLengthValue = typeof obj.maxContentLength === 'string' ? parseInt(obj.maxContentLength, 10) : obj.maxContentLength;
-            if (typeof maxLengthValue !== 'number' || isNaN(maxLengthValue) || maxLengthValue < 0) {
-              throw new Error('Invalid maxContentLength: must be a non-negative number');
-            }
-            maxContentLength = maxLengthValue === 0 ? undefined : maxLengthValue;
-          }
+          // Parse optional parameters - Zod already validates and converts types
+          const maxContentLengthRaw = obj.maxContentLength as number | undefined;
+          const maxContentLength = maxContentLengthRaw === 0 ? undefined : maxContentLengthRaw;
 
-          const maxFiles = typeof obj.maxFiles === 'string' ? parseInt(obj.maxFiles, 10) : (obj.maxFiles as number) || 50;
+          const maxFiles = (obj.maxFiles as number) ?? 50;
           const filenamePrefix = typeof obj.filenamePrefix === 'string' ? obj.filenamePrefix : undefined;
 
           // Parse template parameter
           const customTemplate = typeof obj.template === 'string' && obj.template.length > 0 ? obj.template : undefined;
 
-          // Parse appendToExisting parameter
-          let appendToExisting = false;
-          if (obj.appendToExisting !== undefined) {
-            if (typeof obj.appendToExisting === 'string') {
-              appendToExisting = obj.appendToExisting.toLowerCase() === 'true';
-            } else {
-              appendToExisting = Boolean(obj.appendToExisting);
-            }
-          }
+          // Parse appendToExisting parameter - Zod already converts to boolean
+          const appendToExisting = (obj.appendToExisting as boolean) ?? false;
 
           console.log(`[MCP] Starting research for ${urls.length} URL(s)`);
 
@@ -1059,20 +1007,8 @@ class WebSearchMCPServer {
       'Extract and return content from a GitHub repository. This tool fetches README.md and crawls code files (.js, .ts, .py, etc.) from the repository. Use this when you need to understand the structure and contents of a GitHub project.',
       {
         url: z.string().url().describe('The URL of the GitHub repository (e.g., https://github.com/owner/repo)'),
-        maxDepth: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 0) {
-            throw new Error('Invalid maxDepth: must be a non-negative number');
-          }
-          return num;
-        }).optional().describe('Maximum directory depth to crawl (default: from environment or 3)'),
-        maxFiles: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 0) {
-            throw new Error('Invalid maxFiles: must be a non-negative number');
-          }
-          return num;
-        }).optional().describe('Maximum number of files to extract content from (default: from environment or 50)'),
+        maxDepth: z.number().optional().describe('Maximum directory depth to crawl (default: from environment or 3)'),
+        maxFiles: z.number().optional().describe('Maximum number of files to extract content from (default: from environment or 50)'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-github-repo-content`);
@@ -1084,28 +1020,14 @@ class WebSearchMCPServer {
             throw new Error('Invalid arguments: args must be an object');
           }
           const obj = args as Record<string, unknown>;
-          
+
           if (!obj.url || typeof obj.url !== 'string') {
             throw new Error('Invalid arguments: url is required and must be a string');
           }
 
-          let maxDepth: number | undefined;
-          if (obj.maxDepth !== undefined) {
-            const maxDepthValue = typeof obj.maxDepth === 'string' ? parseInt(obj.maxDepth, 10) : obj.maxDepth;
-            if (typeof maxDepthValue !== 'number' || isNaN(maxDepthValue)) {
-              throw new Error('Invalid maxDepth: must be a number');
-            }
-            maxDepth = maxDepthValue;
-          }
-
-          let maxFiles: number | undefined;
-          if (obj.maxFiles !== undefined) {
-            const maxFilesValue = typeof obj.maxFiles === 'string' ? parseInt(obj.maxFiles, 10) : obj.maxFiles;
-            if (typeof maxFilesValue !== 'number' || isNaN(maxFilesValue)) {
-              throw new Error('Invalid maxFiles: must be a number');
-            }
-            maxFiles = maxFilesValue;
-          }
+          // Zod already validates and converts these to numbers
+          const maxDepth = (obj.maxDepth as number) ?? undefined;
+          const maxFiles = (obj.maxFiles as number) ?? undefined;
 
           console.log(`[MCP] Starting GitHub repository extraction for: ${obj.url}`);
           
@@ -1253,12 +1175,7 @@ class WebSearchMCPServer {
       'Extract and download OpenAPI/Swagger specifications from API documentation pages. This tool automatically discovers OpenAPI specs by checking HTML link tags, common URL patterns, and versioned swagger files. The spec is saved to docs/technical/openapi/ for future use without re-crawling.',
       {
         url: z.string().url().describe('The URL of the API documentation page (e.g., https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro/)'),
-        forceRefresh: z.union([z.boolean(), z.string()]).transform((val) => {
-          if (typeof val === 'string') {
-            return val.toLowerCase() === 'true';
-          }
-          return Boolean(val);
-        }).default(false).describe('Force refresh the cache and re-download the spec'),
+        forceRefresh: z.boolean().optional().default(false).describe('Force refresh the cache and re-download the spec'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-openapi-spec`);
@@ -1346,20 +1263,8 @@ class WebSearchMCPServer {
       'Advanced web search with automatic query expansion and multi-stage searching. This tool first tries the exact user query, then progressively expands using synonyms, related terms, and alternative phrasings if good results aren\'t found. Use this for complex research where the exact wording might not match the best sources.',
       {
         query: z.string().describe('Search query to execute (uses progressive expansion strategy)'),
-        maxDepth: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 1 || num > 5) {
-            throw new Error('Invalid maxDepth: must be a number between 1 and 5');
-          }
-          return num;
-        }).default(3).describe('Maximum number of expansion stages (1-5, default: 3)'),
-        limit: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 1 || num > 20) {
-            throw new Error('Invalid limit: must be a number between 1 and 20');
-          }
-          return num;
-        }).default(10).describe('Maximum number of results to return (1-20, default: 10)'),
+        maxDepth: z.number().optional().default(3).describe('Maximum number of expansion stages (1-5, default: 3)'),
+        limit: z.number().optional().default(10).describe('Maximum number of results to return (1-20, default: 10)'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: progressive-web-search`);
@@ -1371,28 +1276,14 @@ class WebSearchMCPServer {
             throw new Error('Invalid arguments: args must be an object');
           }
           const obj = args as Record<string, unknown>;
-          
+
           if (!obj.query || typeof obj.query !== 'string') {
             throw new Error('Invalid arguments: query is required and must be a string');
           }
 
-          let maxDepth = 3; // default
-          if (obj.maxDepth !== undefined) {
-            const maxDepthValue = typeof obj.maxDepth === 'string' ? parseInt(obj.maxDepth, 10) : obj.maxDepth;
-            if (typeof maxDepthValue !== 'number' || isNaN(maxDepthValue)) {
-              throw new Error('Invalid maxDepth: must be a number');
-            }
-            maxDepth = maxDepthValue;
-          }
-
-          let limit = 10; // default
-          if (obj.limit !== undefined) {
-            const limitValue = typeof obj.limit === 'string' ? parseInt(obj.limit, 10) : obj.limit;
-            if (typeof limitValue !== 'number' || isNaN(limitValue) || limitValue < 1 || limitValue > 20) {
-              throw new Error('Invalid limit: must be a number between 1 and 20');
-            }
-            limit = limitValue;
-          }
+          // Zod already validates and converts these to numbers
+          const maxDepth = (obj.maxDepth as number) ?? 3;
+          const limit = (obj.limit as number) ?? 10;
 
           console.log(`[MCP] Starting progressive web search for: "${obj.query}"`);
           console.log(`[MCP] Max depth: ${maxDepth}, Limit: ${limit}`);
@@ -1468,13 +1359,7 @@ class WebSearchMCPServer {
       'Extract and return text content from a PDF document. This tool uses HTTP-based extraction with browser fallback for complex PDFs. Use this when you need to extract readable text from PDF files found during web research.',
       {
         url: z.string().url().describe('The URL of the PDF file to extract content from'),
-        maxContentLength: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 0) {
-            throw new Error('Invalid maxContentLength: must be a non-negative number');
-          }
-          return num;
-        }).optional().describe('Maximum characters for the extracted content (0 = no limit).'),
+        maxContentLength: z.number().optional().describe('Maximum characters for the extracted content (0 = no limit).'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-pdf-content`);
@@ -1486,19 +1371,14 @@ class WebSearchMCPServer {
             throw new Error('Invalid arguments: args must be an object');
           }
           const obj = args as Record<string, unknown>;
-          
+
           if (!obj.url || typeof obj.url !== 'string') {
             throw new Error('Invalid arguments: url is required and must be a string');
           }
 
-          let maxContentLength: number | undefined;
-          if (obj.maxContentLength !== undefined) {
-            const maxLengthValue = typeof obj.maxContentLength === 'string' ? parseInt(obj.maxContentLength, 10) : obj.maxContentLength;
-            if (typeof maxLengthValue !== 'number' || isNaN(maxLengthValue) || maxLengthValue < 0) {
-              throw new Error('Invalid maxContentLength: must be a non-negative number');
-            }
-            maxContentLength = maxLengthValue === 0 ? undefined : maxLengthValue;
-          }
+          // Zod already validates and converts this to number
+          const maxContentLengthRaw = (obj.maxContentLength as number) ?? undefined;
+          const maxContentLength = maxContentLengthRaw === 0 ? undefined : maxContentLengthRaw;
 
           console.log(`[MCP] Starting PDF content extraction from: ${obj.url}`);
           
@@ -1543,26 +1423,9 @@ class WebSearchMCPServer {
       'Search the web using intelligent caching. This tool first checks if similar queries have been recently searched and returns cached results when available. Use this for repeated or related queries to save time and reduce API calls.',
       {
         query: z.string().describe('Search query to execute (uses semantic cache)'),
-        limit: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 1 || num > 10) {
-            throw new Error('Invalid limit: must be a number between 1 and 10');
-          }
-          return num;
-        }).default(5).describe('Number of results to return with full content (1-10)'),
-        includeContent: z.union([z.boolean(), z.string()]).transform((val) => {
-          if (typeof val === 'string') {
-            return val.toLowerCase() === 'true';
-          }
-          return Boolean(val);
-        }).default(true).describe('Whether to fetch full page content (default: true)'),
-        maxContentLength: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 0) {
-            throw new Error('Invalid maxContentLength: must be a non-negative number');
-          }
-          return num;
-        }).optional().describe('Maximum characters per result content (0 = no limit).'),
+        limit: z.number().optional().default(5).describe('Number of results to return with full content (1-10)'),
+        includeContent: z.boolean().optional().default(true).describe('Whether to fetch full page content (default: true)'),
+        maxContentLength: z.number().optional().describe('Maximum characters per result content (0 = no limit).'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: cached-web-search`);
@@ -1574,37 +1437,16 @@ class WebSearchMCPServer {
             throw new Error('Invalid arguments: args must be an object');
           }
           const obj = args as Record<string, unknown>;
-          
+
           if (!obj.query || typeof obj.query !== 'string') {
             throw new Error('Invalid arguments: query is required and must be a string');
           }
 
-          let limit = 5; // default
-          if (obj.limit !== undefined) {
-            const limitValue = typeof obj.limit === 'string' ? parseInt(obj.limit, 10) : obj.limit;
-            if (typeof limitValue !== 'number' || isNaN(limitValue) || limitValue < 1 || limitValue > 10) {
-              throw new Error('Invalid limit: must be a number between 1 and 10');
-            }
-            limit = limitValue;
-          }
-
-          let includeContent = true; // default
-          if (obj.includeContent !== undefined) {
-            if (typeof obj.includeContent === 'string') {
-              includeContent = obj.includeContent.toLowerCase() === 'true';
-            } else {
-              includeContent = Boolean(obj.includeContent);
-            }
-          }
-
-          let maxContentLength: number | undefined;
-          if (obj.maxContentLength !== undefined) {
-            const maxLengthValue = typeof obj.maxContentLength === 'string' ? parseInt(obj.maxContentLength, 10) : obj.maxContentLength;
-            if (typeof maxLengthValue !== 'number' || isNaN(maxLengthValue) || maxLengthValue < 0) {
-              throw new Error('Invalid maxContentLength: must be a non-negative number');
-            }
-            maxContentLength = maxLengthValue === 0 ? undefined : maxLengthValue;
-          }
+          // Zod already validates and converts these types
+          const limit = (obj.limit as number) ?? 5;
+          const includeContent = (obj.includeContent as boolean) ?? true;
+          const maxContentLengthRaw = (obj.maxContentLength as number) ?? undefined;
+          const maxContentLength = maxContentLengthRaw === 0 ? undefined : maxContentLengthRaw;
 
           const query = obj.query;
 
@@ -1725,25 +1567,269 @@ class WebSearchMCPServer {
       }
     );
 
-    // Register the list cached documents tool
+    // Register the swarm-web-research tool (multi-device orchestration with LM Link)
+    this.server.tool(
+      'swarm-web-research',
+      'Distribute web research across LM Link connected devices for complex queries. Automatically detects query complexity and routes to single device or multi-device swarm. Use this for comprehensive research that benefits from parallel exploration across multiple devices.',
+      {
+        query: z.string().describe('Research query to execute across devices'),
+        maxSubtasks: z.number().optional().default(5).describe('Maximum number of parallel subtasks to spawn per device (1-8)'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: swarm-web-research`);
+        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+        try {
+          if (typeof args !== 'object' || args === null) {
+            throw new Error('Invalid arguments: args must be an object');
+          }
+          const obj = args as Record<string, unknown>;
+
+          if (!obj.query || typeof obj.query !== 'string') {
+            throw new Error('Invalid arguments: query is required and must be a string');
+          }
+
+          // Zod already validates and converts maxSubtasks
+          let maxSubtasks = (obj.maxSubtasks as number) ?? 5;
+          maxSubtasks = Math.max(1, Math.min(8, maxSubtasks));
+
+          const query = obj.query as string;
+          
+          console.log(`[MCP] Starting swarm web research for: "${query.substring(0, 50)}..."`);
+          console.log(`[MCP] Max subtasks: ${maxSubtasks}`);
+
+          // Detect query complexity
+          const analysis = detectQueryComplexity(query);
+          
+          if (!analysis.hasParallelIndicators || analysis.type === 'simple') {
+            console.log(`[MCP] Query detected as simple, using single device execution`);
+            
+            // Use existing search engine for simple queries
+            const searchResponse = await this.searchEngine.search({
+              query,
+              numResults: 5,
+            });
+            
+            if (searchResponse.results.length === 0) {
+              return {
+                content: [{
+                  type: 'text' as const,
+                  text: `No results found for: "${query}"`
+                }]
+              };
+            }
+
+            // Extract content
+            const sessionId = this.generateSessionId();
+            const enhancedResults = await this.contentExtractor.extractContentForResults(
+              searchResponse.results.slice(0, 3),
+              1,
+              undefined,
+              sessionId
+            );
+
+            let responseText = `**Single Device Research Results for: "${query}"**\n\n`;
+            responseText += `**Complexity:** Simple (single device)\n`;
+            responseText += `**Results:** ${enhancedResults.length}\n\n`;
+
+            enhancedResults.forEach((result, idx) => {
+              responseText += `**${idx + 1}. ${result.title}**\n`;
+              responseText += `URL: ${result.url}\n`;
+              
+              if (result.fullContent && result.fullContent.trim()) {
+                let content = result.fullContent;
+                if (content.length > 3000) {
+                  content = content.substring(0, 3000) + `\n\n[Content truncated]`;
+                }
+                responseText += `\n**Content:**\n${content}\n`;
+              }
+              
+              responseText += `\n---\n\n`;
+            });
+
+            return {
+              content: [{
+                type: 'text' as const,
+                text: responseText
+              }]
+            };
+          }
+
+          // Complex query - use swarm orchestration
+          console.log(`[MCP] Query detected as complex, using multi-device swarm`);
+
+          // Discover available devices via LM Link
+          const devices = await deviceRegistry.getOnlineDevices();
+          
+          if (devices.length < 2) {
+            console.log(`[MCP] Insufficient devices for swarm (${devices.length}), falling back to single device`);
+            
+            // Fallback to single device
+            return this.handleSwarmFallback(query, maxSubtasks);
+          }
+
+          // Determine optimal number of devices
+          const numDevices = await deviceRegistry.getOptimalDeviceCount(query);
+          console.log(`[MCP] Using ${numDevices} device(s) for swarm`);
+
+          // Decompose query into subtasks
+          const subtasks = decomposeQuery(query).slice(0, maxSubtasks);
+          console.log(`[MCP] Decomposed into ${subtasks.length} subtask(s)`);
+
+          // Spawn subagents in parallel across selected devices
+          const results: SwarmSubtaskResult[] = [];
+          
+          for (let i = 0; i < Math.min(subtasks.length, numDevices); i++) {
+            const deviceId = devices[i]?.id || 'device-local';
+            const subtask = subtasks[i] || { id: `task-${i + 1}`, query };
+            
+            console.log(`[MCP] Spawning subagent ${subtask.id} on device ${deviceId}`);
+            
+            // Execute subtask
+            const result = await swarmSubagent.execute({
+              id: subtask.id,
+              query: subtask.query,
+              deviceId
+            });
+            
+            results.push(result);
+          }
+
+          // Aggregate results
+          const aggregated = aggregateSwarmResults(results);
+
+          console.log(`[MCP] Swarm research completed. Devices used: ${aggregated.devicesUsed.length}, Total tokens: ${aggregated.tokenCount}`);
+
+          // Format response
+          let responseText = `**Swarm Web Research Results for: "${query}"**\n\n`;
+          responseText += `**Complexity:** Complex (multi-device swarm)\n`;
+          responseText += `**Devices Used:** ${aggregated.devicesUsed.length}\n`;
+          responseText += `**Subtasks Completed:** ${aggregated.subtasksCompleted}\n`;
+          responseText += `**Subtasks Failed:** ${aggregated.subtasksFailed}\n`;
+          responseText += `**Total Tokens:** ~${aggregated.tokenCount}\n\n`;
+
+          // Add aggregated content (truncated if needed)
+          const maxContentLength = parseInt(process.env.SWARM_RESULT_BUDGET || '15000', 10);
+          
+          let aggregatedContent = aggregated.content;
+          if (aggregatedContent.length > maxContentLength) {
+            aggregatedContent = aggregatedContent.substring(0, maxContentLength) + 
+              `\n\n[Aggregated content truncated at ${maxContentLength} characters]`;
+          }
+          
+          responseText += `---\n\n**Aggregated Results:**\n\n${aggregatedContent}\n`;
+
+          return {
+            content: [{
+              type: 'text' as const,
+              text: responseText
+            }]
+          };
+        } catch (error) {
+          this.handleError(error, 'swarm-web-research');
+        }
+      }
+    );
+
+    // Register the list-devices tool (LM Link device discovery)
+    this.server.tool(
+      'list-devices',
+      'List all LM Link connected devices and their status. Shows online/offline status, hardware tier, capabilities, and current load statistics. Use this to verify device availability before running swarm orchestration tasks.',
+      {
+        includeLoadStats: z.boolean().optional().default(true).describe('Include current load statistics for each device'),
+        filterByCapability: z.string().optional().default('none').describe('Filter devices by capability (vision, toolUse, or none)'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: list-devices`);
+        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+        try {
+          // Zod already validates and converts these types
+          const includeLoadStats = (args as Record<string, unknown>).includeLoadStats as boolean ?? true;
+          const filterByCapability = ((args as Record<string, unknown>).filterByCapability as string) ?? 'none';
+
+          console.log(`[MCP] Listing devices, includeLoadStats: ${includeLoadStats}, filterByCapability: ${filterByCapability}`);
+
+          // Get all online devices
+          const devices = await deviceRegistry.getOnlineDevices();
+          
+          let filteredDevices = devices;
+          
+          // Note: capabilities filtering not implemented in simplified DeviceInfo
+          // In production with full LM Link, this would check device.modelCapabilities
+          filteredDevices = devices;
+
+          const totalDevices = devices.length;
+          const onlineCount = filteredDevices.filter(d => d.status === 'online').length;
+          const offlineCount = filteredDevices.filter(d => d.status === 'offline').length;
+
+          let responseText = `## LM Link Connected Devices\n\n`;
+          responseText += `**Total Devices:** ${totalDevices}\n`;
+          responseText += `**Online:** ${onlineCount}\n`;
+          responseText += `**Offline/Unavailable:** ${offlineCount}\n\n`;
+
+          if (filteredDevices.length === 0) {
+            responseText += `No devices found matching the criteria.\n`;
+          } else {
+            responseText += `\n| # | Device ID | Name | Status | Tier | Models Loaded |\n`;
+            responseText += `|---|-----------|------|--------|------|---------------|\n`;
+
+            filteredDevices.forEach((device, idx) => {
+              const modelCount = device.models ? Object.keys(device.models).length : 0;
+              let statusEmoji = device.status === 'offline' ? '🔴' : '🟢';
+
+              responseText += `| ${idx + 1} | ${device.id} | ${statusEmoji} ${device.name} | ${device.status} | ${device.tier || 'unknown'} | ${modelCount} |\n`;
+            });
+          }
+
+          if (includeLoadStats && filteredDevices.length > 0) {
+            responseText += `\n## Load Statistics\n\n`;
+
+            filteredDevices.forEach(device => {
+              const loadInfo = device.load;
+              if (!loadInfo) return;
+
+              responseText += `### ${device.name}\n`;
+              responseText += `- Active Requests: ${loadInfo.activeRequests || 0}\n`;
+              responseText += `- Total Today: ${loadInfo.totalToday || 0}\n`;
+              
+              if (loadInfo.cooldownUntil) {
+                const cooldownMs = new Date(loadInfo.cooldownUntil).getTime() - Date.now();
+                if (cooldownMs > 0) {
+                  responseText += `- Cooldown: ${(cooldownMs / 1000).toFixed(1)}s remaining\n`;
+                }
+              }
+              
+              responseText += `\n`;
+            });
+          }
+
+          return {
+            content: [{
+              type: 'text' as const,
+              text: responseText
+            }]
+          };
+        } catch (error) {
+          this.handleError(error, 'list-devices');
+        }
+      }
+    );
+
+    // Register the list-cached-documents tool
     this.server.tool(
       'list-cached-documents',
       'List all documents that have been crawled and saved by this MCP server. This includes OpenAPI specifications, technical documentation, and other extracted content. Use this to see what has already been downloaded and avoid re-crawling.',
       {
-        category: z.union([z.string(), z.literal('all')]).default('all').describe('Filter by category (openapi, technical-md, all)'),
+        category: z.string().optional().default('all').describe('Filter by category (openapi, technical-md, all)'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: list-cached-documents`);
         console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
 
         try {
-          let category = 'all'; // default
-          if (typeof args === 'object' && args !== null) {
-            const obj = args as Record<string, unknown>;
-            if (obj.category !== undefined) {
-              category = typeof obj.category === 'string' ? obj.category : 'all';
-            }
-          }
+          // Zod already validates and converts category type
+          const category = ((args as Record<string, unknown>).category as string) ?? 'all';
 
           console.log(`[MCP] Listing cached documents, category: ${category}`);
 
@@ -1811,6 +1897,10 @@ class WebSearchMCPServer {
         }
       }
     );
+
+    // Register research plan tools (Phase 5)
+    this.setupCreateResearchPlanTool();
+    this.setupReviewResearchTool();
   }
 
   private validateAndConvertArgs(args: unknown): WebSearchToolInput {
@@ -2043,15 +2133,231 @@ class WebSearchMCPServer {
     });
   }
 
+  /**
+   * Fallback handler for when insufficient devices are available for swarm orchestration
+   */
+  private handleSwarmFallback(query: string, maxSubtasks: number): any {
+    console.log(`[MCP] Fallback: single device execution for complex query`);
+    
+    // Use existing search engine for fallback
+    return this.searchEngine.search({
+      query,
+      numResults: Math.min(maxSubtasks + 2, 5),
+    }).then(searchResponse => {
+      if (searchResponse.results.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `No results found for: "${query}"`
+          }]
+        };
+      }
+
+      // Extract content
+      const sessionId = this.generateSessionId();
+      
+      return this.contentExtractor.extractContentForResults(
+        searchResponse.results.slice(0, 3),
+        1,
+        undefined,
+        sessionId
+      ).then(enhancedResults => {
+        let responseText = `**Single Device Research Results (Fallback) for: "${query}"**\n\n`;
+        responseText += `**Complexity:** Complex query (fallback to single device)\n`;
+        responseText += `**Devices Available:** < 2\n`;
+        responseText += `**Results:** ${enhancedResults.length}\n\n`;
+
+        enhancedResults.forEach((result, idx) => {
+          responseText += `**${idx + 1}. ${result.title}**\n`;
+          responseText += `URL: ${result.url}\n`;
+          
+          if (result.fullContent && result.fullContent.trim()) {
+            let content = result.fullContent;
+            if (content.length > 3000) {
+              content = content.substring(0, 3000) + `\n\n[Content truncated]`;
+            }
+            responseText += `\n**Content:**\n${content}\n`;
+          }
+          
+          responseText += `\n---\n\n`;
+        });
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: responseText
+          }]
+        };
+      });
+    });
+  }
+
   async run(): Promise<void> {
     console.log('Setting up MCP server...');
     const transport = new StdioServerTransport();
-    
+
     console.log('Connecting to transport...');
     await this.server.connect(transport);
     console.log('Web Search MCP Server started');
     console.log('Server timestamp:', new Date().toISOString());
     console.log('Waiting for MCP messages...');
+  }
+
+  /**
+   * Create Research Plan Tool
+   * Orchestrates distributed research across devices and returns tiny index (not full synthesis)
+   */
+  private setupCreateResearchPlanTool(): void {
+    this.server.tool(
+      'create-research-plan',
+      'Create a distributed research plan that decomposes complex queries, assigns subtasks to devices, and executes parallel research. Returns a tiny index with file paths, metadata, and next steps - NOT a full synthesis. The .md files contain the actual research; this tool returns an index for the orchestrator to navigate.',
+      {
+        query: z.string().describe('Complex research query to plan and execute'),
+        maxDevices: z.number().optional().default(3).describe('Maximum number of devices to use (1-5)'),
+        includeExistingContext: z.boolean().optional().default(true).describe('Read existing research files for context before new searches'),
+        saveToFile: z.boolean().optional().default(true).describe('Save results to docs/research-output/ directory'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: create-research-plan`);
+        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+        try {
+          const validatedArgs = args as Record<string, unknown>;
+
+          if (!validatedArgs.query || typeof validatedArgs.query !== 'string') {
+            throw new Error('query is required and must be a string');
+          }
+
+          const query = validatedArgs.query;
+          const maxDevices = (validatedArgs.maxDevices as number) ?? 3;
+          const includeExistingContext = (validatedArgs.includeExistingContext as boolean) ?? true;
+          const saveToFile = (validatedArgs.saveToFile as boolean) ?? true;
+
+          // Clamp maxDevices
+          const clampedMaxDevices = Math.min(Math.max(1, maxDevices), 5);
+
+          console.log(`[MCP] Creating research plan for: "${query.substring(0, 60)}..."`);
+          console.log(`[MCP] Max devices: ${clampedMaxDevices}`);
+
+          // Create the research plan
+          const index = await researchPlanManager.createPlan(query, {
+            maxDevices: clampedMaxDevices,
+            saveToFile,
+          });
+
+          // Return tiny index (metadata only, not full content)
+          let responseText = `## Research Plan Created\n\n` +
+            `**Plan ID:** ${index.planId}\n` +
+            `**Query:** ${index.query}\n\n` +
+            `### Summary\n` +
+            `- **Files Created:** ${index.summary.totalFiles}\n` +
+            `- **Total Words:** ${index.summary.totalWords}\n` +
+            `- **Estimated Index Tokens:** ~${index.summary.estimatedTokens} (tiny index, not full content)\n` +
+            `- **Coverage:** ${index.summary.coverage || 'unknown'}\n\n` +
+            `### Devices Used\n${index.devicesUsed.map(d => `- ${d}`).join('\n')}\n\n` +
+            `### Files Index\n`;
+
+          for (const file of index.files) {
+            responseText += `\n**File:** \`${path.basename(file.path)}\`\n` +
+              `- Word Count: ${file.wordCount}\n` +
+              `- Quality Score: ${file.qualityScore}/100\n` +
+              `- Entities Found: ${file.entitiesFound.slice(0, 5).join(', ')}${file.entitiesFound.length > 5 ? '...' : ''}\n`;
+          }
+
+          responseText += `\n### Next Steps\n`;
+          for (const step of index.nextSteps) {
+            responseText += `- ${step}\n`;
+          }
+
+          return {
+            content: [{
+              type: 'text' as const,
+              text: responseText
+            }]
+          };
+        } catch (error) {
+          this.handleError(error, 'create-research-plan');
+        }
+      }
+    );
+  }
+
+  /**
+   * Review Research Tool
+   * Compares research files against original prompt to identify gaps and quality issues
+   */
+  private setupReviewResearchTool(): void {
+    this.server.tool(
+      'review-research',
+      'Review completed research plans against the original query. Identifies gaps, low-quality results, and provides recommendations for improvement. Use this to verify that research covered all aspects of the original prompt before proceeding.',
+      {
+        planId: z.string().describe('The plan ID to review (e.g., "plan-20260414-abc123")'),
+        compareWithPrompt: z.boolean().optional().default(true).describe('Compare research against original prompt for completeness'),
+        minimumQualityScore: z.number().optional().default(60).describe('Minimum acceptable quality score per file (0-100)'),
+      },
+      async (args: unknown) => {
+        console.log(`[MCP] Tool call received: review-research`);
+        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+        try {
+          const validatedArgs = args as Record<string, unknown>;
+
+          if (!validatedArgs.planId || typeof validatedArgs.planId !== 'string') {
+            throw new Error('planId is required and must be a string');
+          }
+
+          const planId = validatedArgs.planId;
+          const compareWithPrompt = (validatedArgs.compareWithPrompt as boolean) ?? true;
+          const minimumQualityScore = (validatedArgs.minimumQualityScore as number) ?? 60;
+
+          // Clamp minimumQualityScore
+          const clampedMinScore = Math.min(Math.max(1, minimumQualityScore), 100);
+
+          console.log(`[MCP] Reviewing research plan: ${planId}`);
+
+          // Perform the review
+          const reviewResult = await reviewResearch.review(planId, {
+            compareWithPrompt,
+            minimumQualityScore: clampedMinScore,
+          });
+
+          // Return formatted review report
+          let responseText = `## Research Review Report\n\n` +
+            `**Plan ID:** ${reviewResult.planId}\n` +
+            `**Query:** ${reviewResult.query}\n` +
+            `**Overall Quality Score:** ${reviewResult.qualityScore}/100\n` +
+            `**Files Reviewed:** ${reviewResult.filesReviewed.length}\n\n` +
+            `### Assessment\n${reviewResult.overallAssessment}\n\n`;
+
+          if (reviewResult.gapsFound.length > 0) {
+            responseText += `### Gaps Found (${reviewResult.gapsFound.length})\n`;
+
+            for (const gap of reviewResult.gapsFound) {
+              const severityEmoji = gap.severity === 'high' ? '🔴' : gap.severity === 'medium' ? '🟡' : '🟢';
+              responseText += `\n**${severityEmoji} [${gap.type}]** ${gap.description}\n` +
+                `- Severity: ${gap.severity}\n` +
+                `- Suggestion: ${gap.suggestion}\n`;
+            }
+          }
+
+          if (reviewResult.recommendations.length > 0) {
+            responseText += `\n### Recommendations\n`;
+            for (const rec of reviewResult.recommendations) {
+              responseText += `- ${rec}\n`;
+            }
+          }
+
+          return {
+            content: [{
+              type: 'text' as const,
+              text: responseText
+            }]
+          };
+        } catch (error) {
+          this.handleError(error, 'review-research');
+        }
+      }
+    );
   }
 }
 
