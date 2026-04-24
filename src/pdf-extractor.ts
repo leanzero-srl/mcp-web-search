@@ -1,8 +1,8 @@
 /**
  * MCP Web Search - PDF Extractor Module
- * 
+ *
  * Provides high-fidelity PDF content extraction using multiple strategies:
- * - Direct HTTP download with text extraction
+ * - Direct HTTP download with pdf-parse text extraction
  * - Browser-based rendering for complex PDFs
  * - Fallback mechanisms for unreliable sources
  */
@@ -12,6 +12,17 @@ import { auditLogger, telemetryCollector } from './observability.js';
 
 // ============================================================================
 const browserPool = new BrowserPool();
+
+// Cached pdf-parse dynamic import to avoid repeated module loading
+let cachedPdfParseFn: ((buffer: Uint8Array) => Promise<any>) | null = null;
+async function getPdfParseFn(): Promise<(buffer: Uint8Array) => Promise<any>> {
+  if (!cachedPdfParseFn) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mod: any = await import('pdf-parse');
+    cachedPdfParseFn = mod.default || mod;
+  }
+  return cachedPdfParseFn!;
+}
 
 // ============================================================================
 // Configuration
@@ -120,7 +131,7 @@ export class PdfExtractor {
    */
   private async extractWithHttp(url: string, config: PdfExtractionConfig = {}): Promise<PdfExtractionResult | null> {
     const timeout = config.timeout || this.defaultTimeout;
-    
+
     try {
       // Use fetch to get the PDF as an ArrayBuffer
       const response = await fetch(url, {
@@ -137,14 +148,19 @@ export class PdfExtractor {
 
       const arrayBuffer = await response.arrayBuffer();
       const uint8Array = new Uint8Array(arrayBuffer);
-      
-      // Try to extract text using pdf-parse or similar logic
-      // For now, we'll use a simple approach with PDF.js via browser fallback
-      // This is a placeholder - in production you'd use pdf-parse library
-      const extractedText = await this.extractPdfTextFromBuffer(uint8Array);
-      
+
+      // Extract text using pdf-parse (cached dynamic import)
+      const pdfParseFn = await getPdfParseFn();
+      const data = await pdfParseFn(uint8Array);
+
+      if (!data.text || data.text.trim().length === 0) {
+        return null;
+      }
+
       return {
-        text: extractedText,
+        text: data.text,
+        pageCount: data.numpages,
+        fileSize: uint8Array.length,
         extractionMethod: 'http',
       };
     } catch (error) {
@@ -158,50 +174,31 @@ export class PdfExtractor {
    */
   private async extractWithBrowser(url: string, config: PdfExtractionConfig = {}): Promise<PdfExtractionResult> {
     const timeout = config.timeout || this.defaultTimeout;
-    
+
     // Use getBrowserWithContextPool internally which returns a Browser
     const browser = await browserPool.getBrowser();
-    
+    const page = await browser.newPage();
+
     try {
-      const page = await browser.newPage();
-      
       // Navigate to the PDF URL
-      await page.goto(url, { waitUntil: 'networkidle' });
-      
+      await page.goto(url, { waitUntil: 'networkidle', timeout });
+
       // Wait for PDF to load
       await page.waitForSelector('body', { timeout });
-      
+
       // Extract text content from the page
       const textContent = await page.evaluate(() => {
         return document.body.innerText || '';
       });
-      
-      // Close the page
-      await page.close();
-      
+
       return {
         text: textContent,
         extractionMethod: 'browser',
       };
     } finally {
-      await browserPool.closeAll();
+      // Only close the page, NOT the entire browser pool
+      await page.close();
     }
-  }
-
-  /**
-   * Extract text from PDF buffer using a simple approach
-   * In production, you'd use pdf-parse library
-   */
-  private async extractPdfTextFromBuffer(buffer: Uint8Array): Promise<string> {
-    // This is a placeholder implementation
-    // For production use, install pdf-parse: npm install pdf-parse
-    // Then use:
-    // const pdf = await import('pdf-parse');
-    // const data = await pdf.default(buffer);
-    // return data.text;
-    
-    // For now, return an empty string to indicate the method needs proper implementation
-    return 'PDF text extraction requires pdf-parse library. Please install: npm install pdf-parse';
   }
 
   /**

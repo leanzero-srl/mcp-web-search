@@ -20,6 +20,7 @@ interface ContextRecord {
   lastUsed: number;
   ageStart: number;
   isHealthy: boolean;
+  lastHealthCheck?: number;   // Timestamp of last health check
 }
 
 // Export types for compatibility
@@ -64,8 +65,8 @@ export class ContextPool {
    */
   async getContext(): Promise<BrowserContext> {
     // First, try to get an existing healthy context that hasn't timed out
-    const availableContext = this.findAvailableContext();
-    
+    const availableContext = await this.findAvailableContext();
+
     if (availableContext) {
       console.log(`[ContextPool] Reusing existing context (${this.contexts.size} total in pool)`);
       return availableContext;
@@ -85,7 +86,7 @@ export class ContextPool {
     await new Promise(resolve => setTimeout(resolve, this.reuseTimeoutMs));
     
     // Try again after waiting
-    const fallbackContext = this.findAvailableContext();
+    const fallbackContext = await this.findAvailableContext();
     if (fallbackContext) {
       return fallbackContext;
     }
@@ -159,43 +160,50 @@ export class ContextPool {
   /**
    * Finds an available (healthy and not timed out) context in the pool
    */
-  private findAvailableContext(): BrowserContext | null {
+  private async findAvailableContext(): Promise<BrowserContext | null> {
     const now = Date.now();
-    
+
     for (const [guid, record] of this.contexts.entries()) {
       if (!record.isHealthy) continue;
-      
+
       // Check if context has exceeded max age
       if (now - record.ageStart > this.maxAgeMs) {
         console.log(`[ContextPool] Context ${guid} expired (age: ${(now - record.ageStart)}ms > ${this.maxAgeMs}ms)`);
         this.invalidateContext(record);
         continue;
       }
-      
+
       // Check if context has timed out
       if (now - record.lastUsed > this.reuseTimeoutMs) {
         console.log(`[ContextPool] Context ${guid} timed out (idle: ${(now - record.lastUsed)}ms > ${this.reuseTimeoutMs}ms)`);
         continue;
       }
-      
+
       // Perform health check by trying to create a quick page
-      if (!this.healthCheck(record)) {
+      if (!(await this.healthCheck(record))) {
         this.invalidateContext(record);
         continue;
       }
-      
+
       // Update last used time
       record.lastUsed = now;
       return record.context;
     }
-    
+
     return null;
   }
 
   /**
-   * Performs a quick health check on a context
+   * Performs a quick health check on a context (cached for 5s to avoid overhead)
    */
   private async healthCheck(record: ContextRecord): Promise<boolean> {
+    const now = Date.now();
+
+    // If we checked within the last 5 seconds, reuse the result
+    if (record.lastHealthCheck && now - record.lastHealthCheck < 5000) {
+      return true;
+    }
+
     try {
       // Quick check: verify browser is still connected
       const browser = record.context.browser();
@@ -203,11 +211,12 @@ export class ContextPool {
         console.log('[ContextPool] Browser disconnected during health check');
         return false;
       }
-      
+
       // Create and immediately close a test page to ensure context is responsive
       const page = await record.context.newPage();
       await page.close();
-      
+
+      record.lastHealthCheck = now;
       return true;
     } catch (error) {
       console.log(`[ContextPool] Context health check failed:`, error);

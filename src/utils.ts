@@ -4,6 +4,20 @@
 
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+import http from 'http';
+import https from 'https';
+
+// Shared HTTP/HTTPS agents with keep-alive connection pooling
+const httpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000 });
+const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000 });
+
+/**
+ * Get shared axios config with connection pooling (keep-alive)
+ * Use this for all HTTP clients to reduce TCP handshake overhead
+ */
+export function getAxiosHttpAgentConfig(): { httpAgent: http.Agent; httpsAgent: https.Agent } {
+  return { httpAgent, httpsAgent };
+}
 
 export function cleanText(text: string, maxLength: number = 10000): string {
   return text

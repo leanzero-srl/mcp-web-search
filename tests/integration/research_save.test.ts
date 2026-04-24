@@ -65,7 +65,7 @@ describe('Research and Save Integration Test', () => {
     const content = result.content as Array<{ type: string; text?: string }>;
     const textContent = content.find(c => c.type === 'text')?.text || '';
     
-    expect(textContent).toContain('Successfully researched and saved data from');
+    expect(textContent).toContain('Research complete!');
     expect(textContent).toContain(testUrl);
     // Check if it mentions the file path (it should)
     expect(textContent).toContain('docs/research-output/');

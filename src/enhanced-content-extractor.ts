@@ -1,10 +1,11 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { ContentExtractionOptions, SearchResult, ResearchDigest } from './types.js';
-import { cleanText, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
+import { cleanText, getContentPreview, generateTimestamp, isPdfUrl, getAxiosHttpAgentConfig } from './utils.js';
 import { BrowserPool } from './browser-pool.js';
 import { scoreContentQuality, getBestContentSelector, cleanText as qualityCleanText } from './content-quality-scorer.js';
 import { sessionRateLimiter } from './enterprise-guardrails.js';
+import { requestDeduplicator } from './request-deduplicator.js';
 
 /**
  * Parses a GitHub URL to extract owner, repo, and path information.
@@ -72,6 +73,7 @@ async function extractRawGitHubContent(url: string): Promise<string | null> {
         'X-GitHub-Api-Version': '2022-11-28'
       },
       timeout: 10000,
+      ...getAxiosHttpAgentConfig(),
     });
 
     // Decode base64 content
@@ -83,73 +85,6 @@ async function extractRawGitHubContent(url: string): Promise<string | null> {
     console.error(`[EnhancedContentExtractor] Failed to fetch raw GitHub file:`, error);
     return null;
   }
-}
-
-/**
- * Converts HTML elements to Markdown format for better AI readability.
- * This implementation preserves structural cues like headings, lists, and links.
- */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function convertToMarkdown($: cheerio.CheerioAPI, element: any, depth: number = 0): string {
-  if (!element.tagName) return '';
-
-  const tag = element.tagName.toLowerCase();
-  const noiseTags = ['script', 'style', 'noscript', 'iframe', 'img', 'video', 'audio', 'canvas', 'svg', 'object', 'embed', 'applet', 'form', 'input', 'textarea', 'select', 'button', 'label', 'fieldset', 'legend', 'optgroup', 'option', 'nav', 'header', 'footer', 'aside', 'ad', 'advertisement', 'ads', 'social-share', 'share-buttons', 'comments', 'comment-section', 'related-posts', 'recommendations', 'newsletter-signup', 'cookie-notice', 'privacy-notice', 'terms-notice', 'disclaimer', 'legal', 'copyright', 'meta', 'metadata', 'author-info', 'publish-date', 'tags', 'categories', 'navigation', 'pagination', 'search-box', 'search-form', 'login-form', 'signup-form', 'newsletter', 'popup', 'modal', 'overlay', 'tooltip', 'toolbar', 'ribbon', 'banner', 'promo', 'sponsored', 'affiliate', 'tracking', 'analytics', 'pixel', 'beacon'];
-
-  if (noiseTags.includes(tag)) return '';
-
-  let content = '';
-
-  // Handle Headings
-  if (/^h[1-6]$/.test(tag)) {
-    const level = parseInt(tag.substring(1));
-    const prefix = '#'.repeat(Math.min(level, 6));
-    const text = $(element).text().trim();
-    return text ? `\n\n${prefix} ${text}\n\n` : '';
-  }
-
-  // Handle Lists
-  if (tag === 'li') {
-    const text = $(element).text().trim();
-    return text ? `* ${text}\n` : '';
-  }
-  if (tag === 'ul' || tag === 'ol') {
-    // Simplified: just collect children
-    return '\n';
-  }
-
-  // Handle Emphasis
-  if (['strong', 'b'].includes(tag)) {
-    return `**${$(element).text().trim()}**`;
-  }
-  if (['em', 'i'].includes(tag)) {
-    return `*${$(element).text().trim()}*`;
-  }
-
-  // Handle Links
-  if (tag === 'a') {
-    const href = $(element).attr('href');
-    const text = $(element).text().trim();
-    return href ? `[${text}](${href})` : text;
-  }
-
-  // Recurse into children
-  if (element.children && element.children.length > 0) {
-    for (let i = 0; i < element.children.length; i++) {
-      content += convertToMarkdown($, element.children[i], depth + 1);
-    }
-  } else {
-    const text = $(element).text().trim();
-    if (text) content += text;
-  }
-
-  // Add block spacing for structural elements
-  const isBlock = ['p', 'div', 'section', 'article', 'main', 'br', 'hr'].includes(tag);
-  if (isBlock && content.trim()) {
-    return `\n${content.trim()}\n`;
-  }
-
-  return content;
 }
 
 export class EnhancedContentExtractor {
@@ -185,6 +120,21 @@ export class EnhancedContentExtractor {
 
     console.log(`[EnhancedContentExtractor] Starting extraction for: ${url}`);
 
+    // OPTIMIZATION: Deduplicate concurrent extractions of the same URL
+    // This prevents redundant HTTP/browser calls when the same URL appears in multiple searches
+    return requestDeduplicator.deduplicate(
+      url,
+      'extract',
+      () => this.executeExtraction(options)
+    );
+  }
+
+  /**
+   * Executes the actual content extraction (wrapped by deduplication in extractContent())
+   */
+  private async executeExtraction(options: ContentExtractionOptions): Promise<{ content: string; digest?: ResearchDigest }> {
+    const { url } = options;
+
     // Check if this is a GitHub raw URL - use direct API instead of browser fallback
     if (url.includes('raw.githubusercontent.com')) {
       console.log(`[EnhancedContentExtractor] Detected GitHub raw URL, using direct API`);
@@ -201,7 +151,7 @@ export class EnhancedContentExtractor {
     try {
       content = await this.extractWithAxios(options);
       console.log(`[EnhancedContentExtractor] Successfully extracted with axios: ${content.length} chars`);
-      
+
       // Validate content quality
       const qualityResult = scoreContentQuality(content);
       if (!qualityResult.isValid) {
@@ -214,14 +164,14 @@ export class EnhancedContentExtractor {
       if (options.sessionId && error instanceof Error && (error.message.includes('404') || error.message.includes('not found'))) {
         sessionRateLimiter.record404(options.sessionId, 'enhanced-content-extractor');
       }
-      
+
       // Check if this looks like a case where browser would help
       if (this.shouldUseBrowser(error, url)) {
         console.log(`[EnhancedContentExtractor] Falling back to headless browser for: ${url}`);
         try {
           content = await this.extractWithBrowser(options);
           console.log(`[EnhancedContentExtractor] Successfully extracted with browser: ${content.length} chars`);
-          
+
           // Validate content quality
           const qualityResult = scoreContentQuality(content);
           if (!qualityResult.isValid) {
@@ -243,7 +193,7 @@ export class EnhancedContentExtractor {
     }
 
     const digest = this.extractResearchInsights(content);
-    
+
     return { content, digest };
   }
 
@@ -291,6 +241,7 @@ export class EnhancedContentExtractor {
       timeout,
       // Remove maxContentLength from axios config - handle truncation manually
       validateStatus: (status: number) => status < 400,
+      ...getAxiosHttpAgentConfig(),
     });
 
     let content = this.parseContent(response.data);

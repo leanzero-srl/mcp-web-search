@@ -55,22 +55,6 @@ import { GitHubExtractor, parseGitHubUrl } from './github-extractor.js';
 import { openAPIExtractor } from './openapi-extractor.js';
 
 // ============================================================================
-// Import Phase 4 modules (Swarm Orchestration)
-// ============================================================================
-
-import { deviceRegistry } from './services/device-registry.js';
-import { aggregateResults, SubtaskResult as SwarmSubtaskResult, aggregateResults as aggregateSwarmResults } from './utils/result-aggregator.js';
-import { swarmSubagent, Subtask as SwarmTask } from './services/swarm-subagent.js';
-import { detectQueryComplexity, decomposeQuery } from './utils/query-complexity-detector.js';
-
-// ============================================================================
-// Import Phase 5 modules (Research Plan Tool)
-// ============================================================================
-
-import { researchPlanManager } from './research-plan-manager.js';
-import { reviewResearch } from './review-research.js';
-
-// ============================================================================
 // Import Phase 3 modules (Intelligence Expansion)
 // ============================================================================
 
@@ -108,7 +92,8 @@ class WebSearchMCPServer {
   }
 
   /**
-   * Helper function to convert errors to McpError with proper codes
+   * Helper function to convert errors to McpError with proper codes.
+   * Returns structured error format for consistent client-side handling.
    */
   private handleError(error: unknown, toolName: string): never {
     console.error(`[MCP] Error in ${toolName}:`, error);
@@ -130,29 +115,36 @@ class WebSearchMCPServer {
 
       if (message.includes('timeout') || message.includes('timed out')) {
         throw new McpError(
-          ERROR_CODES.InternalError,
+          ERROR_CODES.RequestTimeout,
           `Request timeout: ${error.message}`
         );
       }
 
       if (message.includes('not found') || message.includes('404')) {
         throw new McpError(
-          ERROR_CODES.InvalidParams,
+          ERROR_CODES.InvalidRequest,
           `Resource not found: ${error.message}`
         );
       }
 
-      if (message.includes('rate limit') || message.includes('quota')) {
+      if (message.includes('403') || message.includes('forbidden') || message.includes('unauthorized')) {
         throw new McpError(
-          ERROR_CODES.ResourceExhausted,
-          `Rate limit exceeded: ${error.message}`
+          ERROR_CODES.Unauthorized,
+          `Access denied: ${error.message}`
         );
       }
 
-      if (message.includes('unauthorized') || message.includes('401') || message.includes('403')) {
+      if (message.includes('rate limit') || message.includes('too many requests')) {
         throw new McpError(
-          ERROR_CODES.Unauthorized,
-          `Authentication/authorization failed: ${error.message}`
+          ERROR_CODES.ResourceExhausted,
+          `Rate limited: ${error.message}`
+        );
+      }
+
+      if (message.includes('network') || message.includes('connection') || message.includes('dns')) {
+        throw new McpError(
+          ERROR_CODES.ConnectionClosed,
+          `Network error: ${error.message}`
         );
       }
 
@@ -223,32 +215,21 @@ class WebSearchMCPServer {
         try {
           // Convert and validate arguments
           const validatedArgs = this.validateAndConvertArgs(args);
-          
-          // Auto-detect model types based on parameter formats
-          // Llama models often send string parameters and struggle with large responses
-          const isLikelyLlama = typeof args === 'object' && args !== null && (
-            ('limit' in args && typeof (args as Record<string, unknown>).limit === 'string') ||
-            ('includeContent' in args && typeof (args as Record<string, unknown>).includeContent === 'string')
-          );
-          
-          // Detect models that handle large responses well (Qwen, Gemma, recent Deepseek)
-          const isLikelyRobustModel = typeof args === 'object' && args !== null && (
-            ('limit' in args && typeof (args as Record<string, unknown>).limit === 'number') &&
-            ('includeContent' in args && typeof (args as Record<string, unknown>).includeContent === 'boolean')
-          );
-          
-          // Only apply auto-limit if maxContentLength is not explicitly set (including 0)
+
+          // Use explicit client capability hint from environment variable
+          // Set MODEL_CAPABILITY=limited (for models that struggle with large responses)
+          // or MODEL_CAPABILITY=full (default, for models that handle large responses well)
+          const modelCapability = process.env.MODEL_CAPABILITY?.toLowerCase() || 'full';
+          const isLimitedModel = modelCapability === 'limited' || modelCapability === 'low';
+
+          // Only apply auto-limit for models explicitly marked as limited
           const hasExplicitMaxLength = typeof args === 'object' && args !== null && 'maxContentLength' in args;
-          
-          if (!hasExplicitMaxLength && isLikelyLlama) {
-            console.log(`[MCP] Detected potential Llama model (string parameters), applying content length limit`);
-            validatedArgs.maxContentLength = 2000; // Reasonable limit for Llama
-          }
-          
-          // For robust models (Qwen, Gemma, recent Deepseek), remove maxContentLength if it's set to a low value
-          if (isLikelyRobustModel && validatedArgs.maxContentLength && validatedArgs.maxContentLength < 5000) {
-            console.log(`[MCP] Detected robust model (numeric parameters), removing unnecessary content length limit`);
-            validatedArgs.maxContentLength = undefined;
+
+          if (!hasExplicitMaxLength && isLimitedModel) {
+            console.log(`[MCP] Limited model detected (MODEL_CAPABILITY=${modelCapability}), applying content length limit`);
+            validatedArgs.maxContentLength = 2000;
+          } else if (!hasExplicitMaxLength && !isLimitedModel) {
+            console.log(`[MCP] Full capability model, no content length limit applied`);
           }
           
           console.log(`[MCP] Validated args:`, JSON.stringify(validatedArgs, null, 2));
@@ -368,9 +349,10 @@ class WebSearchMCPServer {
 
           console.log(`[MCP] Search summaries completed, found ${summaryResults.length} results`);
           
-          // Format the results as text
-          let responseText = `Search summaries for "${obj.query}" with ${summaryResults.length} results:\n\n`;
-          
+          // Format: structured JSON block + human-readable text for AI-friendly parsing
+          const jsonBlock = `\`\`\`json\n${JSON.stringify(summaryResults, null, 2)}\n\`\`\``;
+          let responseText = `Search summaries for "${obj.query}" with ${summaryResults.length} results:\n\n${jsonBlock}\n\n`;
+
           summaryResults.forEach((summary, i) => {
             responseText += `**${i + 1}. ${summary.title}**\n`;
             responseText += `URL: ${summary.url}\n`;
@@ -442,16 +424,22 @@ class WebSearchMCPServer {
            let body = '';
 
            if (maxContentLength && maxContentLength > 0) {
-             const remainingSpace = maxContentLength - header.length - 50;
-             if (content.length > remainingSpace) {
-               body = `**Content (truncated):**\n${content.substring(0, Math.max(0, remainingSpace))}\n\n[Content truncated to respect limit]`;
+             const availableForContent = maxContentLength - header.length - 50;
+             if (content.length > availableForContent) {
+               body = `**Content (truncated):**\n${content.substring(0, Math.max(0, availableForContent))}\n\n[Content truncated to respect limit]`;
              } else {
                body = `**Content:**\n${content}`;
              }
            } else {
              body = `**Content:**\n${content}`;
            }
-           const responseText = header + body;
+
+           let responseText = header + body;
+
+           // Ensure final response never exceeds maxContentLength
+           if (maxContentLength && maxContentLength > 0 && responseText.length > maxContentLength) {
+             responseText = responseText.substring(0, maxContentLength);
+           }
 
             return {
               content: [
@@ -708,103 +696,117 @@ class WebSearchMCPServer {
 
           const results: Array<{ url: string; filePath: string; success: boolean; error?: string }> = [];
 
-          // Process each URL
-          for (let i = 0; i < urls.length; i++) {
-            const currentUrl = urls[i];
-            console.log(`[MCP] Processing URL ${i + 1}/${urls.length}: ${currentUrl}`);
+          // When appendToExisting is true, process URLs sequentially to avoid race conditions
+          // on the shared output file. Otherwise, use parallel processing with concurrency limit (max 3).
+          const pLimit = await import('p-limit');
+          const concurrencyLimit = appendToExisting ? 1 : 3;
+          const limit = pLimit.default(concurrencyLimit);
 
-            try {
-              // Extract content with retry
-              const extractionResult = await extractContentWithRetry(currentUrl, sessionId);
-              
-              let { content, digest } = extractionResult;
-              
-              if (!content || content.trim().length === 0) {
-                throw new Error('Extracted content is empty');
-              }
+          if (appendToExisting) {
+            console.log(`[MCP] Sequential processing enabled (appendToExisting=true) to avoid file write races`);
+          }
 
-              // Sanitize content
-              content = sanitizeContent(content, currentUrl);
+          // Progress tracking for batch operations
+          let completedCount = 0;
+          const totalUrls = urls.length;
 
-              // Apply content length limit if specified
-              if (maxContentLength && maxContentLength > 0) {
-                if (content.length > maxContentLength) {
-                  content = content.substring(0, maxContentLength) + '\n\n[Content truncated to respect limit]';
+          const processingTasks = urls.map((currentUrl, index) =>
+            limit(async () => {
+              completedCount++;
+              console.log(`[MCP] Processing URL ${completedCount}/${totalUrls}: ${currentUrl}`);
+
+              try {
+                // Extract content with retry
+                const extractionResult = await extractContentWithRetry(currentUrl, sessionId);
+
+                let { content, digest } = extractionResult;
+
+                if (!content || content.trim().length === 0) {
+                  throw new Error('Extracted content is empty');
                 }
-              }
 
-              // Prepare metadata
-              const urlObj = new URL(currentUrl);
-              const displayTitle = `${urlObj.hostname}${urlObj.pathname.replace(/\/$/, '')}`;
-              
-              // Create slug for filename
-              const dateSlug = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
-              const urlSlug = currentUrl.replace(/[^a-z0-9]/gi, '-').toLowerCase().substring(0, 50);
-              const prefix = filenamePrefix ? `${filenamePrefix}-` : '';
-              const filename = `${prefix}research-${dateSlug}-${urlSlug}.md`;
-              const filePath = path.join(outputDir, filename);
+                // Sanitize content
+                content = sanitizeContent(content, currentUrl);
 
-              // Calculate metadata
-              const wordCount = content.split(/\s+/).filter(w => w.length > 0).length;
-              const readingTime = calculateReadingTime(content);
-              const qualityScore = calculateQualityScore(content, digest);
-
-              // Prepare digest data for template
-              const entities = digest?.entities || [];
-              const claims = digest?.claims || [];
-              const keyTerms = digest?.keyTerms || [];
-
-              // Build Markdown content
-              let mdContent: string;
-
-              if (customTemplate) {
-                // Use custom template
-                mdContent = renderTemplate(customTemplate, {
-                  title: displayTitle,
-                  url: currentUrl,
-                  timestamp,
-                  wordCount,
-                  readingTime,
-                  qualityScore,
-                  entities,
-                  claims,
-                  keyTerms,
-                  content
-                });
-              } else {
-                // Use default template
-                mdContent = `# Research Report: ${displayTitle}\n\n`;
-                mdContent += `**Source URL:** ${currentUrl}\n`;
-                mdContent += `**Research Timestamp:** ${timestamp}\n`;
-                mdContent += `**Word Count:** ${wordCount}\n`;
-                mdContent += `**Reading Time:** ${readingTime}\n`;
-                mdContent += `**Quality Score:** ${qualityScore}/100\n\n`;
-
-                if (digest) {
-                  mdContent += `## 🧠 Research Digest\n\n`;
-
-                  mdContent += `### 🔍 Entities\n`;
-                  if (digest.entities && digest.entities.length > 0) {
-                    mdContent += `- ${digest.entities.join('\n- ')}\n`;
-                  } else {
-                    mdContent += `*None detected*\n`;
+                // Apply content length limit if specified
+                if (maxContentLength && maxContentLength > 0) {
+                  if (content.length > maxContentLength) {
+                    content = content.substring(0, maxContentLength) + '\n\n[Content truncated to respect limit]';
                   }
-                  mdContent += '\n';
+                }
 
-                  mdContent += `### 📢 Key Claims\n`;
-                  if (digest.claims && digest.claims.length > 0) {
-                    mdContent += `- ${digest.claims.join('\n- ')}\n`;
-                  } else {
-                    mdContent += `*None detected*\n`;
-                  }
-                  mdContent += '\n';
+                // Prepare metadata
+                const urlObj = new URL(currentUrl);
+                const displayTitle = `${urlObj.hostname}${urlObj.pathname.replace(/\/$/, '')}`;
 
-                  mdContent += `### 🔑 Key Terms\n`;
-                  if (digest.keyTerms && digest.keyTerms.length > 0) {
-                    mdContent += `- ${digest.keyTerms.join('\n- ')}\n`;
-                  } else {
-                    mdContent += `*None detected*\n`;
-                  }
+                // Create slug for filename
+                const dateSlug = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+                const urlSlug = currentUrl.replace(/[^a-z0-9]/gi, '-').toLowerCase().substring(0, 50);
+                const prefix = filenamePrefix ? `${filenamePrefix}-` : '';
+                const filename = `${prefix}research-${dateSlug}-${urlSlug}.md`;
+                const filePath = path.join(outputDir, filename);
+
+                // Calculate metadata
+                const wordCount = content.split(/\s+/).filter(w => w.length > 0).length;
+                const readingTime = calculateReadingTime(content);
+                const qualityScore = calculateQualityScore(content, digest);
+
+                // Prepare digest data for template
+                const entities = digest?.entities || [];
+                const claims = digest?.claims || [];
+                const keyTerms = digest?.keyTerms || [];
+
+                // Build Markdown content
+                let mdContent: string;
+
+                if (customTemplate) {
+                  // Use custom template
+                  mdContent = renderTemplate(customTemplate, {
+                    title: displayTitle,
+                    url: currentUrl,
+                    timestamp,
+                    wordCount,
+                    readingTime,
+                    qualityScore,
+                    entities,
+                    claims,
+                    keyTerms,
+                    content
+                  });
+                } else {
+                  // Use default template
+                  mdContent = `# Research Report: ${displayTitle}\n\n`;
+                  mdContent += `**Source URL:** ${currentUrl}\n`;
+                  mdContent += `**Research Timestamp:** ${timestamp}\n`;
+                  mdContent += `**Word Count:** ${wordCount}\n`;
+                  mdContent += `**Reading Time:** ${readingTime}\n`;
+                  mdContent += `**Quality Score:** ${qualityScore}/100\n\n`;
+
+                  if (digest) {
+                    mdContent += `## 🧠 Research Digest\n\n`;
+
+                    mdContent += `### 🔍 Entities\n`;
+                    if (digest.entities && digest.entities.length > 0) {
+                      mdContent += `- ${digest.entities.join('\n- ')}\n`;
+                    } else {
+                      mdContent += `*None detected*\n`;
+                    }
+                    mdContent += '\n';
+
+                    mdContent += `### 📢 Key Claims\n`;
+                    if (digest.claims && digest.claims.length > 0) {
+                      mdContent += `- ${digest.claims.join('\n- ')}\n`;
+                    } else {
+                      mdContent += `*None detected*\n`;
+                    }
+                    mdContent += '\n';
+
+                    mdContent += `### 🔑 Key Terms\n`;
+                    if (digest.keyTerms && digest.keyTerms.length > 0) {
+                      mdContent += `- ${digest.keyTerms.join('\n- ')}\n`;
+                    } else {
+                      mdContent += `*None detected*\n`;
+                    }
                   mdContent += '\n';
                 }
 
@@ -813,33 +815,40 @@ class WebSearchMCPServer {
                 mdContent += content + '\n';
               }
 
-              // Handle appendToExisting
+              // Handle appendToExisting (note: parallel + append is best-effort due to race conditions)
               let finalFilePath = filePath;
               if (appendToExisting) {
                 const existingFilePath = findExistingResearchFile(outputDir, filenamePrefix);
                 if (existingFilePath) {
-                  // Append to existing file
                   const separator = '\n\n---\n\n';
-                  const existingContent = fs.readFileSync(existingFilePath, 'utf8');
-                  fs.writeFileSync(existingFilePath, existingContent + separator + mdContent, 'utf8');
+                  const existingContent = await fs.promises.readFile(existingFilePath, 'utf8');
+                  await fs.promises.writeFile(existingFilePath, existingContent + separator + mdContent, 'utf8');
                   finalFilePath = existingFilePath;
                   console.log(`[MCP] Successfully appended research to existing file: ${existingFilePath}`);
                 } else {
-                  // No existing file, create new one
-                  fs.writeFileSync(filePath, mdContent, 'utf8');
+                  await fs.promises.writeFile(filePath, mdContent, 'utf8');
                   console.log(`[MCP] Successfully saved research to: ${filePath}`);
                 }
               } else {
-                // Default behavior - write new file
-                fs.writeFileSync(filePath, mdContent, 'utf8');
+                await fs.promises.writeFile(filePath, mdContent, 'utf8');
                 console.log(`[MCP] Successfully saved research to: ${filePath}`);
               }
 
-              results.push({ url: currentUrl, filePath: finalFilePath, success: true });
+              return { url: currentUrl, filePath: finalFilePath, success: true as const };
             } catch (error) {
               const errorMessage = error instanceof Error ? error.message : String(error);
               console.error(`[MCP] Failed to process ${currentUrl}: ${errorMessage}`);
-              results.push({ url: currentUrl, filePath: '', success: false, error: errorMessage });
+              return { url: currentUrl, filePath: '', success: false as const, error: errorMessage };
+            }
+          }));
+
+          // Wait for all processing tasks to complete
+          const taskResults = await Promise.allSettled(processingTasks);
+          for (const settled of taskResults) {
+            if (settled.status === 'fulfilled') {
+              results.push(settled.value);
+            } else {
+              results.push({ url: '', filePath: '', success: false, error: settled.reason?.message || 'Unknown error' });
             }
           }
 
@@ -848,7 +857,7 @@ class WebSearchMCPServer {
           const failedResults = results.filter(r => !r.success);
 
           let responseText = `Research complete! Processed ${results.length} URL(s).\n\n`;
-          
+
           if (successfulResults.length > 0) {
             responseText += `**✅ Successful (${successfulResults.length}):**\n`;
             successfulResults.forEach(r => {
@@ -856,7 +865,7 @@ class WebSearchMCPServer {
             });
             responseText += '\n';
           }
-          
+
           if (failedResults.length > 0) {
             responseText += `**❌ Failed (${failedResults.length}):**\n`;
             failedResults.forEach(r => {
@@ -884,6 +893,8 @@ class WebSearchMCPServer {
       'Discover all available page URLs on a website by reading its sitemap.xml file. This is the RECOMMENDED FIRST STEP when you have a specific domain URL (e.g., https://company.com). If this tool returns a large number of URLs, it is highly recommended to use filter-sitemap-urls as your next step to narrow down high-value pages before attempting content extraction, as extracting all URLs directly may exceed context limits and reduce precision.',
       {
         url: z.string().url().describe('The base URL of the website to discover the sitemap for (e.g., https://example.com)'),
+        offset: z.number().optional().default(0).describe('Starting index for pagination (default: 0)'),
+        limit: z.number().optional().default(100).describe('Maximum number of URLs to return per page (default: 100, max: 500)'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-website-sitemap`);
@@ -899,10 +910,23 @@ class WebSearchMCPServer {
             throw new Error('Invalid arguments: url is required and must be a string');
           }
 
-          console.log(`[MCP] Starting sitemap discovery for: ${obj.url}`);
-          const urls = await fetchSitemapUrls(obj.url);
+          // Parse pagination params
+          let offset = 0;
+          if (obj.offset !== undefined) {
+            const offsetVal = typeof obj.offset === 'string' ? parseInt(obj.offset, 10) : obj.offset;
+            offset = typeof offsetVal === 'number' && !isNaN(offsetVal) && offsetVal >= 0 ? offsetVal : 0;
+          }
 
-          if (urls.length === 0) {
+          let limit = 100;
+          if (obj.limit !== undefined) {
+            const limitVal = typeof obj.limit === 'string' ? parseInt(obj.limit, 10) : obj.limit;
+            limit = typeof limitVal === 'number' && !isNaN(limitVal) && limitVal > 0 ? Math.min(limitVal, 500) : 100;
+          }
+
+          console.log(`[MCP] Starting sitemap discovery for: ${obj.url} (offset=${offset}, limit=${limit})`);
+          const allUrls = await fetchSitemapUrls(obj.url);
+
+          if (allUrls.length === 0) {
             return {
               content: [
                 {
@@ -913,25 +937,35 @@ class WebSearchMCPServer {
             };
           }
 
-          console.log(`[MCP] Sitemap discovery completed, found ${urls.length} URLs`);
+          // Apply pagination
+          const totalPages = Math.ceil(allUrls.length / limit);
+          const currentPage = Math.floor(offset / limit) + 1;
+          const paginatedUrls = allUrls.slice(offset, offset + limit);
+
+          console.log(`[MCP] Sitemap discovery completed, found ${allUrls.length} total URLs (showing page ${currentPage}/${totalPages})`);
 
           let responseText = `**Sitemap Discovery Results for: ${obj.url}**\n\n`;
-          responseText += `**Total URLs Found:** ${urls.length}\n\n`;
+          responseText += `**Total URLs:** ${allUrls.length}\n`;
+          responseText += `**Page:** ${currentPage}/${totalPages} (showing ${paginatedUrls.length} URLs)\n\n`;
           responseText += `**URLs:**\n`;
-          
-          // Return first 100 URLs to avoid overwhelming the agent, or all if less than 100
-          const displayUrls = urls.slice(0, 100);
-          displayUrls.forEach((url, idx) => {
-            responseText += `${idx + 1}. ${url}\n`;
+
+          paginatedUrls.forEach((url, idx) => {
+            responseText += `${idx + 1 + offset}. ${url}\n`;
           });
 
-          // Tiered Guidance based on URL count
-          if (urls.length > 100) {
-            responseText += `\n... and ${urls.length - 100} more URLs.\n\n⚠️ **Observation:** This website contains a large number of URLs (${urls.length}). Extracting all of them directly would likely exceed context limits and reduce result precision. To efficiently locate specific information, it is recommended to use the 'filter-sitemap-urls' tool with targeted keywords (e.g., ['about', 'company', 'strategy']) before proceeding with content extraction. This narrows the scope to high-value pages.\n`;
-          } else if (urls.length > 20) {
-            responseText += `\n... and ${urls.length - 100} more URLs.\n\nℹ️ **Note:** The site has a moderate number of URLs (${urls.length}). For better efficiency, consider using 'filter-sitemap-urls' to target specific sections, or proceed with selecting the most relevant pages for extraction.\n`;
+          // Pagination hints
+          if (currentPage < totalPages) {
+            const nextOffset = offset + limit;
+            responseText += `\n💡 **Next page:** Use offset=${nextOffset} to see more URLs.\n`;
+          }
+
+          // Tiered Guidance based on total URL count
+          if (allUrls.length > 100) {
+            responseText += `\n⚠️ **Observation:** This website contains ${allUrls.length} URLs. Consider using 'filter-sitemap-urls' with targeted keywords to narrow down high-value pages.\n`;
+          } else if (allUrls.length > 20) {
+            responseText += `\nℹ️ **Note:** The site has ${allUrls.length} URLs. Consider using 'filter-sitemap-urls' to target specific sections.\n`;
           } else {
-            responseText += `\n\n💡 **Suggestion:** With only ${urls.length} URLs found, you can proceed directly to extracting content from the most promising pages without needing to filter extensively.\n`;
+            responseText += `\n💡 **Suggestion:** With only ${allUrls.length} URLs, you can proceed directly to content extraction.\n`;
           }
 
           return {
@@ -955,17 +989,31 @@ class WebSearchMCPServer {
       {
         url: z.string().url().describe('The base URL of the website'),
         keywords: z.array(z.string()).describe('Keywords to look for in URLs (e.g., ["about", "strategy", "mission"])'),
-        limit: z.number().optional().default(20).describe('Maximum number of matching URLs to return'),
+        offset: z.number().optional().default(0).describe('Starting index for pagination (default: 0)'),
+        limit: z.number().optional().default(20).describe('Maximum number of matching URLs to return (default: 20, max: 200)'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: filter-sitemap-urls`);
         try {
           if (typeof args !== 'object' || args === null) throw new Error('Invalid arguments');
           const obj = args as Record<string, any>;
-          
-          console.log(`[MCP] Filtering sitemap for ${obj.url} with keywords: ${obj.keywords.join(', ')}`);
+
+          // Parse pagination params
+          let offset = 0;
+          if (obj.offset !== undefined) {
+            const offsetVal = typeof obj.offset === 'string' ? parseInt(obj.offset, 10) : obj.offset;
+            offset = typeof offsetVal === 'number' && !isNaN(offsetVal) && offsetVal >= 0 ? offsetVal : 0;
+          }
+
+          let limit = 20;
+          if (obj.limit !== undefined) {
+            const limitVal = typeof obj.limit === 'string' ? parseInt(obj.limit, 10) : obj.limit;
+            limit = typeof limitVal === 'number' && !isNaN(limitVal) && limitVal > 0 ? Math.min(limitVal, 200) : 20;
+          }
+
+          console.log(`[MCP] Filtering sitemap for ${obj.url} with keywords: ${obj.keywords.join(', ')} (offset=${offset}, limit=${limit})`);
           const allUrls = await fetchSitemapUrls(obj.url);
-          
+
           if (allUrls.length === 0) {
             return { content: [{ type: 'text', text: `No URLs found in sitemap for ${obj.url}` }] };
           }
@@ -982,17 +1030,28 @@ class WebSearchMCPServer {
           .filter(item => item.score > 0)
           .sort((a, b) => b.score - a.score);
 
-          const filtered = scoredUrls.slice(0, obj.limit || 20).map(i => i.url);
+          const totalMatches = scoredUrls.length;
+          const filtered = scoredUrls.slice(offset, offset + limit).map(i => i.url);
 
-          if (filtered.length === 0) {
+          if (filtered.length === 0 && offset === 0) {
             return { content: [{ type: 'text', text: `No URLs matched the keywords for ${obj.url}. Found ${allUrls.length} total URLs.` }] };
           }
 
-          let responseText = `**Filtered Sitemap Results for: ${obj.url}**\n`;
-          responseText += `Found ${filtered.length} high-value pages matching your keywords (out of ${allUrls.length} total):\n\n`;
+          // Pagination info
+          const totalPages = Math.ceil(totalMatches / limit);
+          const currentPage = Math.floor(offset / limit) + 1;
+
+          let responseText = `**Filtered Sitemap Results for: ${obj.url}**\n\n`;
+          responseText += `**Total Matches:** ${totalMatches}\n`;
+          responseText += `**Page:** ${currentPage}/${totalPages} (showing ${filtered.length} URLs)\n\n`;
           filtered.forEach((url, idx) => {
-            responseText += `${idx + 1}. ${url}\n`;
+            responseText += `${idx + 1 + offset}. ${url}\n`;
           });
+
+          if (currentPage < totalPages) {
+            const nextOffset = offset + limit;
+            responseText += `\n💡 **Next page:** Use offset=${nextOffset} to see more results.\n`;
+          }
 
           return { content: [{ type: 'text', text: responseText }] };
         } catch (error) {
@@ -1567,255 +1626,6 @@ class WebSearchMCPServer {
       }
     );
 
-    // Register the swarm-web-research tool (multi-device orchestration with LM Link)
-    this.server.tool(
-      'swarm-web-research',
-      'Distribute web research across LM Link connected devices for complex queries. Automatically detects query complexity and routes to single device or multi-device swarm. Use this for comprehensive research that benefits from parallel exploration across multiple devices.',
-      {
-        query: z.string().describe('Research query to execute across devices'),
-        maxSubtasks: z.number().optional().default(5).describe('Maximum number of parallel subtasks to spawn per device (1-8)'),
-      },
-      async (args: unknown) => {
-        console.log(`[MCP] Tool call received: swarm-web-research`);
-        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
-
-        try {
-          if (typeof args !== 'object' || args === null) {
-            throw new Error('Invalid arguments: args must be an object');
-          }
-          const obj = args as Record<string, unknown>;
-
-          if (!obj.query || typeof obj.query !== 'string') {
-            throw new Error('Invalid arguments: query is required and must be a string');
-          }
-
-          // Zod already validates and converts maxSubtasks
-          let maxSubtasks = (obj.maxSubtasks as number) ?? 5;
-          maxSubtasks = Math.max(1, Math.min(8, maxSubtasks));
-
-          const query = obj.query as string;
-          
-          console.log(`[MCP] Starting swarm web research for: "${query.substring(0, 50)}..."`);
-          console.log(`[MCP] Max subtasks: ${maxSubtasks}`);
-
-          // Detect query complexity
-          const analysis = detectQueryComplexity(query);
-          
-          if (!analysis.hasParallelIndicators || analysis.type === 'simple') {
-            console.log(`[MCP] Query detected as simple, using single device execution`);
-            
-            // Use existing search engine for simple queries
-            const searchResponse = await this.searchEngine.search({
-              query,
-              numResults: 5,
-            });
-            
-            if (searchResponse.results.length === 0) {
-              return {
-                content: [{
-                  type: 'text' as const,
-                  text: `No results found for: "${query}"`
-                }]
-              };
-            }
-
-            // Extract content
-            const sessionId = this.generateSessionId();
-            const enhancedResults = await this.contentExtractor.extractContentForResults(
-              searchResponse.results.slice(0, 3),
-              1,
-              undefined,
-              sessionId
-            );
-
-            let responseText = `**Single Device Research Results for: "${query}"**\n\n`;
-            responseText += `**Complexity:** Simple (single device)\n`;
-            responseText += `**Results:** ${enhancedResults.length}\n\n`;
-
-            enhancedResults.forEach((result, idx) => {
-              responseText += `**${idx + 1}. ${result.title}**\n`;
-              responseText += `URL: ${result.url}\n`;
-              
-              if (result.fullContent && result.fullContent.trim()) {
-                let content = result.fullContent;
-                if (content.length > 3000) {
-                  content = content.substring(0, 3000) + `\n\n[Content truncated]`;
-                }
-                responseText += `\n**Content:**\n${content}\n`;
-              }
-              
-              responseText += `\n---\n\n`;
-            });
-
-            return {
-              content: [{
-                type: 'text' as const,
-                text: responseText
-              }]
-            };
-          }
-
-          // Complex query - use swarm orchestration
-          console.log(`[MCP] Query detected as complex, using multi-device swarm`);
-
-          // Discover available devices via LM Link
-          const devices = await deviceRegistry.getOnlineDevices();
-          
-          if (devices.length < 2) {
-            console.log(`[MCP] Insufficient devices for swarm (${devices.length}), falling back to single device`);
-            
-            // Fallback to single device
-            return this.handleSwarmFallback(query, maxSubtasks);
-          }
-
-          // Determine optimal number of devices
-          const numDevices = await deviceRegistry.getOptimalDeviceCount(query);
-          console.log(`[MCP] Using ${numDevices} device(s) for swarm`);
-
-          // Decompose query into subtasks
-          const subtasks = decomposeQuery(query).slice(0, maxSubtasks);
-          console.log(`[MCP] Decomposed into ${subtasks.length} subtask(s)`);
-
-          // Spawn subagents in parallel across selected devices
-          const results: SwarmSubtaskResult[] = [];
-          
-          for (let i = 0; i < Math.min(subtasks.length, numDevices); i++) {
-            const deviceId = devices[i]?.id || 'device-local';
-            const subtask = subtasks[i] || { id: `task-${i + 1}`, query };
-            
-            console.log(`[MCP] Spawning subagent ${subtask.id} on device ${deviceId}`);
-            
-            // Execute subtask
-            const result = await swarmSubagent.execute({
-              id: subtask.id,
-              query: subtask.query,
-              deviceId
-            });
-            
-            results.push(result);
-          }
-
-          // Aggregate results
-          const aggregated = aggregateSwarmResults(results);
-
-          console.log(`[MCP] Swarm research completed. Devices used: ${aggregated.devicesUsed.length}, Total tokens: ${aggregated.tokenCount}`);
-
-          // Format response
-          let responseText = `**Swarm Web Research Results for: "${query}"**\n\n`;
-          responseText += `**Complexity:** Complex (multi-device swarm)\n`;
-          responseText += `**Devices Used:** ${aggregated.devicesUsed.length}\n`;
-          responseText += `**Subtasks Completed:** ${aggregated.subtasksCompleted}\n`;
-          responseText += `**Subtasks Failed:** ${aggregated.subtasksFailed}\n`;
-          responseText += `**Total Tokens:** ~${aggregated.tokenCount}\n\n`;
-
-          // Add aggregated content (truncated if needed)
-          const maxContentLength = parseInt(process.env.SWARM_RESULT_BUDGET || '15000', 10);
-          
-          let aggregatedContent = aggregated.content;
-          if (aggregatedContent.length > maxContentLength) {
-            aggregatedContent = aggregatedContent.substring(0, maxContentLength) + 
-              `\n\n[Aggregated content truncated at ${maxContentLength} characters]`;
-          }
-          
-          responseText += `---\n\n**Aggregated Results:**\n\n${aggregatedContent}\n`;
-
-          return {
-            content: [{
-              type: 'text' as const,
-              text: responseText
-            }]
-          };
-        } catch (error) {
-          this.handleError(error, 'swarm-web-research');
-        }
-      }
-    );
-
-    // Register the list-devices tool (LM Link device discovery)
-    this.server.tool(
-      'list-devices',
-      'List all LM Link connected devices and their status. Shows online/offline status, hardware tier, capabilities, and current load statistics. Use this to verify device availability before running swarm orchestration tasks.',
-      {
-        includeLoadStats: z.boolean().optional().default(true).describe('Include current load statistics for each device'),
-        filterByCapability: z.string().optional().default('none').describe('Filter devices by capability (vision, toolUse, or none)'),
-      },
-      async (args: unknown) => {
-        console.log(`[MCP] Tool call received: list-devices`);
-        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
-
-        try {
-          // Zod already validates and converts these types
-          const includeLoadStats = (args as Record<string, unknown>).includeLoadStats as boolean ?? true;
-          const filterByCapability = ((args as Record<string, unknown>).filterByCapability as string) ?? 'none';
-
-          console.log(`[MCP] Listing devices, includeLoadStats: ${includeLoadStats}, filterByCapability: ${filterByCapability}`);
-
-          // Get all online devices
-          const devices = await deviceRegistry.getOnlineDevices();
-          
-          let filteredDevices = devices;
-          
-          // Note: capabilities filtering not implemented in simplified DeviceInfo
-          // In production with full LM Link, this would check device.modelCapabilities
-          filteredDevices = devices;
-
-          const totalDevices = devices.length;
-          const onlineCount = filteredDevices.filter(d => d.status === 'online').length;
-          const offlineCount = filteredDevices.filter(d => d.status === 'offline').length;
-
-          let responseText = `## LM Link Connected Devices\n\n`;
-          responseText += `**Total Devices:** ${totalDevices}\n`;
-          responseText += `**Online:** ${onlineCount}\n`;
-          responseText += `**Offline/Unavailable:** ${offlineCount}\n\n`;
-
-          if (filteredDevices.length === 0) {
-            responseText += `No devices found matching the criteria.\n`;
-          } else {
-            responseText += `\n| # | Device ID | Name | Status | Tier | Models Loaded |\n`;
-            responseText += `|---|-----------|------|--------|------|---------------|\n`;
-
-            filteredDevices.forEach((device, idx) => {
-              const modelCount = device.models ? Object.keys(device.models).length : 0;
-              let statusEmoji = device.status === 'offline' ? '🔴' : '🟢';
-
-              responseText += `| ${idx + 1} | ${device.id} | ${statusEmoji} ${device.name} | ${device.status} | ${device.tier || 'unknown'} | ${modelCount} |\n`;
-            });
-          }
-
-          if (includeLoadStats && filteredDevices.length > 0) {
-            responseText += `\n## Load Statistics\n\n`;
-
-            filteredDevices.forEach(device => {
-              const loadInfo = device.load;
-              if (!loadInfo) return;
-
-              responseText += `### ${device.name}\n`;
-              responseText += `- Active Requests: ${loadInfo.activeRequests || 0}\n`;
-              responseText += `- Total Today: ${loadInfo.totalToday || 0}\n`;
-              
-              if (loadInfo.cooldownUntil) {
-                const cooldownMs = new Date(loadInfo.cooldownUntil).getTime() - Date.now();
-                if (cooldownMs > 0) {
-                  responseText += `- Cooldown: ${(cooldownMs / 1000).toFixed(1)}s remaining\n`;
-                }
-              }
-              
-              responseText += `\n`;
-            });
-          }
-
-          return {
-            content: [{
-              type: 'text' as const,
-              text: responseText
-            }]
-          };
-        } catch (error) {
-          this.handleError(error, 'list-devices');
-        }
-      }
-    );
-
     // Register the list-cached-documents tool
     this.server.tool(
       'list-cached-documents',
@@ -1897,10 +1707,6 @@ class WebSearchMCPServer {
         }
       }
     );
-
-    // Register research plan tools (Phase 5)
-    this.setupCreateResearchPlanTool();
-    this.setupReviewResearchTool();
   }
 
   private validateAndConvertArgs(args: unknown): WebSearchToolInput {
@@ -2133,65 +1939,6 @@ class WebSearchMCPServer {
     });
   }
 
-  /**
-   * Fallback handler for when insufficient devices are available for swarm orchestration
-   */
-  private handleSwarmFallback(query: string, maxSubtasks: number): any {
-    console.log(`[MCP] Fallback: single device execution for complex query`);
-    
-    // Use existing search engine for fallback
-    return this.searchEngine.search({
-      query,
-      numResults: Math.min(maxSubtasks + 2, 5),
-    }).then(searchResponse => {
-      if (searchResponse.results.length === 0) {
-        return {
-          content: [{
-            type: 'text' as const,
-            text: `No results found for: "${query}"`
-          }]
-        };
-      }
-
-      // Extract content
-      const sessionId = this.generateSessionId();
-      
-      return this.contentExtractor.extractContentForResults(
-        searchResponse.results.slice(0, 3),
-        1,
-        undefined,
-        sessionId
-      ).then(enhancedResults => {
-        let responseText = `**Single Device Research Results (Fallback) for: "${query}"**\n\n`;
-        responseText += `**Complexity:** Complex query (fallback to single device)\n`;
-        responseText += `**Devices Available:** < 2\n`;
-        responseText += `**Results:** ${enhancedResults.length}\n\n`;
-
-        enhancedResults.forEach((result, idx) => {
-          responseText += `**${idx + 1}. ${result.title}**\n`;
-          responseText += `URL: ${result.url}\n`;
-          
-          if (result.fullContent && result.fullContent.trim()) {
-            let content = result.fullContent;
-            if (content.length > 3000) {
-              content = content.substring(0, 3000) + `\n\n[Content truncated]`;
-            }
-            responseText += `\n**Content:**\n${content}\n`;
-          }
-          
-          responseText += `\n---\n\n`;
-        });
-
-        return {
-          content: [{
-            type: 'text' as const,
-            text: responseText
-          }]
-        };
-      });
-    });
-  }
-
   async run(): Promise<void> {
     console.log('Setting up MCP server...');
     const transport = new StdioServerTransport();
@@ -2201,163 +1948,6 @@ class WebSearchMCPServer {
     console.log('Web Search MCP Server started');
     console.log('Server timestamp:', new Date().toISOString());
     console.log('Waiting for MCP messages...');
-  }
-
-  /**
-   * Create Research Plan Tool
-   * Orchestrates distributed research across devices and returns tiny index (not full synthesis)
-   */
-  private setupCreateResearchPlanTool(): void {
-    this.server.tool(
-      'create-research-plan',
-      'Create a distributed research plan that decomposes complex queries, assigns subtasks to devices, and executes parallel research. Returns a tiny index with file paths, metadata, and next steps - NOT a full synthesis. The .md files contain the actual research; this tool returns an index for the orchestrator to navigate.',
-      {
-        query: z.string().describe('Complex research query to plan and execute'),
-        maxDevices: z.number().optional().default(3).describe('Maximum number of devices to use (1-5)'),
-        includeExistingContext: z.boolean().optional().default(true).describe('Read existing research files for context before new searches'),
-        saveToFile: z.boolean().optional().default(true).describe('Save results to docs/research-output/ directory'),
-      },
-      async (args: unknown) => {
-        console.log(`[MCP] Tool call received: create-research-plan`);
-        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
-
-        try {
-          const validatedArgs = args as Record<string, unknown>;
-
-          if (!validatedArgs.query || typeof validatedArgs.query !== 'string') {
-            throw new Error('query is required and must be a string');
-          }
-
-          const query = validatedArgs.query;
-          const maxDevices = (validatedArgs.maxDevices as number) ?? 3;
-          const includeExistingContext = (validatedArgs.includeExistingContext as boolean) ?? true;
-          const saveToFile = (validatedArgs.saveToFile as boolean) ?? true;
-
-          // Clamp maxDevices
-          const clampedMaxDevices = Math.min(Math.max(1, maxDevices), 5);
-
-          console.log(`[MCP] Creating research plan for: "${query.substring(0, 60)}..."`);
-          console.log(`[MCP] Max devices: ${clampedMaxDevices}`);
-
-          // Create the research plan
-          const index = await researchPlanManager.createPlan(query, {
-            maxDevices: clampedMaxDevices,
-            saveToFile,
-          });
-
-          // Return tiny index (metadata only, not full content)
-          let responseText = `## Research Plan Created\n\n` +
-            `**Plan ID:** ${index.planId}\n` +
-            `**Query:** ${index.query}\n\n` +
-            `### Summary\n` +
-            `- **Files Created:** ${index.summary.totalFiles}\n` +
-            `- **Total Words:** ${index.summary.totalWords}\n` +
-            `- **Estimated Index Tokens:** ~${index.summary.estimatedTokens} (tiny index, not full content)\n` +
-            `- **Coverage:** ${index.summary.coverage || 'unknown'}\n\n` +
-            `### Devices Used\n${index.devicesUsed.map(d => `- ${d}`).join('\n')}\n\n` +
-            `### Files Index\n`;
-
-          for (const file of index.files) {
-            responseText += `\n**File:** \`${path.basename(file.path)}\`\n` +
-              `- Word Count: ${file.wordCount}\n` +
-              `- Quality Score: ${file.qualityScore}/100\n` +
-              `- Entities Found: ${file.entitiesFound.slice(0, 5).join(', ')}${file.entitiesFound.length > 5 ? '...' : ''}\n`;
-          }
-
-          responseText += `\n### Next Steps\n`;
-          for (const step of index.nextSteps) {
-            responseText += `- ${step}\n`;
-          }
-
-          return {
-            content: [{
-              type: 'text' as const,
-              text: responseText
-            }]
-          };
-        } catch (error) {
-          this.handleError(error, 'create-research-plan');
-        }
-      }
-    );
-  }
-
-  /**
-   * Review Research Tool
-   * Compares research files against original prompt to identify gaps and quality issues
-   */
-  private setupReviewResearchTool(): void {
-    this.server.tool(
-      'review-research',
-      'Review completed research plans against the original query. Identifies gaps, low-quality results, and provides recommendations for improvement. Use this to verify that research covered all aspects of the original prompt before proceeding.',
-      {
-        planId: z.string().describe('The plan ID to review (e.g., "plan-20260414-abc123")'),
-        compareWithPrompt: z.boolean().optional().default(true).describe('Compare research against original prompt for completeness'),
-        minimumQualityScore: z.number().optional().default(60).describe('Minimum acceptable quality score per file (0-100)'),
-      },
-      async (args: unknown) => {
-        console.log(`[MCP] Tool call received: review-research`);
-        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
-
-        try {
-          const validatedArgs = args as Record<string, unknown>;
-
-          if (!validatedArgs.planId || typeof validatedArgs.planId !== 'string') {
-            throw new Error('planId is required and must be a string');
-          }
-
-          const planId = validatedArgs.planId;
-          const compareWithPrompt = (validatedArgs.compareWithPrompt as boolean) ?? true;
-          const minimumQualityScore = (validatedArgs.minimumQualityScore as number) ?? 60;
-
-          // Clamp minimumQualityScore
-          const clampedMinScore = Math.min(Math.max(1, minimumQualityScore), 100);
-
-          console.log(`[MCP] Reviewing research plan: ${planId}`);
-
-          // Perform the review
-          const reviewResult = await reviewResearch.review(planId, {
-            compareWithPrompt,
-            minimumQualityScore: clampedMinScore,
-          });
-
-          // Return formatted review report
-          let responseText = `## Research Review Report\n\n` +
-            `**Plan ID:** ${reviewResult.planId}\n` +
-            `**Query:** ${reviewResult.query}\n` +
-            `**Overall Quality Score:** ${reviewResult.qualityScore}/100\n` +
-            `**Files Reviewed:** ${reviewResult.filesReviewed.length}\n\n` +
-            `### Assessment\n${reviewResult.overallAssessment}\n\n`;
-
-          if (reviewResult.gapsFound.length > 0) {
-            responseText += `### Gaps Found (${reviewResult.gapsFound.length})\n`;
-
-            for (const gap of reviewResult.gapsFound) {
-              const severityEmoji = gap.severity === 'high' ? '🔴' : gap.severity === 'medium' ? '🟡' : '🟢';
-              responseText += `\n**${severityEmoji} [${gap.type}]** ${gap.description}\n` +
-                `- Severity: ${gap.severity}\n` +
-                `- Suggestion: ${gap.suggestion}\n`;
-            }
-          }
-
-          if (reviewResult.recommendations.length > 0) {
-            responseText += `\n### Recommendations\n`;
-            for (const rec of reviewResult.recommendations) {
-              responseText += `- ${rec}\n`;
-            }
-          }
-
-          return {
-            content: [{
-              type: 'text' as const,
-              text: responseText
-            }]
-          };
-        } catch (error) {
-          this.handleError(error, 'review-research');
-        }
-      }
-    );
   }
 }
 

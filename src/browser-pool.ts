@@ -9,20 +9,54 @@ export class BrowserPool {
   private headless: boolean;
   private lastUsedBrowserType: string = '';
   private legacyMode: boolean; // If true, use old browser-based pooling
+  private initialized: boolean = false;
 
   constructor() {
     // Read configuration from environment variables
     this.maxBrowsers = parseInt(process.env.MAX_BROWSERS || '3', 10);
     this.headless = process.env.BROWSER_HEADLESS !== 'false'; // Default to true
-    
+
     // Configure browser types based on environment
     const browserTypesEnv = process.env.BROWSER_TYPES || 'chromium,firefox';
     this.browserTypes = browserTypesEnv.split(',').map(type => type.trim());
-    
+
     // Check if legacy mode is enabled (for backward compatibility)
     this.legacyMode = process.env.USE_LEGACY_POOL === 'true';
-    
-    console.log(`[BrowserPool] Configuration: maxBrowsers=${this.maxBrowsers}, headless=${this.headless}, types=${this.browserTypes.join(',')}, legacyMode=${this.legacyMode}`);
+
+    // LAZY INIT: Don't create context pool on construction - wait until actually needed
+    // This saves ~100ms+ for Serper-only mode where browser isn't used at all
+
+    console.log(`[BrowserPool] Configuration: maxBrowsers=${this.maxBrowsers}, headless=${this.headless}, types=${this.browserTypes.join(',')}, legacyMode=${this.legacyMode} (lazy init enabled)`);
+  }
+
+  /**
+   * Ensures the browser pool is initialized - called on first use
+   */
+  private async ensureInitialized(): Promise<void> {
+    if (this.initialized) return;
+
+    const startTime = Date.now();
+
+    // Create context pool on first use (lazy initialization)
+    if (!this.legacyMode) {
+      const envConfig = getEnvironmentConfig();
+
+      const config: ContextPoolConfig = {
+        maxSize: parseInt(process.env.CONTEXT_POOL_SIZE || '10', 10),
+        reuseTimeoutMs: parseInt(process.env.CONTEXT_REUSE_TIMEOUT || '20000', 10),
+        maxAgeMs: parseInt(process.env.CONTEXT_MAX_AGE || '60000', 10),
+      };
+
+      this.contextPool = new ContextPool({
+        engineType: envConfig.engineType,
+        headlessMode: envConfig.headlessMode,
+        config,
+      });
+
+      console.log(`[BrowserPool] Lazy initialization completed in ${Date.now() - startTime}ms`);
+    }
+
+    this.initialized = true;
   }
 
   async getBrowser(type?: string): Promise<Browser> {
@@ -39,20 +73,11 @@ export class BrowserPool {
    * Gets a browser using the new context pool approach (recommended)
    */
   private async getBrowserWithContextPool(): Promise<Browser> {
+    // LAZY INIT: Initialize on first use instead of constructor
+    await this.ensureInitialized();
+
     if (!this.contextPool) {
-      const envConfig = getEnvironmentConfig();
-
-      const config: ContextPoolConfig = {
-        maxSize: parseInt(process.env.CONTEXT_POOL_SIZE || '10', 10),
-        reuseTimeoutMs: parseInt(process.env.CONTEXT_REUSE_TIMEOUT || '20000', 10),
-        maxAgeMs: parseInt(process.env.CONTEXT_MAX_AGE || '60000', 10),
-      };
-
-      this.contextPool = new ContextPool({
-        engineType: envConfig.engineType,
-        headlessMode: envConfig.headlessMode,
-        config,
-      });
+      throw new Error('[BrowserPool] Context pool not initialized');
     }
 
     // Note: This method returns a browser for compatibility
@@ -163,23 +188,14 @@ export class BrowserPool {
   private browsers: Map<string, Browser> = new Map();
 
   /**
-   * Gets a browser context from the pool
+   * Gets a browser context from the pool (with lazy initialization)
    */
   async getContext(): Promise<BrowserContext> {
+    // LAZY INIT: Initialize on first use
+    await this.ensureInitialized();
+
     if (!this.contextPool) {
-      const envConfig = getEnvironmentConfig();
-
-      const config: ContextPoolConfig = {
-        maxSize: parseInt(process.env.CONTEXT_POOL_SIZE || '10', 10),
-        reuseTimeoutMs: parseInt(process.env.CONTEXT_REUSE_TIMEOUT || '20000', 10),
-        maxAgeMs: parseInt(process.env.CONTEXT_MAX_AGE || '60000', 10),
-      };
-
-      this.contextPool = new ContextPool({
-        engineType: envConfig.engineType,
-        headlessMode: envConfig.headlessMode,
-        config,
-      });
+      throw new Error('[BrowserPool] Context pool not initialized');
     }
 
     return await this.contextPool.getContext();
