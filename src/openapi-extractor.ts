@@ -7,7 +7,9 @@
 
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+import pLimit from 'p-limit';
 import { CrawlCache, crawlCache } from './crawl-cache.js';
+import { getAxiosHttpAgentConfig } from './utils.js';
 import {
   TechnicalDocType,
   OpenAPISpecInfo,
@@ -50,26 +52,6 @@ const OPENAPI_PATH_PATTERNS = [
   '/api/specifications',
   '/spec/v1',
   '/spec/v2',
-];
-
-// HTML link relation types for OpenAPI discovery
-const OPENAPI_LINK_RELATIONS = [
-  'search',           // <link rel="search" type="application/openapi+json">
-  'alternate',        // <link rel="alternate" type="application/openapi+json">
-  'doc',              // <link rel="doc" type="application/openapi+json">
-  'service-desc',     // <link rel="service-desc" type="application/openapi+json">
-  'http://apielements.org/api/swagger', // Legacy
-];
-
-// Content types for OpenAPI discovery
-const OPENAPI_CONTENT_TYPES = [
-  'application/openapi+json',
-  'application/vnd.oai.openapi',
-  'application/x.openapi+json',
-  'application/swagger+json',
-  'application/yaml',
-  'text/yaml',
-  'application/json',
 ];
 
 /**
@@ -131,73 +113,6 @@ function generateFileName(
 }
 
 /**
- * Detects the type of technical documentation from URL or content
- */
-function detectDocType(url: string, html?: string): { type: TechnicalDocType; confidence: number } {
-  const urlLower = url.toLowerCase();
-  const bestType = TechnicalDocType.REST_API;
-  const bestConfidence = 0.5;
-  
-  // Check URL patterns first (highest confidence)
-  if (urlLower.includes('openapi.json') || urlLower.includes('/openapi/') || urlLower.match(/\/v\d+\/openapi/)) {
-    return { type: TechnicalDocType.OPENAPI_JSON, confidence: 0.95 };
-  }
-  
-  if (urlLower.includes('swagger.json')) {
-    return { type: TechnicalDocType.SWAGGER_JSON, confidence: 0.95 };
-  }
-  
-  if (urlLower.includes('openapi.yaml') || urlLower.includes('/swagger.yaml')) {
-    return { type: TechnicalDocType.OPENAPI_YAML, confidence: 0.95 };
-  }
-  
-  // Check for versioned swagger patterns like /swagger-v3.xxxx.json
-  const versionedSwaggerMatch = url.match(/\/swagger-v\d+\.[a-zA-Z0-9._-]+\.json/);
-  if (versionedSwaggerMatch) {
-    return { type: TechnicalDocType.SWAGGER_JSON, confidence: 0.9 };
-  }
-  
-  // Check HTML content for clues
-  if (html) {
-    const $ = cheerio.load(html);
-    
-    // Look for OpenAPI link tags
-    for (const element of $('link').toArray()) {
-      const rel = $(element).attr('rel') || '';
-      const type = $(element).attr('type') || '';
-      const href = $(element).attr('href') || '';
-      
-      if (rel.toLowerCase() === 'search' && 
-          (type.includes('openapi') || type.includes('swagger'))) {
-        return { type: TechnicalDocType.OPENAPI_JSON, confidence: 0.9 };
-      }
-      
-      if (href.includes('openapi.json')) {
-        return { type: TechnicalDocType.OPENAPI_JSON, confidence: 0.85 };
-      }
-      
-      if (href.includes('swagger.json')) {
-        return { type: TechnicalDocType.SWAGGER_JSON, confidence: 0.85 };
-      }
-    }
-    
-    // Check title for documentation keywords
-    const title = $('title').text().toLowerCase();
-    if (title.includes('openapi') || title.includes('swagger')) {
-      return { type: urlLower.includes('yaml') ? TechnicalDocType.OPENAPI_YAML : TechnicalDocType.OPENAPI_JSON, confidence: 0.7 };
-    }
-    
-    // Check for API documentation indicators
-    const bodyText = $('body').text().toLowerCase();
-    if (bodyText.includes('rest api') || bodyText.includes('api reference')) {
-      return { type: TechnicalDocType.REST_API, confidence: 0.6 };
-    }
-  }
-  
-  return { type: bestType, confidence: bestConfidence };
-}
-
-/**
  * Tries to extract OpenAPI spec from a page by checking common patterns
  */
 async function discoverOpenAPISpec(
@@ -254,50 +169,79 @@ async function discoverOpenAPISpec(
     }
   }
   
-  // Try common path patterns
+  // Handle regex patterns first (instant, no HTTP needed)
   for (const pattern of OPENAPI_PATH_PATTERNS) {
-    try {
-      if (typeof pattern === 'string') {
-        const specUrl = urlObj.origin + pattern;
-        
-        // Skip if pattern doesn't match URL structure
-        if (!urlLowerIncludes(url, pattern)) continue;
-        
+    if (pattern instanceof RegExp) {
+      const match = url.match(pattern);
+      if (match) {
+        console.log(`[OpenAPIExtractor] Found versioned swagger in URL: ${url}`);
+        return { url, type: TechnicalDocType.SWAGGER_JSON };
+      }
+    }
+  }
+
+  // Collect string patterns that match the URL structure
+  const matchingPatterns: Array<{ pattern: string; specUrl: string }> = [];
+  for (const pattern of OPENAPI_PATH_PATTERNS) {
+    if (typeof pattern === 'string' && urlLowerIncludes(url, pattern)) {
+      matchingPatterns.push({ pattern, specUrl: urlObj.origin + pattern });
+    }
+  }
+
+  // Probe matching patterns in parallel with concurrency limit
+  if (matchingPatterns.length > 0) {
+    const limit = pLimit(5);
+    const controller = new AbortController();
+
+    const probes = matchingPatterns.map(({ pattern, specUrl }) => {
+      return limit(async () => {
+        if (controller.signal.aborted) return null;
+
         console.log(`[OpenAPIExtractor] Trying: ${specUrl}`);
-        
         try {
           const response = await axios.get(specUrl, {
             timeout: 5000,
             maxContentLength,
             validateStatus: () => true,
             headers: getStandardHeaders(),
+            signal: controller.signal,
+            ...getAxiosHttpAgentConfig(),
           });
-          
+
           if (response.status === 200 && isValidOpenAPIContent(response.data)) {
+            controller.abort(); // Cancel all other probes
             console.log(`[OpenAPIExtractor] Found OpenAPI spec at: ${specUrl}`);
-            
-            const type = pattern.toLowerCase().includes('yaml') 
-              ? TechnicalDocType.OPENAPI_YAML 
+
+            const type = pattern.toLowerCase().includes('yaml')
+              ? TechnicalDocType.OPENAPI_YAML
               : TechnicalDocType.OPENAPI_JSON;
-            
+
             return { url: specUrl, type };
           }
-        } catch (error) {
-          // Continue to next pattern
+        } catch (error: unknown) {
+          const axError = error as { code?: string };
+          if (axError.code !== 'ERR_CANCELED') {
+            // Continue to next pattern
+          }
         }
-      } else if (pattern instanceof RegExp) {
-        // Handle regex patterns for versioned swagger files
-        const match = url.match(pattern);
-        if (match) {
-          console.log(`[OpenAPIExtractor] Found versioned swagger in URL: ${url}`);
-          return { url, type: TechnicalDocType.SWAGGER_JSON };
+        return null;
+      });
+    });
+
+    // Run probes in batches, returning first non-null result
+    for (const probe of probes) {
+      try {
+        const result = await probe;
+        if (result) return result;
+      } catch (error: unknown) {
+        const axError = error as { code?: string };
+        if (axError.code !== 'ERR_CANCELED') {
+          // Ignore, continue to next
         }
       }
-    } catch (error) {
-      // Continue to next pattern
     }
   }
-  
+
   return null;
 }
 
@@ -344,40 +288,56 @@ async function downloadOpenAPISpec(
   url: string,
   maxContentLength: number = 10000000 // 10MB default
 ): Promise<{ content: string; type: TechnicalDocType } | null> {
-  try {
-    console.log(`[OpenAPIExtractor] Downloading OpenAPI spec from: ${url}`);
-    
-    const response = await axios.get(url, {
-      timeout: 30000,
-      maxContentLength,
-      validateStatus: () => true,
-      headers: getStandardHeaders(),
-    });
-    
-    if (response.status !== 200) {
-      console.warn(`[OpenAPIExtractor] Failed to download: HTTP ${response.status}`);
-      return null;
+  const maxRetries = 2;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[OpenAPIExtractor] Downloading OpenAPI spec from: ${url}${attempt > 0 ? ` (attempt ${attempt + 1}/${maxRetries + 1})` : ''}`);
+
+      const response = await axios.get(url, {
+        timeout: 30000,
+        maxContentLength,
+        validateStatus: () => true,
+        headers: getStandardHeaders(),
+        ...getAxiosHttpAgentConfig(),
+      });
+
+      if (response.status !== 200) {
+        // Retry on server errors (5xx)
+        if (response.status >= 500 && attempt < maxRetries) {
+          console.warn(`[OpenAPIExtractor] Server error HTTP ${response.status}, will retry...`);
+          await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+          continue;
+        }
+        console.warn(`[OpenAPIExtractor] Failed to download: HTTP ${response.status}`);
+        return null;
+      }
+
+      // Detect content type
+      const contentType = response.headers['content-type'] || '';
+      let docType: TechnicalDocType = TechnicalDocType.OPENAPI_JSON;
+
+      if (contentType.includes('yaml') || url.toLowerCase().endsWith('.yaml')) {
+        docType = TechnicalDocType.OPENAPI_YAML;
+      } else if (url.toLowerCase().includes('swagger.json')) {
+        docType = TechnicalDocType.SWAGGER_JSON;
+      }
+
+      const content = typeof response.data === 'string'
+        ? response.data
+        : JSON.stringify(response.data, null, 2);
+
+      return { content, type: docType };
+    } catch (error) {
+      console.error(`[OpenAPIExtractor] Error downloading OpenAPI spec from ${url}:`, error);
+      if (attempt < maxRetries) {
+        // Exponential backoff: 1s, 2s
+        await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+      }
     }
-    
-    // Detect content type
-    const contentType = response.headers['content-type'] || '';
-    let docType: TechnicalDocType = TechnicalDocType.OPENAPI_JSON;
-    
-    if (contentType.includes('yaml') || url.toLowerCase().endsWith('.yaml')) {
-      docType = TechnicalDocType.OPENAPI_YAML;
-    } else if (url.toLowerCase().includes('swagger.json')) {
-      docType = TechnicalDocType.SWAGGER_JSON;
-    }
-    
-    const content = typeof response.data === 'string' 
-      ? response.data 
-      : JSON.stringify(response.data, null, 2);
-    
-    return { content, type: docType };
-  } catch (error) {
-    console.error(`[OpenAPIExtractor] Error downloading OpenAPI spec from ${url}:`, error);
-    return null;
   }
+
+  return null;
 }
 
 /**
@@ -514,6 +474,7 @@ export class OpenAPIExtractor {
         maxContentLength: 2000000, // 2MB for HTML pages
         validateStatus: () => true,
         headers: getStandardHeaders(),
+        ...getAxiosHttpAgentConfig(),
       });
       
       if (pageResponse.status !== 200) {

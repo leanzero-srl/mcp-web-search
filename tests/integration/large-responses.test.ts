@@ -36,7 +36,7 @@ describe('Large Responses Tests', () => {
       name: 'full-web-search',
       arguments: {
         query: 'large response test',
-        limit: 20, // Request many results
+        limit: 10, // Request max allowed results (server caps at 10)
       },
     }, undefined, { timeout: testTimeout });
 
@@ -45,7 +45,7 @@ describe('Large Responses Tests', () => {
     }
 
     const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
+
     // Should handle large response
     expect(textContent.length).toBeGreaterThan(0);
   }, testTimeout);
@@ -120,10 +120,9 @@ describe('Large Responses Tests', () => {
 
   it('should handle multiple large file extractions', async () => {
     const result = await client.callTool({
-      name: 'extract-github-files',
+      name: 'get-github-repo-content',
       arguments: {
         url: 'https://github.com/microsoft/TypeScript',
-        filePatterns: ['*.ts'],
         maxFiles: 10,
       },
     }, undefined, { timeout: testTimeout });
@@ -133,7 +132,7 @@ describe('Large Responses Tests', () => {
     }
 
     const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
+
     // Should handle multiple large files
     expect(textContent.length).toBeGreaterThan(0);
   }, testTimeout);

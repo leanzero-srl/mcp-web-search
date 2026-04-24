@@ -35,7 +35,7 @@ describe('OpenAPI Integration Tests', () => {
     const result = await client.callTool({
       name: 'get-web-search-summaries',
       arguments: {
-        url: 'https://petstore3.swagger.io/',
+        query: 'swagger petstore openapi documentation site:swagger.io',
         limit: 2,
       },
     }, undefined, { timeout: testTimeout });
@@ -45,7 +45,7 @@ describe('OpenAPI Integration Tests', () => {
     }
 
     const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
+
     // Should search for Swagger-related content
     expect(textContent.length).toBeGreaterThan(50);
   }, testTimeout);
@@ -109,7 +109,7 @@ describe('OpenAPI Integration Tests', () => {
     const result = await client.callTool({
       name: 'get-single-web-page-content',
       arguments: {
-        url: 'https://swagger.io/spec/',
+        url: 'https://swagger.io/docs/',
         maxContentLength: 3000,
       },
     }, undefined, { timeout: testTimeout });
@@ -119,7 +119,7 @@ describe('OpenAPI Integration Tests', () => {
     }
 
     const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
+
     // Should return OpenAPI spec content
     expect(textContent.length).toBeGreaterThan(50);
   }, testTimeout);

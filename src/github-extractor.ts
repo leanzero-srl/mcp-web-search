@@ -1,5 +1,14 @@
 import axios, { AxiosRequestConfig, AxiosResponse } from 'axios';
+import pLimit from 'p-limit';
+import { getAxiosHttpAgentConfig } from './utils.js';
 import { GitHubFile } from './types.js';
+
+// Extend AxiosRequestConfig to include the _retry flag for type-safe rate-limit handling
+declare module 'axios' {
+  interface InternalAxiosRequestConfig {
+    _retry?: boolean;
+  }
+}
 
 /**
  * GitHub Repository Extractor
@@ -18,7 +27,8 @@ function createGitHubAxiosClient(githubToken?: string) {
       'Accept': 'application/vnd.github.v3+json',
       'User-Agent': 'Web-Search-MCP',
       'X-GitHub-Api-Version': '2022-11-28'
-    }
+    },
+    ...getAxiosHttpAgentConfig(),
   });
 
   // Request interceptor to mask token in logs
@@ -31,12 +41,57 @@ function createGitHubAxiosClient(githubToken?: string) {
     return config;
   });
 
-  // Response interceptor to mask any exposed tokens in error messages
+  // Response interceptor to mask tokens and handle rate limiting
   client.interceptors.response.use(
     (response) => response,
-    (error) => {
+    async (error) => {
+      const originalRequest = error.config;
+
+      // Handle GitHub rate limiting (403 with Retry-After)
+      if (error.response?.status === 403 && !originalRequest._retry) {
+        originalRequest._retry = true;
+        const retryAfter = error.response.headers['retry-after'];
+
+        if (retryAfter) {
+          const parsedSeconds = parseInt(retryAfter, 10);
+          let waitTime: number;
+
+          if (!isNaN(parsedSeconds) && parsedSeconds > 0) {
+            // Retry-After as seconds
+            waitTime = Math.min(parsedSeconds * 1000, 30000);
+          } else {
+            // Try parsing as HTTP-date
+            const date = new Date(retryAfter);
+            if (!isNaN(date.getTime())) {
+              waitTime = Math.max(0, Math.min(date.getTime() - Date.now(), 30000));
+            } else {
+              // Fallback to default
+              waitTime = 10000;
+            }
+          }
+          console.log(`[GitHubExtractor] Rate limited, waiting ${waitTime}ms (Retry-After: ${retryAfter})`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+        } else {
+          // Check if it's an auth/scopes issue (403 without Retry-After) vs rate limit
+          const message = error.response?.data?.message?.toLowerCase() || '';
+          if (message.includes('rate limit')) {
+            // Rate limited without header — use shorter backoff for tests
+            const waitTime = 10000;
+            console.log(`[GitHubExtractor] Rate limited (no Retry-After), waiting ${waitTime}ms`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+          } else {
+            // Auth/scopes issue — don't retry, just pass through
+            console.warn(`[GitHubExtractor] 403 (not rate limited): ${message}`);
+            return Promise.reject(error);
+          }
+        }
+
+        // Retry the original request
+        return client(originalRequest);
+      }
+
+      // Mask token in error message
       if (error.message && githubToken) {
-        // Mask token in error message
         error.message = error.message.replace(githubToken, '***token-masked***');
       }
       return Promise.reject(error);
@@ -268,7 +323,7 @@ export class GitHubExtractor {
   }
 
   /**
-   * Helper method for recursive directory crawling
+   * Helper method for recursive directory crawling with parallel file fetching
    */
   private async crawlDirectory(
     owner: string,
@@ -286,35 +341,52 @@ export class GitHubExtractor {
     try {
       const contents = await this.getContent(owner, repo, currentPath, branch);
 
-      for (const item of contents) {
-        if (item.type === 'dir') {
-          // Recursively crawl directories
-          await this.crawlDirectory(owner, repo, item.path, depth + 1, branch, accumulatedFiles, processedPaths);
-        } else if (item.type === 'file') {
-          // Skip if already processed (prevents duplicate file fetching)
-          if (processedPaths.has(item.path)) {
-            continue;
-          }
+      // Separate directories and files
+      const dirs = contents.filter(item => item.type === 'dir');
+      const files = contents.filter(item => item.type === 'file');
 
-          // Check if we should include this file
-          if (!this.includeCodeOnly || this.isCodeFile(item.name)) {
+      // Fetch files in parallel with concurrency limit
+      const limit = pLimit(5);
+      const filePromises: Promise<void>[] = [];
+
+      for (const item of files) {
+        // Check file limit before queuing more work
+        if (accumulatedFiles.length >= this.maxFiles && this.includeCodeOnly) break;
+
+        // Skip if already processed or not a code file
+        if (processedPaths.has(item.path)) continue;
+        if (this.includeCodeOnly && !this.isCodeFile(item.name)) continue;
+
+        filePromises.push(
+          limit(async () => {
             try {
               const content = await this.getFileContent(owner, repo, item.path, branch);
+
+              // Check limit again inside worker to prevent overshooting maxFiles due to parallel execution
+              if (this.includeCodeOnly && accumulatedFiles.length >= this.maxFiles) return;
+
               processedPaths.add(item.path);
               accumulatedFiles.push({
                 ...item,
                 content,
-                size: content.length
+                size: content.length,
               });
 
               console.log(`[GitHubExtractor] Added file: ${item.path} (${content.length} chars)`);
-
-              if (accumulatedFiles.length >= this.maxFiles) return accumulatedFiles;
             } catch (fileError) {
               console.warn(`[GitHubExtractor] Failed to fetch ${item.path}:`, fileError);
             }
-          }
-        }
+          })
+        );
+      }
+
+      // Wait for all file fetches to complete
+      await Promise.all(filePromises);
+
+      // Recursively crawl directories (sequential to maintain depth tracking)
+      for (const dir of dirs) {
+        await this.crawlDirectory(owner, repo, dir.path, depth + 1, branch, accumulatedFiles, processedPaths);
+        if (accumulatedFiles.length >= this.maxFiles && this.includeCodeOnly) break;
       }
     } catch (error) {
       console.error(`[GitHubExtractor] Error crawling ${currentPath}:`, error);

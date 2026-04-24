@@ -84,19 +84,19 @@ describe('Parallel Search Tests', () => {
       'microsoft/TypeScript',
       'facebook/react',
     ];
-    
+
     const promises = repos.map(repo =>
       client.callTool({
-        name: 'extract-github-readme',
+        name: 'get-github-repo-content',
         arguments: {
           url: `https://github.com/${repo}`,
-          maxContentLength: 1000,
+          maxFiles: 3,
         },
       }, undefined, { timeout: testTimeout })
     );
-    
+
     const results = await Promise.allSettled(promises);
-    
+
     // At least one should succeed
     const successful = results.filter(r => r.status === 'fulfilled');
     expect(successful.length).toBeGreaterThan(0);

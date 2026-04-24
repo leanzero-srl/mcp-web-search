@@ -91,10 +91,9 @@ describe('Output Limiting Tests', () => {
 
   it('should limit number of files extracted from GitHub', async () => {
     const result = await client.callTool({
-      name: 'extract-github-files',
+      name: 'get-github-repo-content',
       arguments: {
         url: 'https://github.com/microsoft/TypeScript',
-        filePatterns: ['*.ts'],
         maxFiles: 5,
       },
     }, undefined, { timeout: testTimeout });
@@ -105,7 +104,7 @@ describe('Output Limiting Tests', () => {
 
     // Should limit the number of files
     const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
+
     // The content should be limited based on maxFiles parameter
     expect(textContent.length).toBeGreaterThan(0);
   }, testTimeout);

@@ -28,6 +28,15 @@ export interface SemanticCacheEntry {
 }
 
 /**
+ * In-flight request cache to prevent duplicate concurrent lookups.
+ * OPTIMIZATION: When multiple identical queries arrive simultaneously,
+ * only one makes the actual API call and others wait for it.
+ * Max size capped to prevent memory leaks under sustained load.
+ */
+const pendingCache = new Map<string, { promise: Promise<SemanticCacheEntry | null>; expiresAt: number }>();
+const PENDING_CACHE_MAX_SIZE = 100;
+
+/**
  * Semantic cache configuration
  */
 export interface SemanticCacheConfig {
@@ -84,7 +93,11 @@ export class SemanticCache {
   }
 
   /**
-   * Get a cached entry if it exists and is valid
+   * Get a cached entry if it exists and is valid.
+   *
+   * OPTIMIZATION: Uses in-flight request cache to prevent duplicate concurrent lookups.
+   * When multiple identical queries arrive simultaneously (within ~30s window),
+   * they share the same in-flight request instead of each hitting the cache/API.
    */
   public async get(query: string): Promise<SemanticCacheEntry | null> {
     if (!this.config.enabled) return null;
@@ -92,9 +105,59 @@ export class SemanticCache {
     const cache = this.getCache();
     if (!cache) return null;
 
+    // OPTIMIZATION: Check for in-flight request first
+    const normalizedQuery = query.toLowerCase().trim();
+    const now = Date.now();
+
+    // Clean up expired entries
+    for (const [key, entry] of pendingCache.entries()) {
+      if (entry.expiresAt < now) {
+        pendingCache.delete(key);
+      }
+    }
+
+    // Check if there's already an in-flight request for this query
+    const pending = pendingCache.get(normalizedQuery);
+    if (pending && pending.expiresAt > now) {
+      console.log(`[SemanticCache] 🔄 Reusing in-flight request for "${normalizedQuery}"`);
+      return pending.promise;
+    }
+
+    // Create the cache lookup promise
+    const cachePromise = this.performCacheLookup(cache, normalizedQuery);
+
+    // Evict oldest entry if at capacity (LRU eviction)
+    if (pendingCache.size >= PENDING_CACHE_MAX_SIZE) {
+      const oldestKey = pendingCache.keys().next().value;
+      if (oldestKey) pendingCache.delete(oldestKey);
+    }
+
+    // Store as in-flight request (30 second window for deduplication)
+    pendingCache.set(normalizedQuery, {
+      promise: cachePromise,
+      expiresAt: now + 30000
+    });
+
+    try {
+      const result = await cachePromise;
+      return result;
+    } finally {
+      // Clean up after completion (allow a small buffer for late arrivals)
+      setTimeout(() => pendingCache.delete(normalizedQuery), 2000);
+    }
+  }
+
+  /**
+   * Internal method to perform the actual cache lookup with timeout
+   */
+  private async performCacheLookup(cache: UpstashSemanticCache, query: string): Promise<SemanticCacheEntry | null> {
     try {
       // Upstash SemanticCache.get returns the value stored in 'set'
-      const cached = await cache.get(query);
+      // Wrap with 2s timeout — if Upstash is slow, fall through to fresh search
+      const cached = await Promise.race([
+        cache.get(query),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
+      ]);
 
       if (cached) {
         // If we stored as a JSON string, parse it back to an object
@@ -131,7 +194,11 @@ export class SemanticCache {
       };
 
       // Store as JSON string to ensure compatibility with all cache provider versions
-      await cache.set(query, JSON.stringify(entry));
+      // Wrap with 3s timeout — if Upstash is slow, fail gracefully (data will be re-cached next time)
+      await Promise.race([
+        cache.set(query, JSON.stringify(entry)),
+        new Promise<void>((_, reject) => setTimeout(() => reject(new Error('Cache set timeout')), 3000)),
+      ]);
       
       auditLogger.log({
         timestamp: new Date().toISOString(),
