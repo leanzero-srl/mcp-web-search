@@ -344,33 +344,27 @@ export class InputValidator {
       throw new Error('Invalid URL: cannot be empty');
     }
 
-    try {
-      // Basic URL validation
-      if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
-        auditLogger.logToolError(
-          'validation',
-          -32602, // InvalidParams
-          `Invalid URL: must start with http:// or https://`,
-          'Validation'
-        );
-        throw new Error('Invalid URL: must start with http:// or https://');
-      }
-
-      // Check length limit
-      if (trimmed.length > this.config.maxInputLength) {
-        auditLogger.logToolError(
-          'validation',
-          -32602, // InvalidParams
-          `URL too long`,
-          'Validation'
-        );
-        throw new Error('URL too long');
-      }
-
-      return trimmed;
-    } catch (error) {
-      throw error; // Re-throw validation errors
+    if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+      auditLogger.logToolError(
+        'validation',
+        -32602, // InvalidParams
+        `Invalid URL: must start with http:// or https://`,
+        'Validation',
+      );
+      throw new Error('Invalid URL: must start with http:// or https://');
     }
+
+    if (trimmed.length > this.config.maxInputLength) {
+      auditLogger.logToolError(
+        'validation',
+        -32602, // InvalidParams
+        `URL too long`,
+        'Validation',
+      );
+      throw new Error('URL too long');
+    }
+
+    return trimmed;
   }
 
   /**

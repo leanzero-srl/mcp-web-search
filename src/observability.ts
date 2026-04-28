@@ -304,7 +304,7 @@ export class TelemetryCollector {
   /**
    * Record a failed search
    */
-  public recordSearchFailure(engine: string, durationMs: number): void {
+  public recordSearchFailure(engine: string, _durationMs: number): void {
     if (!this.enabled) return;
     this.metrics.tool_failures++;
 
