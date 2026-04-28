@@ -3,7 +3,7 @@ import * as cheerio from 'cheerio';
 import { SearchOptions, SearchResult, SearchResultWithMetadata } from './types.js';
 import { generateTimestamp, sanitizeQuery, getAxiosHttpAgentConfig } from './utils.js';
 import { RateLimiter } from './rate-limiter.js';
-import { BrowserPool } from './browser-pool.js';
+import { browserPool } from './browser-pool.js';
 
 // Import WebKit-first browser engine
 import { createOptimizedBrowser, getEnginePriorityOrder, BrowserEngineType, getHeadlessOption, getEnvironmentConfig } from './browser-engine.js';
@@ -23,9 +23,8 @@ export interface SearchEngineConfig {
 
 export class SearchEngine {
   private readonly rateLimiter: RateLimiter;
-  private browserPool: BrowserPool;
+  private readonly browserPool = browserPool;
   private readonly concurrencyLimiter: ReturnType<typeof pLimit>;
-  private readonly maxConcurrentSearches: number;
 
   constructor(config: SearchEngineConfig = {}) {
     const {
@@ -35,10 +34,8 @@ export class SearchEngine {
     } = config;
 
     this.rateLimiter = new RateLimiter(maxRequestsPerMinute, resetIntervalMs);
-    this.browserPool = new BrowserPool();
-    this.maxConcurrentSearches = maxConcurrentSearches;
     this.concurrencyLimiter = pLimit(maxConcurrentSearches);
-    
+
     console.log(`[SearchEngine] Using WebKit-first engine priority: ${getEnginePriorityOrder().join(' -> ')}`);
   }
 
@@ -73,14 +70,21 @@ export class SearchEngine {
 
   /**
    * Executes the actual search logic (wrapped by deduplication in search())
+   *
+   * Mode selection (Serper-first by default — README documents
+   * `USE_SERPER_ONLY=true` and the user has confirmed Serper is the right
+   * primary path):
+   *   - `USE_SERPER_ONLY=false` ⇒ enable browser fallbacks
+   *   - `ENABLE_BROWSER_FALLBACKS=true` ⇒ enable browser fallbacks (legacy alias)
+   *   - otherwise ⇒ Serper only (skip Playwright launches entirely)
    */
   private async executeSearch(query: string, numResults: number, timeout: number): Promise<SearchResultWithMetadata> {
-    // OPTIMIZATION 2: By default, use Serper-only mode for maximum performance
-    // Browser fallbacks are opt-in via ENABLE_BROWSER_FALLBACKS=true
-    const enableBrowserFallbacks = process.env.ENABLE_BROWSER_FALLBACKS === 'true';
+    const serperOnlyEnv = process.env.USE_SERPER_ONLY;
+    const enableBrowserFallbacks =
+      process.env.ENABLE_BROWSER_FALLBACKS === 'true' || serperOnlyEnv === 'false';
     const useSerperOnly = !enableBrowserFallbacks;
 
-    console.log(`[SearchEngine] Serper-only mode: ${useSerperOnly} (enableBrowserFallbacks: ${enableBrowserFallbacks})`);
+    console.log(`[SearchEngine] Serper-only mode: ${useSerperOnly} (USE_SERPER_ONLY=${serperOnlyEnv ?? 'unset'}, ENABLE_BROWSER_FALLBACKS=${process.env.ENABLE_BROWSER_FALLBACKS ?? 'unset'})`);
 
     // Fast path: Skip browser engines entirely for maximum performance
     if (useSerperOnly) {
@@ -320,6 +324,55 @@ export class SearchEngine {
     return { results: [], engine: 'None' };
   }
 
+  // ---- Serper circuit breaker ------------------------------------------------
+  // After N consecutive failures we stop calling Serper for `cooldownMs` and
+  // let the fallback chain take over immediately. After the cooldown a single
+  // probe request is allowed; on success we close, on failure we re-open.
+  // Process-wide state is fine — there's typically one SearchEngine per process.
+  private static serperBreaker = {
+    consecutiveFailures: 0,
+    openedAt: 0,
+    halfOpen: false,
+    failureThreshold: parseInt(process.env.SERPER_BREAKER_FAILURES || '5', 10),
+    cooldownMs: parseInt(process.env.SERPER_BREAKER_COOLDOWN_MS || '30000', 10),
+  };
+
+  private static serperBreakerShouldSkip(): boolean {
+    const b = SearchEngine.serperBreaker;
+    if (b.openedAt === 0) return false;
+    const sinceOpen = Date.now() - b.openedAt;
+    if (sinceOpen >= b.cooldownMs) {
+      // Allow one probe request through.
+      if (!b.halfOpen) {
+        b.halfOpen = true;
+        return false;
+      }
+      // Probe is in flight — keep skipping until it resolves.
+      return true;
+    }
+    return true;
+  }
+
+  private static serperBreakerRecordSuccess(): void {
+    const b = SearchEngine.serperBreaker;
+    b.consecutiveFailures = 0;
+    b.openedAt = 0;
+    b.halfOpen = false;
+  }
+
+  private static serperBreakerRecordFailure(): void {
+    const b = SearchEngine.serperBreaker;
+    b.consecutiveFailures += 1;
+    b.halfOpen = false;
+    if (b.consecutiveFailures >= b.failureThreshold && b.openedAt === 0) {
+      b.openedAt = Date.now();
+      console.error(
+        `[SearchEngine] Serper circuit breaker OPENED after ${b.consecutiveFailures} ` +
+          `consecutive failures; cooldown ${b.cooldownMs}ms`,
+      );
+    }
+  }
+
   /**
    * Runs a search with a specific browser engine
    */
@@ -327,6 +380,11 @@ export class SearchEngine {
     const apiKey = process.env.SERPER_API_KEY;
     if (!apiKey) {
       console.error('[SearchEngine] API search failed: SERPER_API_KEY is not set');
+      return [];
+    }
+
+    if (SearchEngine.serperBreakerShouldSkip()) {
+      console.error('[SearchEngine] Serper circuit breaker OPEN — skipping API call, using fallback');
       return [];
     }
 
@@ -376,8 +434,10 @@ export class SearchEngine {
         console.log(`[SearchEngine] Cached results for query: "${query}"`);
       }
 
+      SearchEngine.serperBreakerRecordSuccess();
       return results;
     } catch (error) {
+      SearchEngine.serperBreakerRecordFailure();
       console.error(`[SearchEngine] API search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       if (axios.isAxiosError(error)) {
         console.error('[SearchEngine] API Axios error details:', {
@@ -534,11 +594,11 @@ export class SearchEngine {
         if (attempt === 2) throw error;
         await new Promise(resolve => setTimeout(resolve, 500));
       } finally {
+        // Close the page only — the browser is owned by the shared pool.
+        // Closing it here would defeat pooling and force a relaunch (~1–3 s)
+        // on every search.
         if (page) {
           try { await page.close(); } catch {}
-        }
-        if (browser) {
-          try { await browser.close(); } catch {}
         }
       }
     }
@@ -617,11 +677,9 @@ export class SearchEngine {
         console.error(`[SearchEngine] BING: Waiting 500ms before retry...`);
         await new Promise(resolve => setTimeout(resolve, 500));
       } finally {
+        // Close the page only — browser belongs to the shared pool.
         if (page) {
           try { await page.close(); } catch {}
-        }
-        if (browser) {
-          try { await browser.close(); } catch {}
         }
       }
     }
@@ -691,8 +749,8 @@ export class SearchEngine {
 
         return results;
       } finally {
+        // Close the page only — browser belongs to the shared pool.
         try { await page.close(); } catch {}
-        try { await browser.close(); } catch {}
       }
     } catch (error) {
       console.error(`[SearchEngine] DuckDuckGo browser search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);

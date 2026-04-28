@@ -96,3 +96,10 @@ jspm_packages/
 # Qwen Code review reports and cache
 .qwen/reviews/
 .qwen/review-cache/
+
+# TLS certificates and private keys must never be committed
+*.crt
+*.key
+*.pem
+*.p12
+*.pfx

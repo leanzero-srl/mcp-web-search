@@ -9,7 +9,7 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import pLimit from 'p-limit';
 import { CrawlCache, crawlCache } from './crawl-cache.js';
-import { getAxiosHttpAgentConfig } from './utils.js';
+import { getAxiosHttpAgentConfig, safeFetchUrl } from './utils.js';
 import {
   TechnicalDocType,
   OpenAPISpecInfo,
@@ -431,6 +431,17 @@ export class OpenAPIExtractor {
         success: false,
         url,
         error: `Invalid URL format: ${url}`,
+      };
+    }
+
+    // SSRF guard: refuse to fetch loopback / RFC1918 / link-local / cloud-metadata.
+    try {
+      await safeFetchUrl(url);
+    } catch (err) {
+      return {
+        success: false,
+        url,
+        error: err instanceof Error ? err.message : 'URL refused by SSRF guard',
       };
     }
 

@@ -2,9 +2,11 @@
   "mcpServers": {
     "web-search": {
       "command": "node",
-      "args": [
-        "/Users/mark/Projects/web-search-mcp/dist/simple-test.js"
-      ]
+      "args": ["./dist/index.js"],
+      "env": {
+        "SERPER_API_KEY": "",
+        "USE_SERPER_ONLY": "true"
+      }
     }
   }
-} 
+}

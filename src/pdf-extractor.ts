@@ -7,11 +7,9 @@
  * - Fallback mechanisms for unreliable sources
  */
 
-import { BrowserPool } from './browser-pool.js';
+import { browserPool } from './browser-pool.js';
 import { auditLogger, telemetryCollector } from './observability.js';
-
-// ============================================================================
-const browserPool = new BrowserPool();
+import { safeFetchUrl } from './utils.js';
 
 // Cached pdf-parse dynamic import to avoid repeated module loading
 let cachedPdfParseFn: ((buffer: Uint8Array) => Promise<any>) | null = null;
@@ -67,7 +65,10 @@ export class PdfExtractor {
    */
   public async extractPdfContent(url: string, config: PdfExtractionConfig = {}): Promise<PdfExtractionResult> {
     const startTime = Date.now();
-    
+
+    // SSRF guard: block loopback / RFC1918 / link-local / cloud-metadata targets.
+    await safeFetchUrl(url);
+
     try {
       // Try direct HTTP download first (fastest)
       const httpResult = await this.extractWithHttp(url, config);
