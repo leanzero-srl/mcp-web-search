@@ -1,8 +1,9 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+import pLimit from 'p-limit';
 import { ContentExtractionOptions, SearchResult, ResearchDigest } from './types.js';
-import { cleanText, getContentPreview, generateTimestamp, isPdfUrl, getAxiosHttpAgentConfig } from './utils.js';
-import { BrowserPool } from './browser-pool.js';
+import { cleanText, getContentPreview, generateTimestamp, isPdfUrl, getAxiosHttpAgentConfig, safeFetchUrl } from './utils.js';
+import { browserPool } from './browser-pool.js';
 import { scoreContentQuality, getBestContentSelector, cleanText as qualityCleanText } from './content-quality-scorer.js';
 import { sessionRateLimiter } from './enterprise-guardrails.js';
 import { requestDeduplicator } from './request-deduplicator.js';
@@ -66,12 +67,21 @@ async function extractRawGitHubContent(url: string): Promise<string | null> {
   try {
     console.log(`[EnhancedContentExtractor] Using GitHub API to fetch raw file: ${url}`);
 
+    // Send Authorization when GITHUB_TOKEN is configured. Unauthenticated
+    // requests are capped at 60/hr per IP — easy to exhaust during a single
+    // multi-file extraction. With a token the limit is 5000/hr.
+    const headers: Record<string, string> = {
+      'Accept': 'application/vnd.github.v3+json',
+      'User-Agent': 'Web-Search-MCP',
+      'X-GitHub-Api-Version': '2022-11-28',
+    };
+    const githubToken = process.env.GITHUB_TOKEN;
+    if (githubToken) {
+      headers.Authorization = `Bearer ${githubToken}`;
+    }
+
     const response = await axios.get(apiUrl, {
-      headers: {
-        'Accept': 'application/vnd.github.v3+json',
-        'User-Agent': 'Web-Search-MCP',
-        'X-GitHub-Api-Version': '2022-11-28'
-      },
+      headers,
       timeout: 10000,
       ...getAxiosHttpAgentConfig(),
     });
@@ -90,7 +100,7 @@ async function extractRawGitHubContent(url: string): Promise<string | null> {
 export class EnhancedContentExtractor {
   private readonly defaultTimeout: number;
   private readonly maxContentLength: number;
-  private browserPool: BrowserPool;
+  private readonly browserPool = browserPool;
   private fallbackThreshold: number;
 
   // Minimum content length for valid results
@@ -99,17 +109,19 @@ export class EnhancedContentExtractor {
   constructor() {
     this.defaultTimeout = parseInt(process.env.DEFAULT_TIMEOUT || '6000', 10);
     
-    // Read MAX_CONTENT_LENGTH from environment variable, fallback to 500KB
+    // Read MAX_CONTENT_LENGTH from environment variable. Default lowered to
+    // 100 KB — the previous 500 KB default would push 5 MB into the LLM
+    // context for a 10-result search and was the dominant source of GC churn
+    // during Cheerio parsing.
     const envMaxLength = process.env.MAX_CONTENT_LENGTH;
-    this.maxContentLength = envMaxLength ? parseInt(envMaxLength, 10) : 500000;
-    
+    this.maxContentLength = envMaxLength ? parseInt(envMaxLength, 10) : 100_000;
+
     // Validate the parsed value
     if (isNaN(this.maxContentLength) || this.maxContentLength < 0) {
-      console.warn(`[EnhancedContentExtractor] Invalid MAX_CONTENT_LENGTH value: ${envMaxLength}, using default 500000`);
-      this.maxContentLength = 500000;
+      console.warn(`[EnhancedContentExtractor] Invalid MAX_CONTENT_LENGTH value: ${envMaxLength}, using default 100000`);
+      this.maxContentLength = 100_000;
     }
-    
-    this.browserPool = new BrowserPool();
+
     this.fallbackThreshold = parseInt(process.env.BROWSER_FALLBACK_THRESHOLD || '3', 10);
     
     console.log(`[EnhancedContentExtractor] Configuration: timeout=${this.defaultTimeout}, maxContentLength=${this.maxContentLength}, fallbackThreshold=${this.fallbackThreshold}, minContentLength=${this.minContentLength}`);
@@ -134,6 +146,10 @@ export class EnhancedContentExtractor {
    */
   private async executeExtraction(options: ContentExtractionOptions): Promise<{ content: string; digest?: ResearchDigest }> {
     const { url } = options;
+
+    // SSRF guard: reject loopback / RFC1918 / link-local / cloud-metadata
+    // targets *before* spending any time on axios or playwright.
+    await safeFetchUrl(url);
 
     // Check if this is a GitHub raw URL - use direct API instead of browser fallback
     if (url.includes('raw.githubusercontent.com')) {
@@ -526,10 +542,16 @@ export class EnhancedContentExtractor {
     const nonPdfResults = results.filter(result => !isPdfUrl(result.url));
     const resultsToProcess = nonPdfResults.slice(0, Math.min(targetCount * 2, 10)); // Process extra to account for failures
     
-    console.log(`[EnhancedContentExtractor] Processing ${resultsToProcess.length} non-PDF results concurrently`);
-    
-    // Process results concurrently with timeout
-    const extractionPromises = resultsToProcess.map(async (result): Promise<SearchResult> => {
+    // Bound concurrency so a single search doesn't fan out into N concurrent
+    // browser launches. Default 3 keeps per-host pressure low; tune via
+    // EXTRACT_CONCURRENCY for environments with more headroom.
+    const concurrency = Math.max(1, parseInt(process.env.EXTRACT_CONCURRENCY || '3', 10));
+    const extractLimit = pLimit(concurrency);
+
+    console.log(`[EnhancedContentExtractor] Processing ${resultsToProcess.length} non-PDF results (concurrency=${concurrency})`);
+
+    // Process results with bounded concurrency and per-call timeout
+    const extractionPromises = resultsToProcess.map((result) => extractLimit(async (): Promise<SearchResult> => {
       try {
         // Use a race condition with timeout to prevent hanging - increased timeout for reliability
         const extractionPromise = this.extractContent({ 
@@ -578,8 +600,8 @@ export class EnhancedContentExtractor {
           error: this.getSpecificErrorMessage(error),
         };
       }
-    });
-    
+    }));
+
     // Wait for all extractions to complete
     const allResults = await Promise.all(extractionPromises);
     

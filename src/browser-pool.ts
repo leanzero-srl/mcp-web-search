@@ -237,3 +237,12 @@ export class BrowserPool {
     return this.lastUsedBrowserType;
   }
 }
+
+/**
+ * Process-wide singleton. SearchEngine, EnhancedContentExtractor, and
+ * PdfExtractor all share this instance so we maintain a single underlying
+ * Playwright browser + context pool instead of two or three competing pools.
+ * The pool is lazily initialized on first `getBrowser()` / `getContext()` call,
+ * so importing this module is free if browser fallbacks are never used.
+ */
+export const browserPool = new BrowserPool();

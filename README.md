@@ -101,22 +101,41 @@ You can fine-tune the server's behavior using **Environment Variables**. These a
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SEARCH_ENGINE` | `bing` | `bing`, `brave`, `duckduckgo`, or `serper` |
-| `SERPER_API_KEY` | *none* | Required if using `serper` engine |
-| `SEARCH_ENGINE_MAX_RPM` | `50` | Max requests per minute to the search engine (increased from 10) |
+| `SERPER_API_KEY` | *none* | Required for the (default) Serper-first fast path |
+| `SEARCH_ENGINE_MAX_RPM` | `50` | Max requests per minute to the search engine |
 | `SEARCH_ENGINE_RESET_MS` | `60000` | Reset window for RPM in milliseconds |
 | `DEBUG_BING_SEARCH` | `false` | Set to `true` for verbose Bing parsing logs |
-| `USE_SERPER_ONLY` | `false` | **Performance**: Skip browser engines when Serper API succeeds |
+| `USE_SERPER_ONLY` | `true` | **Performance**: Skip Playwright browser fallbacks (the default). Set `false` to enable browser fallbacks. |
+| `ENABLE_BROWSER_FALLBACKS` | `false` | Legacy alias; setting `true` overrides `USE_SERPER_ONLY` and turns on browser engines |
 | `PARALLEL_SEARCH` | `true` | Enable parallel engine searches (disable for faster single-engine) |
+| `SERPER_BREAKER_FAILURES` | `5` | Consecutive Serper failures before the circuit breaker opens |
+| `SERPER_BREAKER_COOLDOWN_MS` | `30000` | How long the breaker stays open before allowing a probe |
 
 ### 📄 Content Extraction & Quality
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MAX_CONTENT_LENGTH` | `500000` | Max bytes per page (prevents context overflow) |
+| `MAX_CONTENT_LENGTH` | `100000` | Max characters per page (lowered from 500 KB — 5 MB total per 10-result search drove GC pressure) |
 | `MIN_CONTENT_LENGTH` | `200` | Minimum bytes required for a valid result |
 | `DEFAULT_TIMEOUT` | `6000` | Timeout for extraction in ms |
+| `EXTRACT_CONCURRENCY` | `3` | Max parallel page extractions per search (prevents N concurrent browser launches) |
 | `BROWSER_FALLBACK_THRESHOLD`| `3` | Failures before switching to headless browser |
 | `ENABLE_RELEVANCE_CHECKING` | `true` | Enables AI-ready quality scoring |
 | `RELEVANCE_THRESHOLD` | `0.3` | Minimum score (0.0-1.0) for valid content |
+
+### ⏱️ Per-tool wall-clock budgets (ms)
+All defaults sit below ~20 s so the upstream `Forge → LM Studio → MCP` chain
+fits within Forge's ~25 s function timeout. Override only if the deployment
+needs different ceilings.
+
+| Variable | Default |
+|----------|---------|
+| `TOOL_TIMEOUT_FULL_SEARCH` | `18000` |
+| `TOOL_TIMEOUT_SEARCH_SUMMARIES` | `8000` |
+| `TOOL_TIMEOUT_SINGLE_PAGE` | `12000` |
+| `TOOL_TIMEOUT_PDF` | `12000` |
+| `TOOL_TIMEOUT_GITHUB` | `18000` |
+| `TOOL_TIMEOUT_OPENAPI` | `15000` |
+| `TOOL_TIMEOUT_PROGRESSIVE` | `20000` |
 
 ### 🌐 Browser & Stealth Management
 | Variable | Default | Description |

@@ -33,11 +33,7 @@
     "url": "https://github.com/mrkrsl/web-search-mcp.git"
   },
   "dependencies": {
-    "@modelcontextprotocol/client": "^2.0.0-alpha.2",
-    "@modelcontextprotocol/node": "^2.0.0-alpha.2",
     "@modelcontextprotocol/sdk": "^1.15.0",
-    "@modelcontextprotocol/server": "^2.0.0-alpha.2",
-    "@types/pdf-parse": "^1.1.5",
     "@upstash/semantic-cache": "^1.0.5",
     "@upstash/vector": "^1.2.3",
     "axios": "^1.6.8",

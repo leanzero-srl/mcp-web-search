@@ -211,45 +211,30 @@ export function extractKeywords(query: string): string[] {
 }
 
 /**
- * Cleans text content by removing excessive whitespace and unwanted patterns
+ * Cleans text content by collapsing whitespace and removing inert markup
+ * artifacts. Does not strip vocabulary words ("image", "photo", "privacy",
+ * "terms", "cookie", etc.) — those are valid English and the previous behavior
+ * mangled legitimate articles about photography, privacy policies, and
+ * cookie/legal documentation.
  */
 export function cleanText(text: string): string {
-  // Remove excessive whitespace
-  let cleaned = text.replace(/\s+/g, ' ');
-  
-  // Remove data URLs (base64 images)
-  cleaned = cleaned.replace(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/g, '');
-  
-  // Remove image URLs
+  // Normalize line endings first so subsequent whitespace collapse is stable
+  let cleaned = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  // Remove data URLs (base64 images / fonts) — pure noise
+  cleaned = cleaned.replace(/data:[a-z]+\/[^;]+;base64,[A-Za-z0-9+/=]+/gi, '');
+
+  // Remove direct image URLs (rendered as bare links by some extractors)
   cleaned = cleaned.replace(
-    /https?:\/\/[^\s]+\.(jpg|jpeg|png|gif|webp|svg|ico|bmp|tiff)(\?[^\s]*)?/gi,
+    /https?:\/\/\S+\.(?:jpg|jpeg|png|gif|webp|svg|ico|bmp|tiff)(?:\?\S*)?/gi,
     ''
   );
-  
-  // Remove image file extensions
-  cleaned = cleaned.replace(/\.(jpg|jpeg|png|gif|webp|svg|ico|bmp|tiff)/gi, '');
-  
-  // Remove image-related words
-  cleaned = cleaned.replace(
-    /image|img|photo|picture|gallery|slideshow|carousel/gi,
-    ''
-  );
-  
-  // Remove common non-content patterns
-  cleaned = cleaned.replace(
-    /cookie|privacy|terms|conditions|disclaimer|legal|copyright|all rights reserved/gi,
-    ''
-  );
-  
-  // Remove excessive line breaks
-  cleaned = cleaned.replace(/\n\s*\n/g, '\n');
-  cleaned = cleaned.replace(/\r\n/g, '\n');
-  cleaned = cleaned.replace(/\r/g, '\n');
-  
-  // Trim whitespace
-  cleaned = cleaned.trim();
-  
-  return cleaned;
+
+  // Collapse runs of whitespace, but preserve paragraph breaks
+  cleaned = cleaned.replace(/[ \t]+/g, ' ');
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+
+  return cleaned.trim();
 }
 
 /**

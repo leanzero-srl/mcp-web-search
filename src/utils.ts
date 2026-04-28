@@ -6,6 +6,8 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import http from 'http';
 import https from 'https';
+import dns from 'dns/promises';
+import net from 'net';
 
 // Shared HTTP/HTTPS agents with keep-alive connection pooling
 const httpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000 });
@@ -49,6 +51,104 @@ export function validateUrl(url: string): boolean {
   }
 }
 
+/**
+ * Returns true when an IP address (v4 or v6) lives in a range that should never
+ * be reachable from a server fetching arbitrary URLs supplied by an LLM:
+ * loopback, link-local, RFC1918 private, multicast, broadcast, cloud metadata
+ * (169.254.169.254), unique local addresses (fc00::/7), and the IPv6 mappings
+ * of all of the above.
+ */
+function isPrivateOrReservedIp(ip: string): boolean {
+  if (!ip) return true;
+
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map((n) => parseInt(n, 10));
+    if (Number.isNaN(a) || Number.isNaN(b)) return true;
+    if (a === 0) return true;                       // 0.0.0.0/8
+    if (a === 10) return true;                      // 10.0.0.0/8 RFC1918
+    if (a === 127) return true;                     // 127.0.0.0/8 loopback
+    if (a === 169 && b === 254) return true;        // 169.254.0.0/16 link-local + cloud metadata
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 RFC1918
+    if (a === 192 && b === 168) return true;        // 192.168.0.0/16 RFC1918
+    if (a === 192 && b === 0) return true;          // 192.0.0.0/24 IETF protocol
+    if (a >= 224) return true;                      // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved
+    return false;
+  }
+
+  if (net.isIPv6(ip)) {
+    const lower = ip.toLowerCase();
+    if (lower === '::' || lower === '::1') return true;
+    if (lower.startsWith('fe80:') || lower.startsWith('fe8') || lower.startsWith('fec') || lower.startsWith('fea') || lower.startsWith('feb')) return true; // link-local fe80::/10
+    if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // unique-local fc00::/7
+    if (lower.startsWith('ff')) return true;        // multicast ff00::/8
+    // IPv4-mapped IPv6 (::ffff:a.b.c.d) — recurse on the v4 portion
+    if (lower.startsWith('::ffff:')) {
+      const v4 = lower.split('::ffff:')[1];
+      if (v4 && net.isIPv4(v4)) return isPrivateOrReservedIp(v4);
+    }
+    return false;
+  }
+
+  return true; // not a parseable IP
+}
+
+/**
+ * Validates a URL is safe to fetch. Rejects non-http(s) schemes, malformed
+ * URLs, and (after DNS resolution) addresses pointing at loopback / link-local /
+ * RFC1918 / cloud-metadata / multicast targets. Throws on rejection so callers
+ * surface a structured error instead of silently fetching an internal target.
+ *
+ * Note: DNS resolution is best-effort for SSRF defense — a TOCTOU window
+ * between resolution and the actual axios/playwright fetch still exists. For
+ * stronger guarantees, route requests through a custom http.Agent that blocks
+ * the same ranges in `lookup`. This guard catches the common cases.
+ */
+export async function safeFetchUrl(url: string): Promise<void> {
+  if (typeof url !== 'string' || url.length === 0) {
+    throw new Error('Invalid URL: must be a non-empty string');
+  }
+  if (!validateUrl(url)) {
+    throw new Error(`Invalid URL: only http and https schemes are allowed (got: ${url.slice(0, 80)})`);
+  }
+
+  const parsed = new URL(url);
+  // URL.hostname wraps IPv6 literals in brackets ("[::1]") — strip them so
+  // net.isIP / our range check see the bare address.
+  const host = parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
+    ? parsed.hostname.slice(1, -1)
+    : parsed.hostname;
+
+  // Reject literal IP hostnames in private ranges directly (no DNS needed)
+  if (net.isIP(host)) {
+    if (isPrivateOrReservedIp(host)) {
+      throw new Error(`Refused to fetch private/reserved address: ${host}`);
+    }
+    return;
+  }
+
+  // Hostname-level shortcut for "localhost"
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) {
+    throw new Error(`Refused to fetch local hostname: ${host}`);
+  }
+
+  try {
+    const records = await dns.lookup(host, { all: true, verbatim: true });
+    for (const rec of records) {
+      if (isPrivateOrReservedIp(rec.address)) {
+        throw new Error(`Refused to fetch ${host}: resolves to private/reserved address ${rec.address}`);
+      }
+    }
+  } catch (err) {
+    // Re-throw our own refusals; DNS errors (NXDOMAIN, etc.) bubble up as the
+    // caller will see them anyway during the actual fetch.
+    if (err instanceof Error && err.message.startsWith('Refused to fetch')) {
+      throw err;
+    }
+    // DNS lookup failure: let the actual request fail naturally with a clearer
+    // network error rather than masking it as an SSRF rejection.
+  }
+}
+
 export function sanitizeQuery(query: string): string {
   return query.trim().substring(0, 1000); // Limit query length
 }
@@ -65,6 +165,32 @@ export function getRandomUserAgent(): string {
 
 export function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Wraps a promise with a hard wall-clock timeout. On timeout we throw an
+ * Error whose message contains "timeout" so the existing `handleError` mapper
+ * in the MCP layer translates it to MCP error code `-32001` (RequestTimeout)
+ * instead of a generic InternalError. The wrapped work is *not* cancelled
+ * (we don't have AbortSignal threading through every Playwright call yet);
+ * the timeout simply means the caller stops waiting. Internal cleanup still
+ * happens via finally blocks.
+ *
+ * Use this at tool-handler boundaries to enforce predictable upper bounds
+ * suitable for the Forge → LM Studio → MCP latency chain (~25 s function
+ * timeout in Forge, leaving room for inference and network).
+ */
+export function withTimeout<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timeout after ${ms}ms`)),
+      ms,
+    );
+  });
+  return Promise.race([work, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
 }
 
 /**
@@ -97,6 +223,8 @@ export function isPdfUrl(url: string): boolean {
  * Implements robust discovery via robots.txt, root sitemaps, and recursive index parsing.
  */
 export async function fetchSitemapUrls(baseUrl: string): Promise<string[]> {
+  await safeFetchUrl(baseUrl);
+
   const urlObj = new URL(baseUrl);
   const origin = urlObj.origin;
   const allUrls = new Set<string>();
@@ -143,10 +271,14 @@ export async function fetchSitemapUrls(baseUrl: string): Promise<string[]> {
     processedCount++;
 
     try {
+      // Validate each sitemap URL — robots.txt and sitemap-index files can
+      // declare cross-host or pathological URLs.
+      await safeFetchUrl(currentSitemapUrl);
       console.log(`[Utils] Fetching sitemap: ${currentSitemapUrl}`);
-      const response = await axios.get(currentSitemapUrl, { 
-        timeout: 10000, 
-        headers: { 'User-Agent': getRandomUserAgent() } 
+      const response = await axios.get(currentSitemapUrl, {
+        timeout: 10000,
+        headers: { 'User-Agent': getRandomUserAgent() },
+        ...getAxiosHttpAgentConfig(),
       });
 
       const $ = cheerio.load(response.data, { xmlMode: true });

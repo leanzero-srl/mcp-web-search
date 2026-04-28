@@ -380,7 +380,12 @@ export class TelemetryCollector {
 }
 
 /**
- * Global instance for use across the application
+ * Global instance for use across the application.
+ *
+ * Audit logging is on by default — JSON-stderr lines are cheap, the MCP
+ * protocol uses stdout exclusively, and otherwise the structured event stream
+ * (cache hits, engine selection, tool errors) is dead code in production.
+ * Set `DISABLE_AUDIT_LOG=true` to silence it.
  */
-export const auditLogger = new AuditLogger(process.env.DEBUG_AUDIT === 'true');
+export const auditLogger = new AuditLogger(process.env.DISABLE_AUDIT_LOG !== 'true');
 export const telemetryCollector = new TelemetryCollector(true);
