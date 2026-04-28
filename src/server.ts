@@ -62,12 +62,7 @@ const TOOL_TIMEOUTS = {
 };
 import { GitHubExtractor, parseGitHubUrl } from './github-extractor.js';
 import { openAPIExtractor } from './openapi-extractor.js';
-
-// ============================================================================
-// Import Phase 3 modules (Intelligence Expansion)
-// ============================================================================
-
-import { semanticCache } from './semantic-cache.js';
+import { attachClientDetect, isAgenticClient, getClientInfo } from './client-detect.js';
 
 // ============================================================================
 // Import observability module
@@ -170,6 +165,11 @@ export class WebSearchMCPServer {
       name: 'web-search-mcp',
       version: '0.3.1',
     });
+
+    // Detect the client (agentic vs LM-Studio-style) at the initialize
+    // handshake. Tool handlers branch on the result to decide whether to
+    // return content inline or behind a file path.
+    attachClientDetect(this.server);
 
     const maxRPM = parseInt(process.env.SEARCH_ENGINE_MAX_RPM || '50', 10);
     const resetMS = parseInt(process.env.SEARCH_ENGINE_RESET_MS || '60000', 10);
@@ -704,7 +704,7 @@ export class WebSearchMCPServer {
           // Cleanup old files if needed
           cleanupOldFiles(outputDir, maxFiles);
 
-          const results: Array<{ url: string; filePath: string; success: boolean; error?: string }> = [];
+          const results: Array<{ url: string; filePath: string; success: boolean; error?: string; mdContent?: string }> = [];
 
           // When appendToExisting is true, process URLs sequentially to avoid race conditions
           // on the shared output file. Otherwise, use parallel processing with concurrency limit (max 3).
@@ -720,7 +720,7 @@ export class WebSearchMCPServer {
           let completedCount = 0;
           const totalUrls = urls.length;
 
-          const processingTasks = urls.map((currentUrl, index) =>
+          const processingTasks = urls.map((currentUrl) =>
             limit(async () => {
               completedCount++;
               console.log(`[MCP] Processing URL ${completedCount}/${totalUrls}: ${currentUrl}`);
@@ -729,7 +729,8 @@ export class WebSearchMCPServer {
                 // Extract content with retry
                 const extractionResult = await extractContentWithRetry(currentUrl, sessionId);
 
-                let { content, digest } = extractionResult;
+                let { content } = extractionResult;
+                const { digest } = extractionResult;
 
                 if (!content || content.trim().length === 0) {
                   throw new Error('Extracted content is empty');
@@ -844,7 +845,7 @@ export class WebSearchMCPServer {
                 console.log(`[MCP] Successfully saved research to: ${filePath}`);
               }
 
-              return { url: currentUrl, filePath: finalFilePath, success: true as const };
+              return { url: currentUrl, filePath: finalFilePath, success: true as const, mdContent };
             } catch (error) {
               const errorMessage = error instanceof Error ? error.message : String(error);
               console.error(`[MCP] Failed to process ${currentUrl}: ${errorMessage}`);
@@ -862,11 +863,22 @@ export class WebSearchMCPServer {
             }
           }
 
-          // Generate response
+          // Generate response. For agentic clients (Cline / Claude Desktop /
+          // Roo Code) we return only paths — they have a sibling filesystem
+          // MCP and will read the markdown directly. For non-agent clients
+          // (LM Studio in chat mode) the file path is unreachable, so embed
+          // the markdown content inline. Per-result content is hard-capped
+          // to keep total response inside MAX_OUTPUT_LENGTH.
           const successfulResults = results.filter(r => r.success);
           const failedResults = results.filter(r => !r.success);
+          const agentic = isAgenticClient();
 
-          let responseText = `Research complete! Processed ${results.length} URL(s).\n\n`;
+          let responseText = `Research complete! Processed ${results.length} URL(s).\n`;
+          if (!agentic) {
+            const info = getClientInfo();
+            responseText += `*Client: ${info?.name || 'unknown'} (non-agent) — embedding content inline; file paths still listed for reference.*\n`;
+          }
+          responseText += '\n';
 
           if (successfulResults.length > 0) {
             responseText += `**✅ Successful (${successfulResults.length}):**\n`;
@@ -874,6 +886,20 @@ export class WebSearchMCPServer {
               responseText += `- ${r.url} → \`${r.filePath}\`\n`;
             });
             responseText += '\n';
+
+            if (!agentic) {
+              const totalCap = parseInt(process.env.MAX_OUTPUT_LENGTH || '50000', 10);
+              const perResultCap = Math.max(2000, Math.floor(totalCap / Math.max(1, successfulResults.length)));
+              for (const r of successfulResults) {
+                if (!r.mdContent) continue;
+                let chunk = r.mdContent;
+                if (chunk.length > perResultCap) {
+                  chunk = chunk.substring(0, perResultCap) + `\n\n[Truncated at ${perResultCap} chars; full markdown saved to ${r.filePath}]`;
+                }
+                responseText += `\n---\n\n${chunk}\n`;
+              }
+              responseText += '\n';
+            }
           }
 
           if (failedResults.length > 0) {
@@ -897,14 +923,20 @@ export class WebSearchMCPServer {
       }
     );
 
-    // Register the website sitemap discovery tool
+    // Register the unified sitemap tool. Combines discovery and keyword
+    // filtering — previously two separate tools (get-website-sitemap +
+    // filter-sitemap-urls) that small models often chained incorrectly.
+    // Optionally also extracts content from the top-N matches in one call,
+    // collapsing the typical 3-step research flow into a single tool call.
     this.server.tool(
       'get-website-sitemap',
-      'Discover all available page URLs on a website by reading its sitemap.xml file. This is the RECOMMENDED FIRST STEP when you have a specific domain URL (e.g., https://company.com). If this tool returns a large number of URLs, it is highly recommended to use filter-sitemap-urls as your next step to narrow down high-value pages before attempting content extraction, as extracting all URLs directly may exceed context limits and reduce precision.',
+      'Read a website\'s sitemap.xml and (optionally) filter it by keywords. With `extractTopMatching` set, this also fetches content for the top-N matched URLs in the same call — collapsing the typical sitemap → filter → extract chain into one round-trip. Recommended first step when you have a specific domain URL and want to find high-value pages on it.',
       {
-        url: z.string().url().describe('The base URL of the website to discover the sitemap for (e.g., https://example.com)'),
-        offset: z.number().optional().default(0).describe('Starting index for pagination (default: 0)'),
-        limit: z.number().optional().default(100).describe('Maximum number of URLs to return per page (default: 100, max: 500)'),
+        url: z.string().url().describe('The base URL of the website (e.g., https://example.com).'),
+        keywords: z.array(z.string()).optional().describe('Optional. When provided, URLs are scored by case-insensitive keyword count and only matches are returned, sorted best-first.'),
+        offset: z.number().optional().default(0).describe('Starting index for pagination (default: 0).'),
+        limit: z.number().optional().default(100).describe('Max URLs returned per page. Without keywords: default 100, max 500. With keywords: default 20, max 200.'),
+        extractTopMatching: z.number().optional().describe('When set with `keywords`, also extract content from the top-N matched URLs and embed it in the response. Bounded 1..5.'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-website-sitemap`);
@@ -920,20 +952,37 @@ export class WebSearchMCPServer {
             throw new Error('Invalid arguments: url is required and must be a string');
           }
 
-          // Parse pagination params
+          const keywordsRaw = obj.keywords;
+          const keywords: string[] = Array.isArray(keywordsRaw)
+            ? keywordsRaw.filter((k): k is string => typeof k === 'string' && k.trim().length > 0)
+            : [];
+          const filtering = keywords.length > 0;
+
           let offset = 0;
           if (obj.offset !== undefined) {
             const offsetVal = typeof obj.offset === 'string' ? parseInt(obj.offset, 10) : obj.offset;
             offset = typeof offsetVal === 'number' && !isNaN(offsetVal) && offsetVal >= 0 ? offsetVal : 0;
           }
 
-          let limit = 100;
+          const defaultLimit = filtering ? 20 : 100;
+          const maxLimit = filtering ? 200 : 500;
+          let limit = defaultLimit;
           if (obj.limit !== undefined) {
             const limitVal = typeof obj.limit === 'string' ? parseInt(obj.limit, 10) : obj.limit;
-            limit = typeof limitVal === 'number' && !isNaN(limitVal) && limitVal > 0 ? Math.min(limitVal, 500) : 100;
+            limit = typeof limitVal === 'number' && !isNaN(limitVal) && limitVal > 0 ? Math.min(limitVal, maxLimit) : defaultLimit;
           }
 
-          console.log(`[MCP] Starting sitemap discovery for: ${obj.url} (offset=${offset}, limit=${limit})`);
+          // Bound extractTopMatching to a sensible window so a single call
+          // can't blow the per-tool timeout budget by extracting dozens of pages.
+          let extractTopMatching = 0;
+          if (filtering && obj.extractTopMatching !== undefined) {
+            const v = typeof obj.extractTopMatching === 'string' ? parseInt(obj.extractTopMatching, 10) : obj.extractTopMatching;
+            if (typeof v === 'number' && !isNaN(v) && v > 0) {
+              extractTopMatching = Math.min(5, v);
+            }
+          }
+
+          console.log(`[MCP] Sitemap call for ${obj.url} (filtering=${filtering}, extractTopMatching=${extractTopMatching}, offset=${offset}, limit=${limit})`);
           const allUrls = await fetchSitemapUrls(obj.url);
 
           if (allUrls.length === 0) {
@@ -947,35 +996,72 @@ export class WebSearchMCPServer {
             };
           }
 
-          // Apply pagination
-          const totalPages = Math.ceil(allUrls.length / limit);
+          let displayedUrls: string[];
+          let totalForPagination: number;
+          let header: string;
+
+          if (filtering) {
+            const scored = allUrls
+              .map((u) => {
+                const lower = u.toLowerCase();
+                const score = keywords.reduce((s, kw) => s + (lower.includes(kw.toLowerCase()) ? 1 : 0), 0);
+                return { url: u, score };
+              })
+              .filter((x) => x.score > 0)
+              .sort((a, b) => b.score - a.score);
+            totalForPagination = scored.length;
+            displayedUrls = scored.slice(offset, offset + limit).map((x) => x.url);
+            header = `**Filtered Sitemap for ${obj.url}**\n\n**Keywords:** ${keywords.join(', ')}\n**Matches:** ${totalForPagination} of ${allUrls.length} total URLs\n`;
+          } else {
+            totalForPagination = allUrls.length;
+            displayedUrls = allUrls.slice(offset, offset + limit);
+            header = `**Sitemap for ${obj.url}**\n\n**Total URLs:** ${allUrls.length}\n`;
+          }
+
+          const totalPages = Math.max(1, Math.ceil(totalForPagination / limit));
           const currentPage = Math.floor(offset / limit) + 1;
-          const paginatedUrls = allUrls.slice(offset, offset + limit);
 
-          console.log(`[MCP] Sitemap discovery completed, found ${allUrls.length} total URLs (showing page ${currentPage}/${totalPages})`);
-
-          let responseText = `**Sitemap Discovery Results for: ${obj.url}**\n\n`;
-          responseText += `**Total URLs:** ${allUrls.length}\n`;
-          responseText += `**Page:** ${currentPage}/${totalPages} (showing ${paginatedUrls.length} URLs)\n\n`;
-          responseText += `**URLs:**\n`;
-
-          paginatedUrls.forEach((url, idx) => {
-            responseText += `${idx + 1 + offset}. ${url}\n`;
+          let responseText = header + `**Page:** ${currentPage}/${totalPages} (showing ${displayedUrls.length} URLs)\n\n**URLs:**\n`;
+          displayedUrls.forEach((u, idx) => {
+            responseText += `${idx + 1 + offset}. ${u}\n`;
           });
 
-          // Pagination hints
           if (currentPage < totalPages) {
             const nextOffset = offset + limit;
             responseText += `\n💡 **Next page:** Use offset=${nextOffset} to see more URLs.\n`;
           }
 
-          // Tiered Guidance based on total URL count
-          if (allUrls.length > 100) {
-            responseText += `\n⚠️ **Observation:** This website contains ${allUrls.length} URLs. Consider using 'filter-sitemap-urls' with targeted keywords to narrow down high-value pages.\n`;
-          } else if (allUrls.length > 20) {
-            responseText += `\nℹ️ **Note:** The site has ${allUrls.length} URLs. Consider using 'filter-sitemap-urls' to target specific sections.\n`;
-          } else {
-            responseText += `\n💡 **Suggestion:** With only ${allUrls.length} URLs, you can proceed directly to content extraction.\n`;
+          if (!filtering) {
+            if (allUrls.length > 100) {
+              responseText += `\n⚠️ **Tip:** Re-call with a \`keywords\` array to narrow down high-value pages, or set \`extractTopMatching: 3\` to also pull content from the top matches in one shot.\n`;
+            } else if (allUrls.length > 20) {
+              responseText += `\nℹ️ **Tip:** Re-call with \`keywords\` to target specific sections.\n`;
+            }
+          }
+
+          if (filtering && displayedUrls.length === 0 && offset === 0) {
+            responseText += `\nNo URLs matched the keywords. Try broader terms or remove keywords to see the full sitemap.\n`;
+          }
+
+          // One-shot follow-up: extract content from the top N matches.
+          if (filtering && extractTopMatching > 0 && displayedUrls.length > 0) {
+            const targets = displayedUrls.slice(0, extractTopMatching);
+            responseText += `\n---\n\n**Extracted content (top ${targets.length} match${targets.length === 1 ? '' : 'es'}):**\n`;
+            const sessionId = this.generateSessionId();
+            const inlineCap = parseInt(process.env.MAX_OUTPUT_LENGTH || '50000', 10);
+            const perResultCap = Math.max(2000, Math.floor((inlineCap - responseText.length) / Math.max(1, targets.length)));
+            for (const target of targets) {
+              try {
+                const extraction = await this.contentExtractor.extractContent({ url: target, sessionId });
+                let chunk = extraction.content;
+                if (chunk.length > perResultCap) {
+                  chunk = chunk.substring(0, perResultCap) + `\n\n[Truncated at ${perResultCap} chars]`;
+                }
+                responseText += `\n### ${target}\n\n${chunk}\n`;
+              } catch (err) {
+                responseText += `\n### ${target}\n\n[Extraction failed: ${err instanceof Error ? err.message : 'unknown error'}]\n`;
+              }
+            }
           }
 
           return {
@@ -992,99 +1078,35 @@ export class WebSearchMCPServer {
       }
     );
 
-    // Register the sitemap filtering tool for large websites
-    this.server.tool(
-      'filter-sitemap-urls',
-      'Filter a website\'s sitemap to find high-value pages based on keywords. This is a RECOMMENDED next step after get-website-sitemap when many URLs are found, especially for large corporate sites. Example: If researching "what Sanofi does", use keywords like ["about", "company", "strategy", "mission"]. This ensures you extract content from the most authoritative pages rather than random search results.',
-      {
-        url: z.string().url().describe('The base URL of the website'),
-        keywords: z.array(z.string()).describe('Keywords to look for in URLs (e.g., ["about", "strategy", "mission"])'),
-        offset: z.number().optional().default(0).describe('Starting index for pagination (default: 0)'),
-        limit: z.number().optional().default(20).describe('Maximum number of matching URLs to return (default: 20, max: 200)'),
-      },
-      async (args: unknown) => {
-        console.log(`[MCP] Tool call received: filter-sitemap-urls`);
-        try {
-          if (typeof args !== 'object' || args === null) throw new Error('Invalid arguments');
-          const obj = args as Record<string, any>;
+    // (filter-sitemap-urls was merged into get-website-sitemap. Pass a
+    // `keywords` array to filter; pass `extractTopMatching` to also extract
+    // content from the top matches in the same call.)
 
-          // Parse pagination params
-          let offset = 0;
-          if (obj.offset !== undefined) {
-            const offsetVal = typeof obj.offset === 'string' ? parseInt(obj.offset, 10) : obj.offset;
-            offset = typeof offsetVal === 'number' && !isNaN(offsetVal) && offsetVal >= 0 ? offsetVal : 0;
-          }
-
-          let limit = 20;
-          if (obj.limit !== undefined) {
-            const limitVal = typeof obj.limit === 'string' ? parseInt(obj.limit, 10) : obj.limit;
-            limit = typeof limitVal === 'number' && !isNaN(limitVal) && limitVal > 0 ? Math.min(limitVal, 200) : 20;
-          }
-
-          console.log(`[MCP] Filtering sitemap for ${obj.url} with keywords: ${obj.keywords.join(', ')} (offset=${offset}, limit=${limit})`);
-          const allUrls = await fetchSitemapUrls(obj.url);
-
-          if (allUrls.length === 0) {
-            return { content: [{ type: 'text', text: `No URLs found in sitemap for ${obj.url}` }] };
-          }
-
-          // Score URLs based on keyword matches
-          const scoredUrls = allUrls.map(url => {
-            let score = 0;
-            const lowerUrl = url.toLowerCase();
-            obj.keywords.forEach((kw: string) => {
-              if (lowerUrl.includes(kw.toLowerCase())) score++;
-            });
-            return { url, score };
-          })
-          .filter(item => item.score > 0)
-          .sort((a, b) => b.score - a.score);
-
-          const totalMatches = scoredUrls.length;
-          const filtered = scoredUrls.slice(offset, offset + limit).map(i => i.url);
-
-          if (filtered.length === 0 && offset === 0) {
-            return { content: [{ type: 'text', text: `No URLs matched the keywords for ${obj.url}. Found ${allUrls.length} total URLs.` }] };
-          }
-
-          // Pagination info
-          const totalPages = Math.ceil(totalMatches / limit);
-          const currentPage = Math.floor(offset / limit) + 1;
-
-          let responseText = `**Filtered Sitemap Results for: ${obj.url}**\n\n`;
-          responseText += `**Total Matches:** ${totalMatches}\n`;
-          responseText += `**Page:** ${currentPage}/${totalPages} (showing ${filtered.length} URLs)\n\n`;
-          filtered.forEach((url, idx) => {
-            responseText += `${idx + 1 + offset}. ${url}\n`;
-          });
-
-          if (currentPage < totalPages) {
-            const nextOffset = offset + limit;
-            responseText += `\n💡 **Next page:** Use offset=${nextOffset} to see more results.\n`;
-          }
-
-          return { content: [{ type: 'text', text: responseText }] };
-        } catch (error) {
-          this.handleError(error, 'filter-sitemap-urls');
-        }
-      }
-    );
-
-    // Register the GitHub repository content extraction tool
+    // Register the unified GitHub repo tool. Three modes:
+    //   - 'crawl' (default): README + recursive code-file crawl with previews
+    //   - 'list':            single-directory listing (replaces former
+    //                        get-github-directory-contents tool)
+    //   - 'file':            full content of a single file at `path`
+    // The `previewLength` parameter widens the per-file preview cap in
+    // `crawl` mode (default 500, max 5000). Underlying extractor already
+    // pulls full file content; the cap lives at the response layer.
     this.server.tool(
       'get-github-repo-content',
-      'Extract and return content from a GitHub repository. This tool fetches README.md and crawls code files (.js, .ts, .py, etc.) from the repository. Use this when you need to understand the structure and contents of a GitHub project.',
+      'Inspect a GitHub repository in three modes: `crawl` (default — README + recursive code-file crawl with per-file previews), `list` (one directory listing — files and folders by name), or `file` (full content of a single file at `path`). Set `previewLength` to widen the per-file preview cap in crawl mode (default 500, max 5000). Honors GITHUB_TOKEN for authenticated 5000 req/hr quota.',
       {
-        url: z.string().url().describe('The URL of the GitHub repository (e.g., https://github.com/owner/repo)'),
-        maxDepth: z.number().optional().describe('Maximum directory depth to crawl (default: from environment or 3)'),
-        maxFiles: z.number().optional().describe('Maximum number of files to extract content from (default: from environment or 50)'),
+        url: z.string().url().describe('GitHub repo URL, e.g. https://github.com/owner/repo'),
+        mode: z.enum(['crawl', 'list', 'file']).optional().default('crawl').describe('What to return. Default: crawl.'),
+        path: z.string().optional().describe('Used by `list` (directory) and `file` (single file). Empty string lists the repo root.'),
+        branch: z.string().optional().describe('Branch override (defaults to repo default branch).'),
+        maxDepth: z.number().optional().describe('crawl mode only. Max directory depth (default: GITHUB_MAX_DEPTH or 3).'),
+        maxFiles: z.number().optional().describe('crawl mode only. Max files crawled (default: GITHUB_MAX_FILES or 50).'),
+        previewLength: z.number().optional().default(500).describe('crawl mode only. Per-file preview cap in chars (default 500, max 5000).'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-github-repo-content`);
         console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
 
         try {
-          // Validate arguments
           if (typeof args !== 'object' || args === null) {
             throw new Error('Invalid arguments: args must be an object');
           }
@@ -1094,153 +1116,108 @@ export class WebSearchMCPServer {
             throw new Error('Invalid arguments: url is required and must be a string');
           }
 
-          // Zod already validates and converts these to numbers
-          const maxDepth = (obj.maxDepth as number) ?? undefined;
-          const maxFiles = (obj.maxFiles as number) ?? undefined;
-
-          console.log(`[MCP] Starting GitHub repository extraction for: ${obj.url}`);
-          
-          // Validate we have a GitHub extractor initialized
           if (!this.githubExtractor) {
-            throw new Error('GitHub extractor is not initialized. Check GITHUB_MAX_DEPTH, GITHUB_MAX_FILES environment variables.');
+            throw new Error('GitHub extractor is not initialized.');
           }
 
-          // Use the GitHub extractor to get repository content
+          const mode = ((obj.mode as string) || 'crawl') as 'crawl' | 'list' | 'file';
+          const branch = typeof obj.branch === 'string' ? obj.branch : undefined;
+          const targetPath = typeof obj.path === 'string' ? obj.path : '';
+
+          // === mode: list ===
+          if (mode === 'list') {
+            const repoInfo = parseGitHubUrl(obj.url);
+            if (!repoInfo) throw new Error(`Invalid GitHub URL format: ${obj.url}`);
+
+            const contents = await withTimeout(
+              this.githubExtractor.getContent(repoInfo.owner, repoInfo.repo, targetPath, branch),
+              TOOL_TIMEOUTS.github,
+              'get-github-repo-content/list',
+            );
+
+            if (contents.length === 0) {
+              return { content: [{ type: 'text' as const, text: `No contents found at path: ${targetPath || '/'}` }] };
+            }
+
+            const dirs = contents.filter((i) => i.type === 'dir').sort((a, b) => a.name.localeCompare(b.name));
+            const files = contents.filter((i) => i.type === 'file').sort((a, b) => a.name.localeCompare(b.name));
+
+            let body = `**Directory listing:** ${obj.url}${targetPath ? ` (${targetPath})` : ''}\n\n`;
+            if (dirs.length) body += `**Directories:**\n` + dirs.map((d) => `📁 ${d.name}/`).join('\n') + '\n\n';
+            if (files.length) body += `**Files:**\n` + files.map((f) => `📄 ${f.name}`).join('\n') + '\n';
+
+            return { content: [{ type: 'text' as const, text: body }] };
+          }
+
+          // === mode: file ===
+          if (mode === 'file') {
+            if (!targetPath) {
+              throw new Error('mode=file requires `path` (e.g. "src/index.ts")');
+            }
+            const repoInfo = parseGitHubUrl(obj.url);
+            if (!repoInfo) throw new Error(`Invalid GitHub URL format: ${obj.url}`);
+
+            const fileContent = await withTimeout(
+              this.githubExtractor.getFileContent(repoInfo.owner, repoInfo.repo, targetPath, branch),
+              TOOL_TIMEOUTS.github,
+              'get-github-repo-content/file',
+            );
+
+            const ext = targetPath.split('.').pop() || '';
+            const fence = /^(ts|tsx|js|jsx|py|java|go|rs|rb|cs|kt|swift|c|cpp|h|hpp|sh|json|yaml|yml|md|html|css)$/i.test(ext) ? ext.toLowerCase() : '';
+
+            let body = `**File:** ${repoInfo.owner}/${repoInfo.repo}/${targetPath}${branch ? `@${branch}` : ''}\n**Bytes:** ${fileContent.length}\n\n`;
+            body += `\`\`\`${fence}\n${fileContent}\n\`\`\`\n`;
+            return { content: [{ type: 'text' as const, text: body }] };
+          }
+
+          // === mode: crawl (default) ===
+          const maxDepth = (obj.maxDepth as number) ?? undefined;
+          const maxFiles = (obj.maxFiles as number) ?? undefined;
+          const previewLength = Math.min(5000, Math.max(100, (obj.previewLength as number) ?? 500));
+
+          console.log(`[MCP] GitHub crawl for ${obj.url} (previewLength=${previewLength})`);
           const result = await withTimeout(
-            this.githubExtractor.extractGitHubContent(obj.url, {
-              maxDepth,
-              maxFiles,
-            }),
+            this.githubExtractor.extractGitHubContent(obj.url, { maxDepth, maxFiles }),
             TOOL_TIMEOUTS.github,
-            'get-github-repo-content',
+            'get-github-repo-content/crawl',
           );
 
-           console.log(`[MCP] GitHub extraction completed: ${result.repositoryInfo.owner}/${result.repositoryInfo.repo} (${result.files.length} files)`);
- 
-           let responseText = `**Repository:** ${result.repositoryInfo.owner}/${result.repositoryInfo.repo}\n\n`;
-
+          let responseText = `**Repository:** ${result.repositoryInfo.owner}/${result.repositoryInfo.repo}\n\n`;
           if (result.readme) {
             responseText += `**README.md:**\n${result.readme}\n\n`;
           } else {
-            responseText += `**README.md:** No README found\n\n`;
+            responseText += `**README.md:** *(none found)*\n\n`;
           }
 
-          // Add file list
           if (result.files.length > 0) {
-            responseText += `**Files:**\n`;
+            responseText += `**Files (${result.files.length}, previewLength=${previewLength}):**\n`;
             result.files.forEach((file, idx) => {
               responseText += `${idx + 1}. ${file.path} (${file.size || 0} bytes)\n`;
-              
-              // Include file content preview (first 500 chars)
               if (file.content && file.content.length > 0) {
-                let contentPreview = file.content.trim();
-                if (contentPreview.length > 500) {
-                  contentPreview = contentPreview.substring(0, 500) + `\n\n[Content truncated at 500 characters]`;
+                let preview = file.content.trim();
+                if (preview.length > previewLength) {
+                  preview = preview.substring(0, previewLength) + `\n\n[Truncated at ${previewLength} chars; call with mode="file" and path="${file.path}" for full content]`;
                 }
-                responseText += `   Preview: ${contentPreview}\n`;
+                responseText += `   Preview:\n${preview}\n\n`;
               }
             });
           } else {
-            responseText += `**Files:** No files found or all files were skipped.\n`;
+            responseText += `**Files:** *(none found or all skipped)*\n`;
           }
 
-           return {
-             content: [
-               {
-                 type: 'text' as const,
-                 text: responseText,
-               },
-             ],
-           };
-         } catch (error) {
-           this.handleError(error, 'get-github-repo-content');
-         }
-       }
-     );
- 
-     // Register the GitHub directory listing tool
-     this.server.tool(
-       'get-github-directory-contents',
-       'List the files and directories within a specific path of a GitHub repository. This tool is useful for exploring the repository structure before fetching specific file contents.',
-       {
-         url: z.string().url().describe('The URL of the GitHub repository (e.g., https://github.com/owner/repo)'),
-         path: z.string().optional().describe('The path within the repository to list (e.g., "docs/technical")'),
-         branch: z.string().optional().describe('The branch to use (e.g., "main")'),
-       },
-       async (args: unknown) => {
-         console.log(`[MCP] Tool call received: get-github-directory-contents`);
-         console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
- 
-         try {
-           if (typeof args !== 'object' || args === null) {
-             throw new Error('Invalid arguments: args must be an object');
-           }
-           const obj = args as Record<string, unknown>;
- 
-           if (!obj.url || typeof obj.url !== 'string') {
-             throw new Error('Invalid arguments: url is required and must be a string');
-           }
- 
-           const repoInfo = parseGitHubUrl(obj.url);
-           if (!repoInfo) {
-             throw new Error(`Invalid GitHub URL format: ${obj.url}`);
-           }
- 
-           const targetPath = (obj.path as string) || '';
-           const branch = obj.branch as string | undefined;
- 
-           if (!this.githubExtractor) {
-             throw new Error('GitHub extractor is not initialized.');
-           }
- 
-           console.log(`[MCP] Fetching directory contents for ${repoInfo.owner}/${repoInfo.repo}:${targetPath}`);
-           const contents = await this.githubExtractor.getContent(
-             repoInfo.owner,
-             repoInfo.repo,
-             targetPath,
-             branch
-           );
- 
-           if (contents.length === 0) {
-             return {
-               content: [{ type: 'text' as const, text: `No contents found at path: ${targetPath}` }],
-             };
-           }
- 
-           let responseText = `**Directory Listing for:** ${obj.url}${targetPath ? ` (${targetPath})` : ''}\n\n`;
-           
-           // Separate directories and files for better presentation
-           const dirs = contents.filter(item => item.type === 'dir').sort((a, b) => a.name.localeCompare(b.name));
-           const files = contents.filter(item => item.type === 'file').sort((a, b) => a.name.localeCompare(b.name));
- 
-           if (dirs.length > 0) {
-             responseText += `**Directories:**\n`;
-             dirs.forEach(dir => {
-               responseText += `📁 ${dir.name}/\n`;
-             });
-             responseText += `\n`;
-           }
- 
-           if (files.length > 0) {
-             responseText += `**Files:**\n`;
-             files.forEach(file => {
-               responseText += `📄 ${file.name}\n`;
-             });
-           }
- 
-           return {
-             content: [
-               {
-                 type: 'text' as const,
-                 text: responseText,
-               },
-             ],
-           };
-         } catch (error) {
-           this.handleError(error, 'get-github-directory-contents');
-         }
-       }
-     );
+          return { content: [{ type: 'text' as const, text: responseText }] };
+        } catch (error) {
+          this.handleError(error, 'get-github-repo-content');
+        }
+      }
+    );
+
+    // (get-github-directory-contents was merged into get-github-repo-content
+    // as `mode: 'list'`. The single-file-content path is exposed as
+    // `mode: 'file'` with `path`. The previous extra tool only returned
+    // names — small models often called it without a follow-up; folding it
+    // in lets the caller pick the right depth in one decision.)
  
      // Register the OpenAPI specification extraction tool
     this.server.tool(
@@ -1317,8 +1294,34 @@ export class WebSearchMCPServer {
             if (result.openAPISpec.docType) responseText += `- Type: ${result.openAPISpec.docType}\n`;
             if (result.openAPISpec.size !== undefined) responseText += `- Size: ${result.openAPISpec.size} bytes\n`;
           }
-          
-          responseText += `\n**Note:** The full OpenAPI specification has been saved to:\`${result.downloadedFile?.localPath || 'docs/technical/openapi/' + obj.url.replace(/[^a-z0-9]/gi, '-')}.json\`\n\nYou can read this file directly for the complete API documentation without needing to re-extract it.\n`;
+
+          // For agentic clients (Cline / Claude Desktop / Roo Code) the path
+          // is enough — they have a sibling filesystem MCP and will read it.
+          // For non-agent clients (LM Studio in chat mode) the path is
+          // unreachable, so embed the spec content inline up to OPENAPI_INLINE_CAP.
+          if (result.downloadedFile) {
+            responseText += `\n**Saved to:** \`${result.downloadedFile.localPath}\`\n`;
+
+            if (!isAgenticClient()) {
+              const inlineCap = parseInt(process.env.OPENAPI_INLINE_CAP || '50000', 10);
+              try {
+                const specBytes = await fs.promises.readFile(result.downloadedFile.localPath, 'utf8');
+                let chunk = specBytes;
+                let truncated = false;
+                if (chunk.length > inlineCap) {
+                  chunk = chunk.substring(0, inlineCap);
+                  truncated = true;
+                }
+                const isYaml = result.downloadedFile.fileName.endsWith('.yaml') || result.downloadedFile.fileName.endsWith('.yml');
+                responseText += `\n**Spec Content (inline for non-agent client):**\n\`\`\`${isYaml ? 'yaml' : 'json'}\n${chunk}\n\`\`\`\n`;
+                if (truncated) {
+                  responseText += `\n[Truncated to ${inlineCap} chars; full spec is at the path above. Re-call with \`forceRefresh: true\` and a wider \`OPENAPI_INLINE_CAP\` env if you need more.]\n`;
+                }
+              } catch (err) {
+                responseText += `\n[Unable to embed spec inline: ${err instanceof Error ? err.message : 'read error'}]\n`;
+              }
+            }
+          }
           
           return {
             content: [
@@ -1401,17 +1404,21 @@ export class WebSearchMCPServer {
               responseText += `Relevance Score: ${(result.relevanceScore * 100).toFixed(1)}%\n`;
               responseText += `Description: ${result.description}\n`;
               
+              // Tunable per-result caps. Defaults match the previous
+              // hard-coded values; raise via env when running on hardware
+              // with a larger context budget.
+              const fullCap = parseInt(process.env.PROGRESSIVE_FULL_CONTENT_CAP || '3000', 10);
+              const previewCap = parseInt(process.env.PROGRESSIVE_PREVIEW_CAP || '1000', 10);
               if (result.fullContent && result.fullContent.trim()) {
                 let content = result.fullContent;
-                const maxLength = 3000; // Reasonable preview for progressive search
-                if (content.length > maxLength) {
-                  content = content.substring(0, maxLength) + `\n\n[Content truncated at ${maxLength} characters]`;
+                if (content.length > fullCap) {
+                  content = content.substring(0, fullCap) + `\n\n[Content truncated at ${fullCap} characters]`;
                 }
                 responseText += `\n**Content Preview:**\n${content}\n`;
               } else if (result.contentPreview && result.contentPreview.trim()) {
                 let content = result.contentPreview;
-                if (content.length > 1000) {
-                  content = content.substring(0, 1000) + `\n\n[Content truncated at 1000 characters]`;
+                if (content.length > previewCap) {
+                  content = content.substring(0, previewCap) + `\n\n[Content truncated at ${previewCap} characters]`;
                 }
                 responseText += `\n**Content Preview:**\n${content}\n`;
               }
@@ -1500,223 +1507,90 @@ export class WebSearchMCPServer {
       }
     );
 
-    // Register the cached-web-search tool (search with semantic caching)
-    this.server.tool(
-      'cached-web-search',
-      'Search the web using intelligent caching. This tool first checks if similar queries have been recently searched and returns cached results when available. Use this for repeated or related queries to save time and reduce API calls.',
-      {
-        query: z.string().describe('Search query to execute (uses semantic cache)'),
-        limit: z.number().optional().default(5).describe('Number of results to return with full content (1-10)'),
-        includeContent: z.boolean().optional().default(true).describe('Whether to fetch full page content (default: true)'),
-        maxContentLength: z.number().optional().describe('Maximum characters per result content (0 = no limit).'),
-      },
-      async (args: unknown) => {
-        console.log(`[MCP] Tool call received: cached-web-search`);
-        console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
-
-        try {
-          // Validate and convert arguments
-          if (typeof args !== 'object' || args === null) {
-            throw new Error('Invalid arguments: args must be an object');
-          }
-          const obj = args as Record<string, unknown>;
-
-          if (!obj.query || typeof obj.query !== 'string') {
-            throw new Error('Invalid arguments: query is required and must be a string');
-          }
-
-          // Zod already validates and converts these types
-          const limit = (obj.limit as number) ?? 5;
-          const includeContent = (obj.includeContent as boolean) ?? true;
-          const maxContentLengthRaw = (obj.maxContentLength as number) ?? undefined;
-          const maxContentLength = maxContentLengthRaw === 0 ? undefined : maxContentLengthRaw;
-
-          const query = obj.query;
-
-          console.log(`[MCP] Checking semantic cache for: "${query}"`);
-
-          // Check if we have cached results for this query
-          const cachedEntry = await semanticCache.get(query);
-          
-          if (cachedEntry) {
-            console.log(`[MCP] Cache HIT for: "${query}"`);
-            
-            // Format cached results as text
-            let responseText = `**Cached Results for: "${query}"**\n\n`;
-            responseText += `**Cache Hit:** Yes - returned from cache\n`;
-            responseText += `**Query Meaning Match:** Found similar query in cache\n\n`;
-
-            if (Array.isArray(cachedEntry.results)) {
-              cachedEntry.results.slice(0, limit).forEach((result: SearchResult, idx) => {
-                responseText += `**${idx + 1}. ${result.title}**\n`;
-                responseText += `URL: ${result.url}\n`;
-                responseText += `Description: ${result.description}\n`;
-                
-                if (includeContent && result.fullContent) {
-                  let content = result.fullContent;
-                  if (maxContentLength && maxContentLength > 0 && content.length > maxContentLength) {
-                    content = content.substring(0, maxContentLength) + `\n\n[Content truncated at ${maxContentLength} characters]`;
-                  }
-                  responseText += `\n**Full Content:**\n${content}\n`;
-                }
-                
-                responseText += `\n---\n\n`;
-              });
-            } else {
-              responseText += `No results found in cache.\n`;
-            }
-
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: responseText,
-                },
-              ],
-            };
-          }
-
-           console.log(`[MCP] Cache MISS for: "${query}" - performing fresh search`);
- 
-           // Perform the actual web search
-           const searchResponse = await this.searchEngine.search({
-             query,
-             numResults: limit * 2 + 2, // Request extra to account for potential PDF files
-           });
- 
-           const searchResults = searchResponse.results;
- 
-           console.log(`[MCP] Search completed, found ${searchResults.length} results`);
- 
-           // Extract content from each result if requested
-           let enhancedResults: SearchResult[] = [];
-           if (includeContent) {
-             const sessionId = this.generateSessionId();
-             enhancedResults = await this.contentExtractor.extractContentForResults(
-               searchResults.slice(0, limit),
-               limit,
-               maxContentLength,
-               sessionId
-             );
-           } else {
-             enhancedResults = searchResults.slice(0, limit);
-           }
- 
-           // Store results in cache for future similar queries
-          await semanticCache.set(query, enhancedResults);
-
-          console.log(`[MCP] Results cached for: "${query}"`);
-
-          // Format the results as text
-          let responseText = `**Search Results for: "${query}"**\n\n`;
-          responseText += `**Cache Hit:** No - performed fresh search\n`;
-          responseText += `**Results Cached:** Yes\n\n`;
-
-          enhancedResults.forEach((searchResult, idx) => {
-            responseText += `**${idx + 1}. ${searchResult.title}**\n`;
-            responseText += `URL: ${searchResult.url}\n`;
-            responseText += `Description: ${searchResult.description}\n`;
-            
-            if (includeContent && searchResult.fullContent) {
-              let content = searchResult.fullContent;
-              if (maxContentLength && maxContentLength > 0 && content.length > maxContentLength) {
-                content = content.substring(0, maxContentLength) + `\n\n[Content truncated at ${maxContentLength} characters]`;
-              }
-              responseText += `\n**Full Content:**\n${content}\n`;
-            } else if (searchResult.contentPreview && searchResult.contentPreview.trim()) {
-              let content = searchResult.contentPreview;
-              if (maxContentLength && maxContentLength > 0 && content.length > maxContentLength) {
-                content = content.substring(0, maxContentLength) + `\n\n[Content truncated at ${maxContentLength} characters]`;
-              }
-              responseText += `\n**Content Preview:**\n${content}\n`;
-            } else if (searchResult.fetchStatus === 'error') {
-              responseText += `\n**Content Extraction Failed:** ${searchResult.error}\n`;
-            }
-            
-            responseText += `\n---\n\n`;
-          });
-
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: responseText,
-              },
-            ],
-          };
-        } catch (error) {
-          this.handleError(error, 'cached-web-search');
-        }
-      }
-    );
+    // (cached-web-search removed — the semantic cache is now wired directly
+    // into full-web-search's path via the search engine, so a separate tool
+    // was redundant and caused tool-selection confusion for small local
+    // models. The "Status:" line in full-web-search's response surfaces the
+    // engine name, which signals "semantic-cache" on cache hits.)
 
     // Register the list-cached-documents tool
     this.server.tool(
       'list-cached-documents',
-      'List all documents that have been crawled and saved by this MCP server. This includes OpenAPI specifications, technical documentation, and other extracted content. Use this to see what has already been downloaded and avoid re-crawling.',
+      'List documents previously saved by this MCP server: OpenAPI/Swagger specs (saved by get-openapi-spec) and research markdown files (saved by research_and_save_to_markdown). Use this to see what is already on disk before re-crawling. Pair with read-cached-document to fetch a file\'s contents inline (useful for clients that lack a sibling filesystem MCP).',
       {
-        category: z.string().optional().default('all').describe('Filter by category (openapi, technical-md, all)'),
+        category: z.enum(['all', 'openapi', 'research']).optional().default('all').describe('Filter by category: openapi (specs), research (markdown research files), or all.'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: list-cached-documents`);
         console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
 
         try {
-          // Zod already validates and converts category type
           const category = ((args as Record<string, unknown>).category as string) ?? 'all';
 
           console.log(`[MCP] Listing cached documents, category: ${category}`);
 
-          // Get OpenAPI specs from cache
-          const openapiSpecs = openAPIExtractor.listCachedOpenAPISpecs();
-          
-          // Filter by category if specified
-          let results = openapiSpecs;
-          if (category !== 'all' && category !== 'openapi') {
-            results = [];
-          }
+          // OpenAPI specs (only listed when category permits).
+          const openapiSpecs = (category === 'all' || category === 'openapi')
+            ? openAPIExtractor.listCachedOpenAPISpecs()
+            : [];
 
-          console.log(`[MCP] Found ${results.length} cached documents`);
-
-          // Format the result
-          let responseText = `**Cached Documents**\n\n`;
-          responseText += `**Total Cached:** ${results.length}\n`;
-          
-          if (category === 'openapi') {
-            responseText += `**Category:** OpenAPI/Swagger Specifications\n\n`;
-          } else {
-            responseText += `**Category:** All (OpenAPI, Technical Docs)\n\n`;
-          }
-
-          if (results.length === 0) {
-            responseText += `No documents found.\n`;
-          } else {
-            responseText += `\n| # | Title | File Name | Domain | Downloaded |\n`;
-            responseText += `|---|-------|-----------|--------|------------|\n`;
-            
-            results.forEach((spec, idx) => {
-              const title = spec.openAPISpec.title || 'Untitled';
-              const domain = spec.domain;
-              const date = new Date(spec.downloadTime).toLocaleDateString();
-              
-              // Truncate long titles
-              let displayTitle = title;
-              if (displayTitle.length > 40) {
-                displayTitle = title.substring(0, 37) + '...';
+          // Research markdown files. The same project-root resolution that
+          // research_and_save_to_markdown uses, so we look in the same dir.
+          const researchFiles: Array<{ fileName: string; localPath: string; mtime: Date; size: number }> = [];
+          if (category === 'all' || category === 'research') {
+            const isCwdProjectRoot = fs.existsSync(path.join(process.cwd(), 'package.json'));
+            const projectRoot = isCwdProjectRoot ? process.cwd() : path.resolve(__dirname, '..', '..');
+            const researchDir = path.join(projectRoot, 'docs', 'research-output');
+            if (fs.existsSync(researchDir)) {
+              for (const entry of fs.readdirSync(researchDir)) {
+                if (!entry.endsWith('.md')) continue;
+                const full = path.join(researchDir, entry);
+                try {
+                  const stat = fs.statSync(full);
+                  researchFiles.push({ fileName: entry, localPath: full, mtime: stat.mtime, size: stat.size });
+                } catch { /* unreadable entry — skip */ }
               }
-              
-              responseText += `| ${idx + 1} | ${displayTitle} | ${spec.fileName} | ${domain} | ${date} |\n`;
-            });
+              researchFiles.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+            }
           }
 
-          // Add cache statistics
-          const stats = openAPIExtractor.getCacheStats();
-          responseText += `\n**Cache Statistics:**\n`;
-          responseText += `- Total Entries: ${stats.total}\n`;
-          responseText += `- Valid Entries: ${stats.valid}\n`;
-          if (stats.size !== undefined) {
-            responseText += `- Cache File Size: ${(stats.size / 1024).toFixed(2)} KB\n`;
+          let responseText = `**Cached Documents**\n\n`;
+          responseText += `**Category filter:** ${category}\n`;
+          responseText += `**OpenAPI specs:** ${openapiSpecs.length}\n`;
+          responseText += `**Research files:** ${researchFiles.length}\n\n`;
+
+          if (openapiSpecs.length > 0) {
+            responseText += `### OpenAPI / Swagger specs\n\n`;
+            responseText += `| # | Title | File | Domain | Downloaded |\n|---|-------|------|--------|------------|\n`;
+            openapiSpecs.forEach((spec, idx) => {
+              const title = (spec.openAPISpec.title || 'Untitled').substring(0, 40);
+              const date = new Date(spec.downloadTime).toLocaleDateString();
+              responseText += `| ${idx + 1} | ${title} | ${spec.fileName} | ${spec.domain} | ${date} |\n`;
+            });
+            responseText += '\n';
           }
+
+          if (researchFiles.length > 0) {
+            responseText += `### Research markdown\n\n`;
+            responseText += `| # | File | Size (KB) | Modified |\n|---|------|-----------|----------|\n`;
+            researchFiles.forEach((f, idx) => {
+              responseText += `| ${idx + 1} | ${f.fileName} | ${(f.size / 1024).toFixed(1)} | ${f.mtime.toISOString()} |\n`;
+            });
+            responseText += '\n';
+          }
+
+          if (openapiSpecs.length === 0 && researchFiles.length === 0) {
+            responseText += `No documents found.\n`;
+          }
+
+          responseText += `\n*Use the \`read-cached-document\` tool with a file name to fetch contents inline.*\n`;
+
+          const stats = openAPIExtractor.getCacheStats();
+          responseText += `\n**OpenAPI cache stats:** total=${stats.total}, valid=${stats.valid}`;
+          if (stats.size !== undefined) {
+            responseText += `, file size=${(stats.size / 1024).toFixed(2)} KB`;
+          }
+          responseText += `\n`;
 
           return {
             content: [
@@ -1728,6 +1602,101 @@ export class WebSearchMCPServer {
           };
         } catch (error) {
           this.handleError(error, 'list-cached-documents');
+        }
+      }
+    );
+
+    // Register the read-cached-document tool. Companion to list-cached-documents:
+    // takes a file name (as listed) and returns its content inline. Useful for
+    // clients that don't have a sibling filesystem MCP — without this tool the
+    // listing was a dead end for LM Studio.
+    this.server.tool(
+      'read-cached-document',
+      'Return the contents of a previously-cached document by file name (as listed by list-cached-documents). Resolves the file from the OpenAPI cache directory or the research-output directory; returns text inline up to maxBytes. Refuses any name containing path separators or "..".',
+      {
+        fileName: z.string().min(1).describe('File name as shown by list-cached-documents (e.g. "example-com-petstore.json" or "research-2026-04-28-….md").'),
+        maxBytes: z.number().optional().default(50000).describe('Maximum number of bytes to return inline (default 50000, max 200000). Larger documents are truncated with a note.'),
+      },
+      async (args: unknown) => {
+        try {
+          if (typeof args !== 'object' || args === null) {
+            throw new Error('Invalid arguments: args must be an object');
+          }
+          const obj = args as Record<string, unknown>;
+          const fileName = String(obj.fileName ?? '').trim();
+          if (!fileName) {
+            throw new Error('Invalid arguments: fileName is required');
+          }
+          // Refuse traversal attempts. Allowed names match list-cached-documents output.
+          if (fileName.includes('/') || fileName.includes('\\') || fileName.includes('..')) {
+            throw new Error('Invalid file name: path separators and ".." are not permitted');
+          }
+          const maxBytes = Math.min(200_000, Math.max(1_000, (obj.maxBytes as number) ?? 50_000));
+
+          const isCwdProjectRoot = fs.existsSync(path.join(process.cwd(), 'package.json'));
+          const projectRoot = isCwdProjectRoot ? process.cwd() : path.resolve(__dirname, '..', '..');
+
+          // Search both well-known dirs in order: OpenAPI specs, then research output.
+          const openapiDir = path.join(projectRoot, 'docs', 'technical', 'openapi');
+          const researchDir = path.join(projectRoot, 'docs', 'research-output');
+
+          const candidates = [
+            { kind: 'openapi', full: path.join(openapiDir, fileName) },
+            { kind: 'research', full: path.join(researchDir, fileName) },
+          ];
+
+          let found: { kind: string; full: string; size: number } | null = null;
+          for (const c of candidates) {
+            try {
+              const st = fs.statSync(c.full);
+              if (st.isFile()) {
+                found = { kind: c.kind, full: c.full, size: st.size };
+                break;
+              }
+            } catch { /* not in this dir, try next */ }
+          }
+
+          if (!found) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Document not found: ${fileName}. Use list-cached-documents to see available names.`,
+                },
+              ],
+            };
+          }
+
+          const raw = await fs.promises.readFile(found.full, 'utf8');
+          let body = raw;
+          let truncated = false;
+          if (body.length > maxBytes) {
+            body = body.substring(0, maxBytes);
+            truncated = true;
+          }
+
+          const lower = fileName.toLowerCase();
+          const fence = lower.endsWith('.md') ? 'markdown'
+            : lower.endsWith('.yaml') || lower.endsWith('.yml') ? 'yaml'
+              : lower.endsWith('.json') ? 'json'
+                : '';
+
+          let responseText = `**Cached document:** \`${fileName}\` (${found.kind}, ${found.size} bytes)\n\n`;
+          responseText += `\`\`\`${fence}\n${body}\n\`\`\`\n`;
+          if (truncated) {
+            responseText += `\n[Truncated to ${maxBytes} bytes; raise \`maxBytes\` (max 200000) to see more.]\n`;
+          }
+
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: responseText,
+              },
+            ],
+          };
+        } catch (error) {
+          this.handleError(error, 'read-cached-document');
         }
       }
     );

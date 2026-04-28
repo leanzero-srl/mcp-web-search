@@ -178,23 +178,24 @@ needs different ceilings.
 
 ## 🛠️ MCP Tools Reference
 
+11 tools total (down from 13 after the round-2 consolidation).
+
 ### Primary Search Tools
-- `full-web-search`: Comprehensive research. Returns top results with full, cleaned Markdown content.
+- `full-web-search`: Comprehensive research. Returns top results with full, cleaned Markdown content. Semantic cache is in this path; cache hits show as `engine: semantic-cache` in the response.
 - `get-web-search-summaries`: Lightweight search. Returns snippets/descriptions without heavy extraction.
 - `progressive-web-search`: Advanced research. Uses query expansion and multiple engines for complex topics.
-- `cached-web-search`: Intelligent search. Uses semantic caching to provide instant results for similar queries.
 
 ### Specialized Extractors
 - `get-single-web-page-content`: Targeted extraction from a specific URL.
-- `get-github-repo-content`: Deeply crawls and extracts code/READMEs from GitHub repositories.
+- `get-github-repo-content`: Three modes via `mode: 'crawl' | 'list' | 'file'`. Default `crawl` walks the repo and returns README + per-file previews (configurable via `previewLength`, default 500, max 5000). Use `list` for a one-directory listing or `file` with `path` for full content of a single file.
 - `get-pdf-content`: Extracts readable text from PDF documents (with browser fallback).
-- `get-openapi-spec`: Automatically discovers and downloads OpenAPI/Swagger specifications.
+- `get-openapi-spec`: Discovers and downloads OpenAPI/Swagger specs (JSON and YAML). For non-agent clients (LM Studio), the spec content is also embedded inline up to `OPENAPI_INLINE_CAP` (default 50 KB).
+- `research_and_save_to_markdown`: Researches URLs and writes a markdown file per result. For non-agent clients, the markdown is also embedded inline so LM Studio can read it without filesystem access.
 
 ### Discovery & Management
-- `get-website-sitemap`: Discovers all available URLs on a domain via its sitemap.
-- `filter-sitemap-urls`: Filters sitemap results by keywords to find high-value pages.
-- `get-github-directory-contents`: Lists files/folders within a specific GitHub path.
-- `list-cached-documents`: Lists all previously crawled documents and specs stored in the local cache.
+- `get-website-sitemap`: Discovers all URLs in a sitemap. Pass `keywords?: string[]` to filter by keyword (replaces the former `filter-sitemap-urls` tool). Pass `extractTopMatching?: number` (1..5) to also extract content from the top N matches in the same call — collapses the sitemap → filter → extract chain into one round-trip.
+- `list-cached-documents`: Lists OpenAPI specs and research markdown files previously saved on disk. Filter via `category: 'all' | 'openapi' | 'research'`.
+- `read-cached-document`: Returns a previously-cached document's content inline by file name (as listed by `list-cached-documents`). Refuses path-traversal characters.
 
 ---
 

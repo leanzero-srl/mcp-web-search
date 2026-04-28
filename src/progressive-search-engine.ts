@@ -34,20 +34,16 @@ export class ProgressiveSearchEngine implements IProgressiveSearchEngine {
 
   constructor(
     private searchEngines: SearchEngine[],
-    config?: Partial<{
+    _config?: Partial<{
       maxDepth: number;
       minResultsPerStage: number;
       maxTotalResults: number;
-      expandSingleWordQueries: boolean;
-    }>
+    }>,
   ) {
-    const defaults = {
-      maxDepth: 2,
-      minResultsPerStage: 3,
-      maxTotalResults: 15,
-      expandSingleWordQueries: true,
-    };
-    
+    // The constructor used to accept an `expandSingleWordQueries` flag and a
+    // `defaults` object that were never read. The actual stage parameters are
+    // resolved per-call from the `options` argument to `search()`. Keeping the
+    // signature for back-compat but ignoring the values.
     this.semanticExpander = new SemanticExpander(new HeuristicSemanticExpander());
   }
 
@@ -194,11 +190,12 @@ export class ProgressiveSearchEngine implements IProgressiveSearchEngine {
         subQueries.push(`recent scientific advancements in ${originalQuery}`);
         break;
 
-      default:
+      default: {
         // For Informational/Commercial/etc, we perform "Dimension Expansion"
         const semanticExpansions = await this.semanticExpander.expandQuery(originalQuery);
         subQueries.push(...semanticExpansions.slice(0, 3));
         break;
+      }
     }
 
     // Add "Contradiction/Comparison" queries to resolve ambiguity (Research-grade)

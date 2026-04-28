@@ -5,8 +5,6 @@
  * When multiple identical queries arrive simultaneously, only one makes the actual API call.
  */
 
-import pLimit from 'p-limit';
-
 interface PendingRequest<T> {
   promise: Promise<T>;
   timestamp: number;

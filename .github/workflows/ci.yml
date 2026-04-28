@@ -30,8 +30,8 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Tests that hit the real network are skipped in CI by default — they're
-      # flaky against live search engines. Add a `npm run test:unit` script
-      # later for hermetic unit tests once the suite is split.
-      - name: Test (skip network-dependent integration tests)
-        run: npm test -- --run --reporter=verbose --bail=1 || echo "::warning::Tests failed — likely network-dependent integration tests; investigate locally"
+      # Hermetic unit tests only (SSRF guard, cleanText, client detection,
+      # YAML parsing). Integration / e2e suites hit live search engines and
+      # are too flaky for CI — run them locally.
+      - name: Unit tests
+        run: npm run test:unit

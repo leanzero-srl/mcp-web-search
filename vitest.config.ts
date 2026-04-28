@@ -5,10 +5,9 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     setupFiles: ['./tests/setup/vitest.setup.ts'],
-    include: ['tests/integration/**/*.test.ts', 'tests/e2e/**/*.test.ts'],
-    timeout: 120000,
+    include: ['tests/unit/**/*.test.ts', 'tests/integration/**/*.test.ts', 'tests/e2e/**/*.test.ts'],
+    testTimeout: 120000,
     hookTimeout: 60000,
     silent: false,
-    reportFile: 'vitest-results.json',
   },
 });

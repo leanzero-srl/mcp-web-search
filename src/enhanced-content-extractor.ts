@@ -410,7 +410,7 @@ export class EnhancedContentExtractor {
         if ($content.length > 0) {
           mainContent = $content.text().trim();
         }
-      } catch (parseError: unknown) {
+      } catch (_parseError: unknown) {
         console.log(`[BrowserExtractor] Selector parsing failed, using body content`);
         // Re-load HTML after catching error
         const $$ = cheerio.load(html);

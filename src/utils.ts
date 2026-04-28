@@ -245,7 +245,7 @@ export async function fetchSitemapUrls(baseUrl: string): Promise<string[]> {
     for (const match of sitemapMatches) {
       allUrls.add(match[1]);
     }
-  } catch (e) {
+  } catch {
     console.log(`[Utils] No sitemaps found in robots.txt or file missing`);
   }
 

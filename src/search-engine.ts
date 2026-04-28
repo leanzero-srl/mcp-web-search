@@ -6,7 +6,7 @@ import { RateLimiter } from './rate-limiter.js';
 import { browserPool } from './browser-pool.js';
 
 // Import WebKit-first browser engine
-import { createOptimizedBrowser, getEnginePriorityOrder, BrowserEngineType, getHeadlessOption, getEnvironmentConfig } from './browser-engine.js';
+import { createOptimizedBrowser, getEnginePriorityOrder, BrowserEngineType, getEnvironmentConfig } from './browser-engine.js';
 import pLimit from 'p-limit';
 
 // Import semantic cache for result caching
@@ -739,7 +739,7 @@ export class SearchEngine {
           await page.waitForSelector('.result__a, .result, [class*="result"]', {
             timeout: Math.min(timeout * 0.8, 10000)
           });
-        } catch (e) {
+        } catch {
           console.warn(`[SearchEngine] DuckDuckGo browser results selector not found or timed out, proceeding`);
         }
 
@@ -862,7 +862,6 @@ export class SearchEngine {
   }
 
   private parseBingResults(html: string, maxResults: number): SearchResult[] {
-    const debugBing = process.env.DEBUG_BING_SEARCH === 'true';
     console.error(`[SearchEngine] BING: Parsing HTML with length: ${html.length}`);
     
     const $ = cheerio.load(html);

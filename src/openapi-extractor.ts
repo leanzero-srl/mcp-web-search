@@ -8,11 +8,11 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import pLimit from 'p-limit';
+import * as yaml from 'js-yaml';
 import { CrawlCache, crawlCache } from './crawl-cache.js';
 import { getAxiosHttpAgentConfig, safeFetchUrl } from './utils.js';
 import {
   TechnicalDocType,
-  OpenAPISpecInfo,
   DownloadedOpenAPI,
   OpenAPIExtractionOptions,
   OpenAPIExtractionResult,
@@ -345,7 +345,7 @@ async function downloadOpenAPISpec(
  */
 function extractOpenAPIMetadata(
   data: unknown,
-  url: string
+  _url: string,
 ): { title?: string; version?: string; description?: string; basePath?: string } {
   if (!data || typeof data !== 'object') {
     return {};
@@ -420,13 +420,11 @@ export class OpenAPIExtractor {
     console.log(`[OpenAPIExtractor] Processing URL: ${url}`);
 
     const maxContentLength = options?.maxContentLength || this.defaultMaxContentLength;
-    const downloadDir = options?.downloadDir;
 
     // Validate URL format first
-    let parsedUrl: URL;
     try {
-      parsedUrl = new URL(url);
-    } catch (error) {
+      new URL(url);
+    } catch {
       return {
         success: false,
         url,
@@ -598,7 +596,10 @@ export class OpenAPIExtractor {
   }
 
   /**
-   * Parses OpenAPI specification content
+   * Parses OpenAPI specification content. Supports JSON and YAML — the
+   * previous implementation silently truncated YAML to a 1000-char preview
+   * wrapper, which made every YAML spec extraction effectively useless.
+   * Now we go through `js-yaml` for both YAML 1.1 and 1.2 inputs.
    */
   private parseOpenAPISpec(
     content: string,
@@ -606,18 +607,23 @@ export class OpenAPIExtractor {
   ): { valid: boolean; data?: unknown; metadata: Record<string, string>; error?: string } {
     try {
       let specData: unknown;
-      
+
       if (type === TechnicalDocType.OPENAPI_YAML || type === TechnicalDocType.SWAGGER_YAML) {
-        // YAML parsing would require a yaml library
-        // For now, return the raw content as JSON for compatibility
-        console.log('[OpenAPIExtractor] YAML content detected - returning raw content');
-        specData = { rawYaml: content.substring(0, 1000) + '...' };
+        // js-yaml's `load` parses both 1.1 and 1.2; default schema is safe.
+        specData = yaml.load(content);
+        if (specData === null || typeof specData !== 'object') {
+          return {
+            valid: false,
+            error: 'YAML content did not parse to an object',
+            metadata: {},
+          };
+        }
       } else {
         specData = JSON.parse(content);
       }
-      
+
       const metadata = extractOpenAPIMetadata(specData, '');
-      
+
       return {
         valid: true,
         data: specData,
@@ -625,7 +631,7 @@ export class OpenAPIExtractor {
       };
     } catch (error) {
       console.error('[OpenAPIExtractor] Error parsing OpenAPI spec:', error);
-      
+
       return {
         valid: false,
         error: error instanceof Error ? error.message : 'Invalid specification format',
@@ -635,50 +641,10 @@ export class OpenAPIExtractor {
   }
 
   /**
-   * Internal method that extracts OpenAPI spec - handles both regular and technical doc extraction
-   */
-  private async _extractOpenAPISpecInternal(
-    url: string,
-    options?: OpenAPIExtractionOptions | null
-  ): Promise<OpenAPIExtractionResult> {
-    // When options is undefined/null, pass undefined to extractOpenAPISpec
-    if (options === undefined || options === null) {
-      return await (this.extractOpenAPISpec as any)(url);
-    }
-    const result = await this.extractOpenAPISpec(url, options as any);
-    return result;
-  }
-
-  /**
-   * Extracts technical documentation from a page (non-OpenAPI)
-   */
-  async extractTechnicalDoc(
-    url: string,
-    options?: OpenAPIExtractionOptions
-  ): Promise<OpenAPIExtractionResult> {
-    // Convert undefined to null for compatibility with _extractOpenAPISpecInternal
-    const normalizedOptions = options ?? null;
-    const result = await this._extractOpenAPISpecInternal(url, normalizedOptions);
-    
-    if (!result.success && !result.openAPISpec) {
-      return result;
-    }
-    
-    // Mark as tech doc type
-    if (result.detectedType === undefined) {
-      result.detectedType = TechnicalDocType.TECHNICAL_MD;
-    }
-    
-    return result;
-  }
-
-  /**
    * Lists all cached OpenAPI specifications
    */
   public listCachedOpenAPISpecs(): DownloadedOpenAPI[] {
     const cacheEntries = this.cache.getAll();
-    const openapiDir = this.cache.getOpenAPIDir();
-    
     const specs: DownloadedOpenAPI[] = [];
     
     for (const entry of cacheEntries) {
