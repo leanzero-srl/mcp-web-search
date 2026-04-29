@@ -259,7 +259,26 @@ permissions:
         - address: "*.ts.net"
 ```
 
-#### 2. Document the user-side `mcp.json` snippet your app expects
+#### 2. Capture the user's Tailscale-funneled LM Studio URL
+
+You need an admin/settings UI in your Forge app to capture two things from
+the user, persisted in Forge KVS via `@forge/api`'s `storage`:
+
+| Key | Purpose |
+|---|---|
+| `LMSTUDIO_BASE_URL` | e.g. `https://your-machine.tailXXXX.ts.net`. **Must be `https://`, must be on `*.ts.net`, must not be `localhost`.** Reject anything else server-side. |
+| `LMSTUDIO_API_KEY` | Optional. LM Studio's Developer page → Manage Tokens. If set, send as `Authorization: Bearer …`. |
+
+Users get the `*.ts.net` URL by enabling **Tailscale Funnel** on their LM
+Studio host (Tailscale's docs at <https://tailscale.com/kb/1223/funnel>).
+LM Studio also needs **"Serve on Local Network"** turned on in its Developer
+settings so the funnel relay can reach it.
+
+CogniRunner's settings tab is the reference UX
+(`CogniRunner/src/index.js:1743-1817` for the validators that enforce these
+rules and surface specific error messages).
+
+#### 3. Document the user-side `mcp.json` snippet your app expects
 
 Tell your users to add this block to their LM Studio `mcp.json`:
 
@@ -281,16 +300,21 @@ Tell your users to add this block to their LM Studio `mcp.json`:
 ```
 
 The key (`web-search`) is the integration label your Forge app references.
-Pick whatever label fits your domain — just keep it consistent on both sides.
+Pick whatever label fits your domain — just keep it consistent on both sides
+(here, in your `integrations[].id` and in the user's `mcp.json`).
 
-#### 3. Call LM Studio's native chat endpoint with the `integrations` array
+#### 4. Call LM Studio's native chat endpoint with the `integrations` array
 
 ```js
 // In your Forge resolver (running on Atlassian's Forge runtime):
-import api, { route } from '@forge/api';
+import { fetch, storage } from '@forge/api';
 
-const baseUrl = await storage.get('LMSTUDIO_BASE_URL');  // user-configured: https://machine.tailXXXX.ts.net
-const apiKey  = await storage.get('LMSTUDIO_API_KEY');   // optional
+const baseUrl = await storage.get('LMSTUDIO_BASE_URL'); // e.g. https://your-machine.tailXXXX.ts.net
+const apiKey  = await storage.get('LMSTUDIO_API_KEY');  // optional
+
+// Optional: list available models so the user can pick one in your settings UI
+//   GET `${baseUrl}/api/v0/models`  (LM Studio 0.4+ native shape)
+//   GET `${baseUrl}/v1/models`      (OpenAI-compatible fallback)
 
 const response = await fetch(`${baseUrl}/api/v1/chat`, {
   method: 'POST',
@@ -299,7 +323,7 @@ const response = await fetch(`${baseUrl}/api/v1/chat`, {
     ...(apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {}),
   },
   body: JSON.stringify({
-    model: 'your-chosen-model',
+    model: await storage.get('LMSTUDIO_MODEL'),  // captured per #2
     input: 'Find the public Jira REST API rate limit.',
     integrations: [
       {
@@ -317,7 +341,12 @@ const response = await fetch(`${baseUrl}/api/v1/chat`, {
 });
 ```
 
-#### 4. (Optional) Verify the user's `mcp.json` is wired up
+> **Use `fetch` from `@forge/api`, not the global `fetch`.** The Forge
+> runtime sandboxes outbound HTTP through `@forge/api`'s wrapper — only it
+> respects your `manifest.yml` egress rules. The global `fetch` will be
+> blocked or behave inconsistently across Forge runtime versions.
+
+#### 5. (Optional) Verify the user's `mcp.json` is wired up
 
 Send a tiny one-token chat with the integration enabled. If the user's
 `mcp.json` is missing the entry, LM Studio returns a 4xx with an "unknown

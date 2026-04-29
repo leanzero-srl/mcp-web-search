@@ -107,9 +107,10 @@ return shapes are unchanged for the 4 tools you allowlist.
 ### About the new client-aware branching (and why it's safe for both sides)
 
 The MCP server now reads the calling client's identity at the `initialize`
-handshake (`getClientVersion()?.name`) and adapts behavior of three
-disk-write tools (`research_and_save_to_markdown`, `get-openapi-spec`, the
-new `read-cached-document`'s sibling `list-cached-documents`):
+handshake (`getClientVersion()?.name`) and adapts behavior of **two**
+disk-write tools — `research_and_save_to_markdown` and `get-openapi-spec`
+(verified by grep: those are the only two callers of `isAgenticClient()`
+in `src/server.ts`):
 
 - **Agentic clients** (Cline / Claude Desktop / Roo Code / Continue /
   claude-ai) keep the original behavior: response contains compact
@@ -120,14 +121,21 @@ new `read-cached-document`'s sibling `list-cached-documents`):
   fit `MAX_OUTPUT_LENGTH`). The disk write still happens as a side
   effect.
 
-End-to-end smoke verifying the decision (run from the MCP repo):
+`list-cached-documents` and the new `read-cached-document` are
+client-agnostic — both cohorts see the same listing format and the same
+inline content respectively. (`list-cached-documents`'s behavior change in
+this round is content-set, not client-aware: it now lists OpenAPI specs
+*and* research markdown files for everyone.)
+
+End-to-end smoke verifying the decision (run from the MCP repo, after
+`npm run build`):
 
 ```
-$ bash /tmp/mcp-call-as.sh "Cline"     "get-openapi-spec" '{"url":"https://petstore.swagger.io/v2/swagger.json","forceRefresh":true}'
-response length: 788 chars       embeds inline: false   isError: false
+$ scripts/dev/mcp-call-as.sh Cline     get-openapi-spec '{"url":"https://petstore.swagger.io/v2/swagger.json","forceRefresh":true}' | jq -r '.result.content[0].text' | wc -c
+788
 
-$ bash /tmp/mcp-call-as.sh "lm-studio" "get-openapi-spec" '{"url":"https://petstore.swagger.io/v2/swagger.json","forceRefresh":true}'
-response length: ~26 KB chars    embeds inline: true    isError: false
+$ scripts/dev/mcp-call-as.sh lm-studio get-openapi-spec '{"url":"https://petstore.swagger.io/v2/swagger.json","forceRefresh":true}' | jq -r '.result.content[0].text' | wc -c
+26123
 ```
 
 Same tool, same URL, same arguments. The only thing that changed is
