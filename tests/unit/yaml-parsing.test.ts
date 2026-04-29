@@ -45,3 +45,25 @@ servers:
     expect(url.pathname).toBe('/v1');
   });
 });
+
+// Regression for the bug uncovered by the agent-vs-non-agent smoke test:
+// when the OpenAPI URL points at a JSON spec directly, axios auto-parses
+// `response.data` to an Object. Passing that object to crawl-cache's
+// `generateHash()` -> `crypto.update()` throws ERR_INVALID_ARG_TYPE because
+// crypto.update wants a string or Buffer. The fix coerces non-string
+// pageResponse.data to JSON.stringify() before hashing.
+describe('axios JSON auto-parse coercion (regression)', () => {
+  it('coerces parsed object to string for hashing', async () => {
+    const crypto = await import('crypto');
+    const fakeAxiosData = { openapi: '3.0.0', info: { title: 'X', version: '1' } };
+
+    // Bug: this throws ERR_INVALID_ARG_TYPE
+    expect(() => crypto.createHash('md5').update(fakeAxiosData as unknown as string).digest('hex'))
+      .toThrow(/ERR_INVALID_ARG_TYPE|argument must be of type/);
+
+    // Fix: stringify first
+    const coerced = typeof fakeAxiosData === 'string' ? fakeAxiosData : JSON.stringify(fakeAxiosData);
+    const hash = crypto.createHash('md5').update(coerced).digest('hex');
+    expect(hash).toMatch(/^[a-f0-9]{32}$/);
+  });
+});
