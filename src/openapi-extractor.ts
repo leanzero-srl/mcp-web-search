@@ -494,8 +494,14 @@ export class OpenAPIExtractor {
         };
       }
       
-      const html = pageResponse.data;
-      
+      // axios auto-parses JSON when content-type=application/json, so when
+      // the URL points at a spec directly (not a page that *links* to a
+      // spec), `pageResponse.data` is an Object. Coerce to string so the
+      // crawl-cache hash and cheerio.load downstream both receive a string.
+      const html: string = typeof pageResponse.data === 'string'
+        ? pageResponse.data
+        : JSON.stringify(pageResponse.data);
+
       // Step 2: Discover OpenAPI spec URL
       console.log(`[OpenAPIExtractor] Searching for OpenAPI spec in page...`);
       const discoveredSpec = await discoverOpenAPISpec(url, html, maxContentLength);

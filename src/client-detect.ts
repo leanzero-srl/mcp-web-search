@@ -38,6 +38,18 @@ const AGENTIC_NAMES = [
   'continue',
 ];
 
+/**
+ * Pure helper. Returns `true` if the given client name (as reported in
+ * `initialize.params.clientInfo.name`) matches the agentic whitelist. Exported
+ * so tests can exercise the production matching rule directly instead of
+ * duplicating it.
+ */
+export function classifyClientNameAsAgentic(name: string): boolean {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  return AGENTIC_NAMES.some((n) => lower.startsWith(n));
+}
+
 interface ClientInfo {
   name: string;
   version: string;
@@ -63,8 +75,7 @@ export function attachClientDetect(server: McpServer): void {
     }
     const name = (impl.name || 'unknown').toString();
     const version = (impl.version || '0').toString();
-    const lower = name.toLowerCase();
-    const isAgentic = AGENTIC_NAMES.some((n) => lower.startsWith(n));
+    const isAgentic = classifyClientNameAsAgentic(name);
     cached = { name, version, isAgentic };
     logger.info('client-detect: client identified', { name, version, isAgentic });
   };

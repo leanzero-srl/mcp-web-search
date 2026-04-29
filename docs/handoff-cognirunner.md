@@ -1,5 +1,14 @@
 # Handoff: web-search MCP server changes affecting CogniRunner
 
+> **Positioning note:** the integration pattern below is **generic**. Any
+> Atlassian Forge app (or any other sandboxed host that can do HTTPS to
+> Tailscale Funnel) can reach this MCP server via a self-hosted LM Studio
+> bridge — see the new `## 🧩 Using This MCP From an Atlassian Forge App`
+> section in the MCP server's README.md. **CogniRunner is the production
+> reference implementation**, not the only supported consumer. The advice
+> below applies first-class to CogniRunner; replicate the pattern for any
+> other Forge app.
+
 You are working on the **CogniRunner** Forge app at
 `/Users/mihaiperdum/Projects/CogniRunner`. A sibling project — the
 `web-search` MCP server at `/Users/mihaiperdum/Projects/mcp-web-search-upd/mcp-web-search`
@@ -94,6 +103,38 @@ shape. The only changes that reach CogniRunner are improvements:
 
 **Required code changes in CogniRunner: none.** Tool names, arguments,
 return shapes are unchanged for the 4 tools you allowlist.
+
+### About the new client-aware branching (and why it's safe for both sides)
+
+The MCP server now reads the calling client's identity at the `initialize`
+handshake (`getClientVersion()?.name`) and adapts behavior of three
+disk-write tools (`research_and_save_to_markdown`, `get-openapi-spec`, the
+new `read-cached-document`'s sibling `list-cached-documents`):
+
+- **Agentic clients** (Cline / Claude Desktop / Roo Code / Continue /
+  claude-ai) keep the original behavior: response contains compact
+  metadata + a file path. They have a sibling filesystem MCP and read
+  the file themselves.
+- **Non-agent clients** (LM Studio, anything not on the whitelist) get
+  the same metadata **plus** the content embedded inline (truncated to
+  fit `MAX_OUTPUT_LENGTH`). The disk write still happens as a side
+  effect.
+
+End-to-end smoke verifying the decision (run from the MCP repo):
+
+```
+$ bash /tmp/mcp-call-as.sh "Cline"     "get-openapi-spec" '{"url":"https://petstore.swagger.io/v2/swagger.json","forceRefresh":true}'
+response length: 788 chars       embeds inline: false   isError: false
+
+$ bash /tmp/mcp-call-as.sh "lm-studio" "get-openapi-spec" '{"url":"https://petstore.swagger.io/v2/swagger.json","forceRefresh":true}'
+response length: ~26 KB chars    embeds inline: true    isError: false
+```
+
+Same tool, same URL, same arguments. The only thing that changed is
+`clientInfo.name`. **CogniRunner runs through LM Studio, so it always lands
+on the non-agent path** — full content embedded inline, no need for a
+filesystem MCP downstream of LM Studio. (LM Studio itself uses stdio to
+talk to this MCP and just pipes the response text back through.)
 
 ## Recommended (optional) updates in CogniRunner
 

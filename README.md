@@ -8,10 +8,12 @@
 
 ## 🎯 Who Is This For?
 
-This server is built for **Local AI Users**—individuals running Large Language Models (LLMs) on their own hardware or via private instances.
+This server is built for **Local AI Users**—individuals running Large Language Models (LLMs) on their own hardware or via private instances—**and the Atlassian Forge apps that talk to them.**
 
 - ✅ **Cline / Roo Code Users**: Perfect for autonomous coding agents that need to research documentation or libraries.
 - ✅ **Claude Desktop Users**: Seamlessly add web browsing capabilities to your local Claude interface.
+- ✅ **LM Studio Users**: First-class non-agent client support — content is embedded inline (no sibling filesystem MCP required) so the LLM can actually use the results.
+- ✅ **Atlassian Forge App Developers**: Reach this MCP from any Forge app — Jira, Confluence, Bitbucket, Compass, Jira Service Management — by routing through the user's self-hosted LM Studio over Tailscale Funnel. **No HTTP transport, no auth surface, no per-app egress to manage.** A reference implementation ships in [CogniRunner](https://marketplace.atlassian.com/apps/298437877/cognirunner). [→ Forge integration guide](#-using-this-mcp-from-an-atlassian-forge-app).
 - ✅ **Privacy-First Researchers**: Perform deep web research without sending your entire prompt history to third-party search APIs.
 - ✅ **Agent Developers**: A robust, modular foundation for building complex AI agents with built-in rate limiting and quality control.
 
@@ -173,6 +175,203 @@ needs different ceilings.
 - Set `USE_SERPER_ONLY=true` for fastest Serper API responses (skips browser fallbacks)
 - Increase `SEARCH_ENGINE_MAX_RPM` if you have a higher Serper tier limit
 - Use `SEMANTIC_CACHE_ENABLED=false` to disable caching and always fetch fresh results
+
+---
+
+## 🤖 Client-Aware Tool Behavior
+
+This server detects the calling MCP client at the `initialize` handshake (via
+`getClientVersion()`) and adapts tool output accordingly. Two cohorts:
+
+| Cohort | Examples | What they get |
+|---|---|---|
+| **Agentic** | Cline, Claude Desktop, Roo Code, Continue, claude-ai | Compact responses. Disk-write tools (`research_and_save_to_markdown`, `get-openapi-spec`) return only the file path — these clients have a sibling filesystem MCP and will read the file themselves. |
+| **Non-agent** | LM Studio, MCP Inspector, anything not on the whitelist | Full content embedded inline (truncated to fit `MAX_OUTPUT_LENGTH`). The LLM gets a usable result without needing filesystem access. |
+
+The whitelist is a strict prefix match against `clientInfo.name` — see
+`src/client-detect.ts`. **Default is non-agent**, so an unknown caller is
+served the safe (inline) shape rather than an unreachable file path.
+
+Verified end-to-end. Calling `get-openapi-spec` against the Petstore JSON spec
+with two different `clientInfo.name` values:
+
+| `clientInfo.name` | Response size | Inline spec | `isError` |
+|---|---|---|---|
+| `Cline` | 788 bytes | no | false |
+| `lm-studio` | ~26 KB | yes (full spec in fenced block) | false |
+
+Same tool, same arguments, same backend — the only thing that changed is the
+client identity.
+
+---
+
+## 🧩 Using This MCP From an Atlassian Forge App
+
+Atlassian Forge apps run in a sandboxed serverless runtime that **cannot
+spawn stdio child processes**, so they cannot host this MCP server directly.
+The integration pattern uses the user's self-hosted LM Studio as a bridge:
+
+```
+┌──────────────────┐   HTTPS   ┌───────────────────────┐   stdio   ┌──────────────┐
+│  Your Forge app  ├──────────►│  User's LM Studio     ├──────────►│  This MCP    │
+│  (Jira/Conf/etc.)│   over    │  exposed via          │           │  server      │
+│                  │  Tailscale│  Tailscale Funnel     │           │  (web-search)│
+│                  │  Funnel   │  (https://*.ts.net)   │           │              │
+└──────────────────┘           └───────────────────────┘           └──────────────┘
+```
+
+**Why this works**: LM Studio's native `/api/v1/chat` endpoint accepts an
+`integrations` array that loads MCP servers from the user's local `mcp.json`.
+Your Forge app sends a chat completion with `integrations: [{ id: "mcp/web-search", allowed_tools: [...] }]`
+and LM Studio invokes this MCP via stdio on the user's machine. Forge never
+talks to this MCP directly — it talks to LM Studio.
+
+**Why this is a selling point**:
+
+- **Zero per-app egress complexity.** Your Forge `manifest.yml` declares one
+  egress entry (`*.ts.net`) and you reach any number of MCP servers the user
+  has registered locally. No need to whitelist the MCP server's own host —
+  it never needs to be publicly reachable.
+- **No auth surface to defend.** This MCP server has no HTTP transport. The
+  only network boundary is the user's own Tailscale Funnel (which Tailscale
+  authenticates) and LM Studio's optional API token. Nothing to compromise
+  on the MCP side.
+- **Tool-level allowlisting.** Curate exactly which tools your Forge app can
+  invoke per integration. The user can have other MCPs in their `mcp.json`;
+  your app sees only what you allowlist.
+- **Privacy by design.** Field content (Jira issues, Confluence pages,
+  Bitbucket diffs) flows from your Forge app to the user's own machine and
+  out to the model — never through a SaaS aggregator you don't control.
+- **Marketplace-friendly.** AGPL-licensed reference implementation already
+  on the Atlassian Marketplace — see [CogniRunner](https://marketplace.atlassian.com/apps/298437877/cognirunner).
+
+### Integration recipe
+
+#### 1. Declare egress in `manifest.yml`
+
+```yaml
+permissions:
+  external:
+    fetch:
+      backend:
+        - address: "*.ts.net"   # Tailscale Funnel — user's LM Studio
+      client:
+        - address: "*.ts.net"
+```
+
+#### 2. Document the user-side `mcp.json` snippet your app expects
+
+Tell your users to add this block to their LM Studio `mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "web-search": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/mcp-web-search/dist/index.js"],
+      "env": {
+        "SERPER_API_KEY": "<key>",
+        "USE_SERPER_ONLY": "true",
+        "MAX_CONTENT_LENGTH": "100000",
+        "EXTRACT_CONCURRENCY": "3"
+      }
+    }
+  }
+}
+```
+
+The key (`web-search`) is the integration label your Forge app references.
+Pick whatever label fits your domain — just keep it consistent on both sides.
+
+#### 3. Call LM Studio's native chat endpoint with the `integrations` array
+
+```js
+// In your Forge resolver (running on Atlassian's Forge runtime):
+import api, { route } from '@forge/api';
+
+const baseUrl = await storage.get('LMSTUDIO_BASE_URL');  // user-configured: https://machine.tailXXXX.ts.net
+const apiKey  = await storage.get('LMSTUDIO_API_KEY');   // optional
+
+const response = await fetch(`${baseUrl}/api/v1/chat`, {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    ...(apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {}),
+  },
+  body: JSON.stringify({
+    model: 'your-chosen-model',
+    input: 'Find the public Jira REST API rate limit.',
+    integrations: [
+      {
+        type: 'plugin',
+        id: 'mcp/web-search',                      // matches mcp.json key
+        allowed_tools: [                           // curate per app
+          'get-web-search-summaries',
+          'full-web-search',
+          'get-single-web-page-content',
+          'get-pdf-content',
+        ],
+      },
+    ],
+  }),
+});
+```
+
+#### 4. (Optional) Verify the user's `mcp.json` is wired up
+
+Send a tiny one-token chat with the integration enabled. If the user's
+`mcp.json` is missing the entry, LM Studio returns a 4xx with an "unknown
+plugin" message you can surface in your admin UI. CogniRunner's
+`pingLmStudioMcp` resolver does this — copy the pattern.
+
+### What you should NOT do
+
+- **Don't** try to run this MCP server inside Forge. Forge can't spawn
+  stdio children; this MCP has no HTTP transport (deliberately — see
+  Threat model below).
+- **Don't** point your Forge app at `localhost`, `127.0.0.1`, or any
+  RFC1918 address. Forge cannot reach them, and even if it could, this
+  MCP's SSRF guard would refuse the URLs forwarded through tool calls.
+  Always use Tailscale Funnel (`*.ts.net`) — those addresses resolve to
+  Tailscale's public relays and pass the SSRF guard.
+- **Don't** rely on a tool being available unless you allowlist it in the
+  `integrations[].allowed_tools` array. The full surface of this server
+  (11 tools) is overkill for any single Forge app — pick 3-5 that map to
+  your use case.
+
+### Reference implementation: CogniRunner
+
+[CogniRunner](https://marketplace.atlassian.com/apps/298437877/cognirunner)
+is the first production Forge app using this pattern. It's
+[AGPL-licensed open source](https://github.com/mperdum/leanzero-cognirunner-forgeapp) —
+clone it as a starting point. Specifically:
+
+| What | Where in CogniRunner |
+|---|---|
+| `lmstudio` BYOK provider with Tailscale URL validation | `src/index.js:1743-1817` |
+| MCP integration registry (`SUPPORTED_MCPS`) | `src/index.js:2289-2319` |
+| Per-MCP ping/probe resolver | `src/index.js:2380` |
+| Native `/api/v1/chat` request including `integrations` | `src/index.js:4197-4279` |
+
+If you want this MCP to integrate with another Atlassian (or non-Atlassian)
+host, the same recipe applies — Forge isn't special, it just happens to be
+where the proof of concept lives.
+
+### Threat model
+
+The decision to NOT add an HTTP transport is intentional:
+
+- HTTP would mean an exposed listener, an auth surface, TLS, rate limiting,
+  CORS, and DDoS exposure on the MCP side.
+- The bridge model puts those concerns on Tailscale (zero-trust mesh,
+  auth at the funnel) and LM Studio (optional API token, request-rate
+  limited by LM Studio itself), which both already solve them.
+- The only thing the MCP server sees is stdio frames from a local LM
+  Studio process running as the user — same trust boundary as any other
+  CLI tool the user runs.
+
+If you have a use case that really needs direct HTTP access (e.g.,
+non-LM-Studio host, or you want to bypass the local AI), open an issue.
 
 ---
 
