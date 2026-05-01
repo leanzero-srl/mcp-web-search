@@ -73,6 +73,12 @@ import { auditLogger, telemetryCollector } from './observability.js';
 // (Enterprise guardrails are wired into search/extract paths directly via
 // their own modules — no top-level imports needed here.)
 
+export interface WebSearchMCPServerOptions {
+  /** When true, the constructor will not attach SIGINT/SIGTERM handlers.
+   *  HTTP host should pass true and call `closeAll()` from its own shutdown path. */
+  skipShutdownHooks?: boolean;
+}
+
 export class WebSearchMCPServer {
   private server: McpServer;
   private searchEngine: SearchEngine;
@@ -160,7 +166,7 @@ export class WebSearchMCPServer {
     );
   }
 
-  constructor() {
+  constructor(opts: WebSearchMCPServerOptions = {}) {
     this.server = new McpServer({
       name: 'web-search-mcp',
       version: '0.3.1',
@@ -196,13 +202,20 @@ export class WebSearchMCPServer {
       console.warn('[WebSearchMCPServer] Failed to initialize GitHub extractor:', error);
     }
 
-    this.setupTools();
-    this.setupGracefulShutdown();
+    this.registerToolsOn(this.server);
+    if (!opts.skipShutdownHooks) {
+      this.setupGracefulShutdown();
+    }
   }
 
-  private setupTools(): void {
+  /**
+   * Public so the HTTP host can register the same 11 tool handlers on a
+   * fresh per-request McpServer. The handlers close over `this.searchEngine`,
+   * `this.contentExtractor`, etc. — those instances stay process-shared.
+   */
+  public registerToolsOn(target: McpServer): void {
     // Register the main web search tool (primary choice for comprehensive searches)
-    this.server.tool(
+    target.tool(
       'full-web-search',
       'Search the web and fetch complete page content from top results. This is the most comprehensive general web search tool. It searches the web and then follows resulting links to extract full page content. Use get-web-search-summaries for a lightweight alternative. For domain-specific research on known companies, consider starting with get-website-sitemap to discover available pages before filtering and extracting.',
       {
@@ -307,7 +320,7 @@ export class WebSearchMCPServer {
     );
 
     // Register the lightweight web search summaries tool (secondary choice for quick results)
-    this.server.tool(
+    target.tool(
       'get-web-search-summaries',
       'Search the web and return only the search result snippets/descriptions without following links to extract full page content. This is a lightweight alternative to full-web-search for when you only need brief search results. For comprehensive information, use full-web-search instead.',
       {
@@ -386,7 +399,7 @@ export class WebSearchMCPServer {
     );
 
     // Register the single page content extraction tool
-    this.server.tool(
+    target.tool(
       'get-single-web-page-content',
       'Extract and return the full content from a single web page URL. This tool follows a provided URL and extracts the main page content. Useful for getting detailed content from a specific webpage without performing a search.',
       {
@@ -638,7 +651,7 @@ export class WebSearchMCPServer {
     };
 
     // Register the research and save to markdown tool
-    this.server.tool(
+    target.tool(
       'research_and_save_to_markdown',
       'Research web pages and save their content, research digest (entities, claims, terms), and source information into structured markdown files in the /docs/research-output directory for future reference. Supports batch research, content sanitization, quality scoring, and auto-cleanup of old files.',
       {
@@ -928,7 +941,7 @@ export class WebSearchMCPServer {
     // filter-sitemap-urls) that small models often chained incorrectly.
     // Optionally also extracts content from the top-N matches in one call,
     // collapsing the typical 3-step research flow into a single tool call.
-    this.server.tool(
+    target.tool(
       'get-website-sitemap',
       'Read a website\'s sitemap.xml and (optionally) filter it by keywords. With `extractTopMatching` set, this also fetches content for the top-N matched URLs in the same call — collapsing the typical sitemap → filter → extract chain into one round-trip. Recommended first step when you have a specific domain URL and want to find high-value pages on it.',
       {
@@ -1090,7 +1103,7 @@ export class WebSearchMCPServer {
     // The `previewLength` parameter widens the per-file preview cap in
     // `crawl` mode (default 500, max 5000). Underlying extractor already
     // pulls full file content; the cap lives at the response layer.
-    this.server.tool(
+    target.tool(
       'get-github-repo-content',
       'Inspect a GitHub repository in three modes: `crawl` (default — README + recursive code-file crawl with per-file previews), `list` (one directory listing — files and folders by name), or `file` (full content of a single file at `path`). Set `previewLength` to widen the per-file preview cap in crawl mode (default 500, max 5000). Honors GITHUB_TOKEN for authenticated 5000 req/hr quota.',
       {
@@ -1220,7 +1233,7 @@ export class WebSearchMCPServer {
     // in lets the caller pick the right depth in one decision.)
  
      // Register the OpenAPI specification extraction tool
-    this.server.tool(
+    target.tool(
       'get-openapi-spec',
       'Extract and download OpenAPI/Swagger specifications from API documentation pages. This tool automatically discovers OpenAPI specs by checking HTML link tags, common URL patterns, and versioned swagger files. The spec is saved to docs/technical/openapi/ for future use without re-crawling.',
       {
@@ -1338,7 +1351,7 @@ export class WebSearchMCPServer {
     );
 
     // Register the progressive web search tool (advanced strategy with automatic query expansion)
-    this.server.tool(
+    target.tool(
       'progressive-web-search',
       'Advanced web search with automatic query expansion and multi-stage searching. This tool first tries the exact user query, then progressively expands using synonyms, related terms, and alternative phrasings if good results aren\'t found. Use this for complex research where the exact wording might not match the best sources.',
       {
@@ -1442,7 +1455,7 @@ export class WebSearchMCPServer {
     );
 
     // Register the get-pdf-content tool (PDF extraction using multiple strategies)
-    this.server.tool(
+    target.tool(
       'get-pdf-content',
       'Extract and return text content from a PDF document. This tool uses HTTP-based extraction with browser fallback for complex PDFs. Use this when you need to extract readable text from PDF files found during web research.',
       {
@@ -1514,7 +1527,7 @@ export class WebSearchMCPServer {
     // engine name, which signals "semantic-cache" on cache hits.)
 
     // Register the list-cached-documents tool
-    this.server.tool(
+    target.tool(
       'list-cached-documents',
       'List documents previously saved by this MCP server: OpenAPI/Swagger specs (saved by get-openapi-spec) and research markdown files (saved by research_and_save_to_markdown). Use this to see what is already on disk before re-crawling. Pair with read-cached-document to fetch a file\'s contents inline (useful for clients that lack a sibling filesystem MCP).',
       {
@@ -1610,7 +1623,7 @@ export class WebSearchMCPServer {
     // takes a file name (as listed) and returns its content inline. Useful for
     // clients that don't have a sibling filesystem MCP — without this tool the
     // listing was a dead end for LM Studio.
-    this.server.tool(
+    target.tool(
       'read-cached-document',
       'Return the contents of a previously-cached document by file name (as listed by list-cached-documents). Resolves the file from the OpenAPI cache directory or the research-output directory; returns text inline up to maxBytes. Refuses any name containing path separators or "..".',
       {
@@ -1889,6 +1902,17 @@ export class WebSearchMCPServer {
     }
     
     return 'Other error';
+  }
+
+  /**
+   * Close shared resources (browser pool + search engine). Idempotent;
+   * safe to call from either the SIGINT handler or an HTTP host's shutdown.
+   */
+  public async closeAll(): Promise<void> {
+    await Promise.all([
+      this.contentExtractor.closeAll(),
+      this.searchEngine.closeAll(),
+    ]);
   }
 
   private setupGracefulShutdown(): void {
