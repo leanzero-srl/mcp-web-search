@@ -14,6 +14,7 @@ import { getAxiosHttpAgentConfig, safeFetchUrl } from './utils.js';
 import {
   TechnicalDocType,
   DownloadedOpenAPI,
+  OpenAPIEndpoint,
   OpenAPIExtractionOptions,
   OpenAPIExtractionResult,
 } from './types.js';
@@ -387,6 +388,49 @@ function extractOpenAPIMetadata(
   return metadata;
 }
 
+/** HTTP methods that may appear as operation keys under a path item. */
+const OPENAPI_HTTP_METHODS = ['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace'] as const;
+
+/**
+ * Builds a flat endpoint index from a parsed OpenAPI/Swagger document. Both
+ * Swagger 2.0 and OpenAPI 3.x key their operations under `.paths`, so a single
+ * walk covers both. Exported so the get-openapi-spec tool can lazily rebuild
+ * the index from a saved file on a warm-cache hit (when the spec wasn't parsed).
+ *
+ * Returns `{ endpoints: [], endpointCount: 0 }` for anything that isn't a spec
+ * with a usable `paths` object — never throws.
+ */
+export function buildEndpointIndex(specData: unknown): { endpoints: OpenAPIEndpoint[]; endpointCount: number } {
+  const empty = { endpoints: [] as OpenAPIEndpoint[], endpointCount: 0 };
+  if (!specData || typeof specData !== 'object') return empty;
+
+  const paths = (specData as Record<string, unknown>).paths;
+  if (!paths || typeof paths !== 'object') return empty;
+
+  const endpoints: OpenAPIEndpoint[] = [];
+  for (const [pathKey, pathItemRaw] of Object.entries(paths as Record<string, unknown>)) {
+    if (!pathItemRaw || typeof pathItemRaw !== 'object') continue;
+    const pathItem = pathItemRaw as Record<string, unknown>;
+
+    for (const method of OPENAPI_HTTP_METHODS) {
+      const opRaw = pathItem[method];
+      if (!opRaw || typeof opRaw !== 'object') continue;
+      const op = opRaw as Record<string, unknown>;
+
+      const summary = typeof op.summary === 'string' && op.summary.trim()
+        ? op.summary.trim()
+        : typeof op.operationId === 'string'
+          ? op.operationId
+          : '';
+      const tags = Array.isArray(op.tags) ? op.tags.map((t) => String(t)) : [];
+
+      endpoints.push({ method: method.toUpperCase(), path: pathKey, summary, tags });
+    }
+  }
+
+  return { endpoints, endpointCount: endpoints.length };
+}
+
 /**
  * Gets standard HTTP headers for requests
  */
@@ -408,6 +452,16 @@ export class OpenAPIExtractor {
   constructor(options?: { maxContentLength?: number }) {
     this.cache = crawlCache;
     this.defaultMaxContentLength = options?.maxContentLength || 10000000; // 10MB
+  }
+
+  /**
+   * The actual on-disk directory where downloaded specs are saved. Callers
+   * (e.g. read-cached-document) MUST resolve spec files through this rather
+   * than recomputing a path from cwd — the cache dir is module-relative, so a
+   * cwd-based guess can point at a different directory and "lose" saved specs.
+   */
+  public getOpenAPIDir(): string {
+    return this.cache.getOpenAPIDir();
   }
 
   /**
@@ -577,6 +631,8 @@ export class OpenAPIExtractor {
           docType: discoveredSpec.type,
           size: saved.size,
           timestamp: generateTimestamp(),
+          endpoints: specData.endpoints ?? [],
+          endpointCount: specData.endpointCount ?? 0,
         },
         downloadTime: generateTimestamp(),
         domain: domainInfo.domain,
@@ -610,7 +666,7 @@ export class OpenAPIExtractor {
   private parseOpenAPISpec(
     content: string,
     type: TechnicalDocType
-  ): { valid: boolean; data?: unknown; metadata: Record<string, string>; error?: string } {
+  ): { valid: boolean; data?: unknown; metadata: Record<string, string>; endpoints?: OpenAPIEndpoint[]; endpointCount?: number; error?: string } {
     try {
       let specData: unknown;
 
@@ -629,11 +685,14 @@ export class OpenAPIExtractor {
       }
 
       const metadata = extractOpenAPIMetadata(specData, '');
+      const { endpoints, endpointCount } = buildEndpointIndex(specData);
 
       return {
         valid: true,
         data: specData,
         metadata,
+        endpoints,
+        endpointCount,
       };
     } catch (error) {
       console.error('[OpenAPIExtractor] Error parsing OpenAPI spec:', error);

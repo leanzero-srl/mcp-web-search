@@ -225,7 +225,12 @@ export class PdfExtractor {
   }
 
   /**
-   * Truncate text to maximum length
+   * Truncate text to a maximum length.
+   *
+   * Semantics: `undefined`, `0`, and negative `maxLength` all mean "no limit"
+   * and return the text unchanged. This matches the tool layer, which maps a
+   * caller-supplied `maxContentLength` of 0 to "no truncation". Only a positive
+   * `maxLength` shorter than the text actually truncates (with a marker).
    */
   public truncateText(text: string, maxLength?: number): string {
     if (!maxLength || maxLength <= 0) {

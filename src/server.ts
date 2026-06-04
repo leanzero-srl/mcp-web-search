@@ -46,7 +46,7 @@ const pdfExtractor = pdfExtractorInstance;
 
 import { WebSearchToolInput, WebSearchToolOutput, SearchResult } from './types.js';
 import { ProgressiveSearchEngine } from './progressive-search-engine.js';
-import { isPdfUrl, fetchSitemapUrls, withTimeout } from './utils.js';
+import { isPdfUrl, fetchSitemapUrls, withTimeout, clampReadWindow } from './utils.js';
 
 // Per-tool wall-clock budgets. All sit comfortably below the Forge function
 // timeout (~25 s) so the upstream user request never inherits a hung MCP call.
@@ -61,7 +61,8 @@ const TOOL_TIMEOUTS = {
   progressive: parseInt(process.env.TOOL_TIMEOUT_PROGRESSIVE || '20000', 10),
 };
 import { GitHubExtractor, parseGitHubUrl } from './github-extractor.js';
-import { openAPIExtractor } from './openapi-extractor.js';
+import { openAPIExtractor, buildEndpointIndex } from './openapi-extractor.js';
+import * as yaml from 'js-yaml';
 import { attachClientDetect, isAgenticClient, getClientInfo } from './client-detect.js';
 
 // ============================================================================
@@ -70,8 +71,21 @@ import { attachClientDetect, isAgenticClient, getClientInfo } from './client-det
 
 import { auditLogger, telemetryCollector } from './observability.js';
 
-// (Enterprise guardrails are wired into search/extract paths directly via
-// their own modules — no top-level imports needed here.)
+// Enterprise guardrails are mostly wired into search/extract paths via their
+// own modules. The OutputLimiter is also used here as a final safety net: every
+// tool response funnels through `respondText()` so a runaway response is
+// truncated once, cleanly, with a pointer to read-cached-document — instead of
+// being silently cut mid-content by a downstream transport/context limit.
+import { OutputLimiter } from './enterprise-guardrails.js';
+
+// Final-response safety net. The ceiling sits ABOVE every per-tool budget —
+// the ~50k content budgets AND read-cached-document's 200k max page — so it only
+// catches genuine runaway responses (e.g. a multi-MB raw-spec dump) and never
+// re-chops a response a tool already sized or a page the caller explicitly asked
+// for. It's a backstop, not the primary cap.
+const responseLimiter = new OutputLimiter(
+  parseInt(process.env.MAX_TOOL_RESPONSE_CHARS || '250000', 10),
+);
 
 export interface WebSearchMCPServerOptions {
   /** When true, the constructor will not attach SIGINT/SIGTERM handlers.
@@ -164,6 +178,18 @@ export class WebSearchMCPServer {
       ERROR_CODES.InternalError,
       `Unknown error occurred`
     );
+  }
+
+  /**
+   * Single choke point for every tool's text response. Applies the global
+   * OutputLimiter as a final safety net so an oversized response is truncated
+   * once, with an actionable note pointing at read-cached-document, rather than
+   * being silently clipped mid-content further down the stack.
+   */
+  private respondText(text: string): { content: [{ type: 'text'; text: string }] } {
+    return {
+      content: [{ type: 'text' as const, text: responseLimiter.truncate(text) }],
+    };
   }
 
   constructor(opts: WebSearchMCPServerOptions = {}) {
@@ -305,14 +331,7 @@ export class WebSearchMCPServer {
             responseText += `\n---\n\n`;
           });
           
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: responseText,
-              },
-            ],
-          };
+          return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'full-web-search');
         }
@@ -344,6 +363,9 @@ export class WebSearchMCPServer {
 
           let limit = 5; // default
           if (obj.limit !== undefined) {
+            if (typeof obj.limit === 'string' && !/^\d+$/.test(obj.limit.trim())) {
+              throw new Error('Invalid limit: must be an integer between 1 and 10');
+            }
             const limitValue = typeof obj.limit === 'string' ? parseInt(obj.limit, 10) : obj.limit;
             if (typeof limitValue !== 'number' || isNaN(limitValue) || limitValue < 1 || limitValue > 10) {
               throw new Error('Invalid limit: must be a number between 1 and 10');
@@ -372,7 +394,14 @@ export class WebSearchMCPServer {
           }));
 
           console.log(`[MCP] Search summaries completed, found ${summaryResults.length} results`);
-          
+
+          // Explicit empty-result message rather than a bare "0 results" + `[]`.
+          if (summaryResults.length === 0) {
+            return this.respondText(
+              `No results found for "${obj.query}". Try different or broader keywords, or use full-web-search for a deeper crawl.`,
+            );
+          }
+
           // Format: structured JSON block + human-readable text for AI-friendly parsing
           const jsonBlock = `\`\`\`json\n${JSON.stringify(summaryResults, null, 2)}\n\`\`\``;
           let responseText = `Search summaries for "${obj.query}" with ${summaryResults.length} results:\n\n${jsonBlock}\n\n`;
@@ -384,14 +413,7 @@ export class WebSearchMCPServer {
             responseText += `\n---\n\n`;
           });
 
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: responseText,
-              },
-            ],
-          };
+          return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'get-web-search-summaries');
         }
@@ -447,36 +469,25 @@ export class WebSearchMCPServer {
   
            console.log(`[MCP] Single page content extraction completed, extracted ${content.length} characters`);
   
-           // Format the result as text
+           // Format the result as text. Truncate exactly ONCE: reserve room for
+           // the header, the content label, and the truncation marker so the
+           // marker itself is never chopped (the previous two-step truncation
+           // could slice through "[Content truncated…]").
            const header = `**Source:** ${obj.url} | **Title:** ${title} | **Words:** ${wordCount}\n\n`;
-           let body = '';
+           let responseText: string;
 
-           if (maxContentLength && maxContentLength > 0) {
-             const availableForContent = maxContentLength - header.length - 50;
-             if (content.length > availableForContent) {
-               body = `**Content (truncated):**\n${content.substring(0, Math.max(0, availableForContent))}\n\n[Content truncated to respect limit]`;
-             } else {
-               body = `**Content:**\n${content}`;
-             }
+           const fitsLabel = `**Content:**\n`;
+           if (maxContentLength && maxContentLength > 0 &&
+               header.length + fitsLabel.length + content.length > maxContentLength) {
+             const label = `**Content (truncated):**\n`;
+             const marker = `\n\n[Content truncated to respect limit]`;
+             const available = Math.max(0, maxContentLength - header.length - label.length - marker.length);
+             responseText = header + label + content.substring(0, available) + marker;
            } else {
-             body = `**Content:**\n${content}`;
+             responseText = header + fitsLabel + content;
            }
 
-           let responseText = header + body;
-
-           // Ensure final response never exceeds maxContentLength
-           if (maxContentLength && maxContentLength > 0 && responseText.length > maxContentLength) {
-             responseText = responseText.substring(0, maxContentLength);
-           }
-
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: responseText,
-                },
-              ],
-            };
+            return this.respondText(responseText);
           } catch (error) {
             this.handleError(error, 'get-single-web-page-content');
           }
@@ -839,23 +850,32 @@ export class WebSearchMCPServer {
                 mdContent += content + '\n';
               }
 
-              // Handle appendToExisting (note: parallel + append is best-effort due to race conditions)
+              // Handle appendToExisting (note: parallel + append is best-effort due to race conditions).
+              // Isolate the disk write in its own try/catch so one failed write
+              // fails only that URL — the rest of the batch still succeeds — and
+              // so the attempted path is named in the error rather than lost.
               let finalFilePath = filePath;
-              if (appendToExisting) {
-                const existingFilePath = findExistingResearchFile(outputDir, filenamePrefix);
-                if (existingFilePath) {
-                  const separator = '\n\n---\n\n';
-                  const existingContent = await fs.promises.readFile(existingFilePath, 'utf8');
-                  await fs.promises.writeFile(existingFilePath, existingContent + separator + mdContent, 'utf8');
-                  finalFilePath = existingFilePath;
-                  console.log(`[MCP] Successfully appended research to existing file: ${existingFilePath}`);
+              try {
+                if (appendToExisting) {
+                  const existingFilePath = findExistingResearchFile(outputDir, filenamePrefix);
+                  if (existingFilePath) {
+                    const separator = '\n\n---\n\n';
+                    const existingContent = await fs.promises.readFile(existingFilePath, 'utf8');
+                    await fs.promises.writeFile(existingFilePath, existingContent + separator + mdContent, 'utf8');
+                    finalFilePath = existingFilePath;
+                    console.log(`[MCP] Successfully appended research to existing file: ${existingFilePath}`);
+                  } else {
+                    await fs.promises.writeFile(filePath, mdContent, 'utf8');
+                    console.log(`[MCP] Successfully saved research to: ${filePath}`);
+                  }
                 } else {
                   await fs.promises.writeFile(filePath, mdContent, 'utf8');
                   console.log(`[MCP] Successfully saved research to: ${filePath}`);
                 }
-              } else {
-                await fs.promises.writeFile(filePath, mdContent, 'utf8');
-                console.log(`[MCP] Successfully saved research to: ${filePath}`);
+              } catch (writeErr) {
+                const msg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+                console.error(`[MCP] Failed to write research file ${filePath}: ${msg}`);
+                return { url: currentUrl, filePath: '', success: false as const, error: `write failed for ${filePath}: ${msg}` };
               }
 
               return { url: currentUrl, filePath: finalFilePath, success: true as const, mdContent };
@@ -901,15 +921,34 @@ export class WebSearchMCPServer {
             responseText += '\n';
 
             if (!agentic) {
+              // Bound the TOTAL response, not just per-result. We track a running
+              // budget seeded from what's already been appended (header + path
+              // list) and decrement by each emitted block (content + separators),
+              // so accumulation can't silently blow past the cap. Paths are always
+              // listed above, so omitted content is still retrievable on disk.
               const totalCap = parseInt(process.env.MAX_OUTPUT_LENGTH || '50000', 10);
-              const perResultCap = Math.max(2000, Math.floor(totalCap / Math.max(1, successfulResults.length)));
+              let remaining = totalCap - responseText.length;
+              let resultsLeft = successfulResults.filter(r => r.mdContent).length;
+              let omitted = 0;
               for (const r of successfulResults) {
                 if (!r.mdContent) continue;
+                if (remaining <= 200 || resultsLeft <= 0) {
+                  omitted++;
+                  resultsLeft = Math.max(0, resultsLeft - 1);
+                  continue;
+                }
+                const perResultCap = Math.max(1000, Math.floor(remaining / resultsLeft));
                 let chunk = r.mdContent;
                 if (chunk.length > perResultCap) {
-                  chunk = chunk.substring(0, perResultCap) + `\n\n[Truncated at ${perResultCap} chars; full markdown saved to ${r.filePath}]`;
+                  chunk = chunk.substring(0, perResultCap) + `\n\n[Truncated at ${perResultCap} chars; full markdown saved to ${r.filePath} — read it with read-cached-document (use offset to page).]`;
                 }
-                responseText += `\n---\n\n${chunk}\n`;
+                const block = `\n---\n\n${chunk}\n`;
+                responseText += block;
+                remaining -= block.length;
+                resultsLeft = Math.max(0, resultsLeft - 1);
+              }
+              if (omitted > 0) {
+                responseText += `\n[${omitted} more document(s) omitted to stay within the response budget. All files are listed above — read them with read-cached-document (use offset to page through large files).]\n`;
               }
               responseText += '\n';
             }
@@ -922,14 +961,7 @@ export class WebSearchMCPServer {
             });
           }
 
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: responseText,
-              },
-            ],
-          };
+          return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'research_and_save_to_markdown');
         }
@@ -974,7 +1006,10 @@ export class WebSearchMCPServer {
           let offset = 0;
           if (obj.offset !== undefined) {
             const offsetVal = typeof obj.offset === 'string' ? parseInt(obj.offset, 10) : obj.offset;
-            offset = typeof offsetVal === 'number' && !isNaN(offsetVal) && offsetVal >= 0 ? offsetVal : 0;
+            if (typeof offsetVal !== 'number' || isNaN(offsetVal) || offsetVal < 0) {
+              throw new Error('Invalid offset: must be a non-negative integer');
+            }
+            offset = offsetVal;
           }
 
           const defaultLimit = filtering ? 20 : 100;
@@ -982,7 +1017,12 @@ export class WebSearchMCPServer {
           let limit = defaultLimit;
           if (obj.limit !== undefined) {
             const limitVal = typeof obj.limit === 'string' ? parseInt(obj.limit, 10) : obj.limit;
-            limit = typeof limitVal === 'number' && !isNaN(limitVal) && limitVal > 0 ? Math.min(limitVal, maxLimit) : defaultLimit;
+            // Reject explicit invalid values rather than silently substituting
+            // the default — a caller passing limit:0 should hear that it's wrong.
+            if (typeof limitVal !== 'number' || isNaN(limitVal) || limitVal <= 0) {
+              throw new Error('Invalid limit: must be a positive integer');
+            }
+            limit = Math.min(limitVal, maxLimit);
           }
 
           // Bound extractTopMatching to a sensible window so a single call
@@ -990,23 +1030,19 @@ export class WebSearchMCPServer {
           let extractTopMatching = 0;
           if (filtering && obj.extractTopMatching !== undefined) {
             const v = typeof obj.extractTopMatching === 'string' ? parseInt(obj.extractTopMatching, 10) : obj.extractTopMatching;
-            if (typeof v === 'number' && !isNaN(v) && v > 0) {
-              extractTopMatching = Math.min(5, v);
+            if (typeof v !== 'number' || isNaN(v) || v <= 0) {
+              throw new Error('Invalid extractTopMatching: must be a positive integer (bounded 1..5)');
             }
+            extractTopMatching = Math.min(5, v);
           }
 
           console.log(`[MCP] Sitemap call for ${obj.url} (filtering=${filtering}, extractTopMatching=${extractTopMatching}, offset=${offset}, limit=${limit})`);
           const allUrls = await fetchSitemapUrls(obj.url);
 
           if (allUrls.length === 0) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `No URLs found in the sitemap for ${obj.url}. The sitemap might not exist or could be empty.`,
-                },
-              ],
-            };
+            return this.respondText(
+              `No URLs found in the sitemap for ${obj.url}. The sitemap might not exist or could be empty.`,
+            );
           }
 
           let displayedUrls: string[];
@@ -1077,14 +1113,7 @@ export class WebSearchMCPServer {
             }
           }
 
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: responseText,
-              },
-            ],
-          };
+          return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'get-website-sitemap');
         }
@@ -1112,8 +1141,8 @@ export class WebSearchMCPServer {
         path: z.string().optional().describe('Used by `list` (directory) and `file` (single file). Empty string lists the repo root.'),
         branch: z.string().optional().describe('Branch override (defaults to repo default branch).'),
         maxDepth: z.number().optional().describe('crawl mode only. Max directory depth (default: GITHUB_MAX_DEPTH or 3).'),
-        maxFiles: z.number().optional().describe('crawl mode only. Max files crawled (default: GITHUB_MAX_FILES or 50).'),
-        previewLength: z.number().optional().default(500).describe('crawl mode only. Per-file preview cap in chars (default 500, max 5000).'),
+        maxFiles: z.number().optional().describe('crawl mode only. Max files crawled (default: GITHUB_MAX_FILES or 50). Must be a positive integer when provided.'),
+        previewLength: z.number().optional().default(500).describe('crawl mode only. Per-file preview cap in chars (default 500, min 100, max 5000; values below 100 are raised to 100).'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-github-repo-content`);
@@ -1133,9 +1162,20 @@ export class WebSearchMCPServer {
             throw new Error('GitHub extractor is not initialized.');
           }
 
-          const mode = ((obj.mode as string) || 'crawl') as 'crawl' | 'list' | 'file';
+          const modeRaw = (obj.mode as string) || 'crawl';
+          if (modeRaw !== 'crawl' && modeRaw !== 'list' && modeRaw !== 'file') {
+            throw new Error(`Invalid mode: "${modeRaw}". Must be one of crawl, list, file.`);
+          }
+          const mode = modeRaw as 'crawl' | 'list' | 'file';
           const branch = typeof obj.branch === 'string' ? obj.branch : undefined;
           const targetPath = typeof obj.path === 'string' ? obj.path : '';
+
+          // Defense-in-depth: `path` is interpolated raw into the GitHub
+          // contents API URL (github-extractor.getContent/getFileContent), so
+          // refuse traversal segments and absolute paths before forwarding.
+          if (/(^|\/)\.\.(\/|$)/.test(targetPath) || targetPath.startsWith('/')) {
+            throw new Error('Invalid path: must be a repo-relative path without ".." segments or a leading "/".');
+          }
 
           // === mode: list ===
           if (mode === 'list') {
@@ -1149,7 +1189,7 @@ export class WebSearchMCPServer {
             );
 
             if (contents.length === 0) {
-              return { content: [{ type: 'text' as const, text: `No contents found at path: ${targetPath || '/'}` }] };
+              return this.respondText(`No contents found at path: ${targetPath || '/'}`);
             }
 
             const dirs = contents.filter((i) => i.type === 'dir').sort((a, b) => a.name.localeCompare(b.name));
@@ -1159,7 +1199,7 @@ export class WebSearchMCPServer {
             if (dirs.length) body += `**Directories:**\n` + dirs.map((d) => `📁 ${d.name}/`).join('\n') + '\n\n';
             if (files.length) body += `**Files:**\n` + files.map((f) => `📄 ${f.name}`).join('\n') + '\n';
 
-            return { content: [{ type: 'text' as const, text: body }] };
+            return this.respondText(body);
           }
 
           // === mode: file ===
@@ -1181,12 +1221,18 @@ export class WebSearchMCPServer {
 
             let body = `**File:** ${repoInfo.owner}/${repoInfo.repo}/${targetPath}${branch ? `@${branch}` : ''}\n**Bytes:** ${fileContent.length}\n\n`;
             body += `\`\`\`${fence}\n${fileContent}\n\`\`\`\n`;
-            return { content: [{ type: 'text' as const, text: body }] };
+            return this.respondText(body);
           }
 
           // === mode: crawl (default) ===
           const maxDepth = (obj.maxDepth as number) ?? undefined;
           const maxFiles = (obj.maxFiles as number) ?? undefined;
+          if (maxFiles !== undefined && (typeof maxFiles !== 'number' || isNaN(maxFiles) || maxFiles <= 0)) {
+            throw new Error('Invalid maxFiles: must be a positive integer');
+          }
+          if (maxDepth !== undefined && (typeof maxDepth !== 'number' || isNaN(maxDepth) || maxDepth < 0)) {
+            throw new Error('Invalid maxDepth: must be a non-negative integer');
+          }
           const previewLength = Math.min(5000, Math.max(100, (obj.previewLength as number) ?? 500));
 
           console.log(`[MCP] GitHub crawl for ${obj.url} (previewLength=${previewLength})`);
@@ -1219,7 +1265,7 @@ export class WebSearchMCPServer {
             responseText += `**Files:** *(none found or all skipped)*\n`;
           }
 
-          return { content: [{ type: 'text' as const, text: responseText }] };
+          return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'get-github-repo-content');
         }
@@ -1235,10 +1281,14 @@ export class WebSearchMCPServer {
      // Register the OpenAPI specification extraction tool
     target.tool(
       'get-openapi-spec',
-      'Extract and download OpenAPI/Swagger specifications from API documentation pages. This tool automatically discovers OpenAPI specs by checking HTML link tags, common URL patterns, and versioned swagger files. The spec is saved to docs/technical/openapi/ for future use without re-crawling.',
+      'Extract an OpenAPI/Swagger specification from an API documentation page. Discovers the spec via HTML link tags, common URL patterns, and versioned swagger files, then saves the full raw spec to docs/technical/openapi/. By default it returns a compact ENDPOINT INDEX (method + path + summary + tags) plus the saved file path — not the raw spec — because real specs are far too large to inline. Use pathFilter/tag/method to narrow the index, and read-cached-document (with offset paging) to fetch the full raw spec or any section.',
       {
         url: z.string().url().describe('The URL of the API documentation page (e.g., https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro/)'),
         forceRefresh: z.boolean().optional().default(false).describe('Force refresh the cache and re-download the spec'),
+        pathFilter: z.string().optional().describe('Return only endpoints whose path contains this substring (case-insensitive), e.g. "/users" or "auth".'),
+        tag: z.string().optional().describe('Return only endpoints carrying this OpenAPI tag (case-insensitive).'),
+        method: z.string().optional().describe('Return only endpoints with this HTTP method (GET/POST/PUT/PATCH/DELETE/…, case-insensitive).'),
+        summaryOnly: z.boolean().optional().default(true).describe('When true (default) return the endpoint index only. Set false to also inline the full raw spec — but only when it is small enough to fit; otherwise the index + read-cached-document instructions are returned instead (the spec is never truncated mid-structure).'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-openapi-spec`);
@@ -1261,6 +1311,12 @@ export class WebSearchMCPServer {
             forceRefresh = Boolean(refreshValue);
           }
 
+          // Index filters (all optional). summaryOnly defaults to true.
+          const pathFilter = typeof obj.pathFilter === 'string' ? obj.pathFilter.trim() : '';
+          const tagFilter = typeof obj.tag === 'string' ? obj.tag.trim().toLowerCase() : '';
+          const methodFilter = typeof obj.method === 'string' ? obj.method.trim().toUpperCase() : '';
+          const summaryOnly = obj.summaryOnly === undefined ? true : Boolean(obj.summaryOnly);
+
           console.log(`[MCP] Starting OpenAPI spec extraction from: ${obj.url}`);
 
           // Use the OpenAPI extractor (url is already passed as first argument)
@@ -1275,25 +1331,14 @@ export class WebSearchMCPServer {
           console.log(`[MCP] OpenAPI extraction completed: success=${result.success}`);
 
           if (!result.success) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `Failed to extract OpenAPI specification:\n\nError: ${result.error || 'Unknown error'}`,
-                },
-              ],
-            };
+            return this.respondText(
+              `Failed to extract OpenAPI specification:\n\nError: ${result.error || 'Unknown error'}`,
+            );
           }
 
           // Format the result
           let responseText = `**OpenAPI Specification Extracted Successfully!**\n\n`;
-          
-          if (result.downloadedFile) {
-            responseText += `**Downloaded File:** ${result.downloadedFile.fileName}\n`;
-            responseText += `**Local Path:** ${result.downloadedFile.localPath}\n`;
-            responseText += `**Original URL:** ${result.openAPISpec?.url || obj.url}\n\n`;
-          }
-          
+
           if (result.openAPISpec) {
             responseText += `**Specification Info:**\n`;
             if (result.openAPISpec.title) responseText += `- Title: ${result.openAPISpec.title}\n`;
@@ -1308,42 +1353,82 @@ export class WebSearchMCPServer {
             if (result.openAPISpec.size !== undefined) responseText += `- Size: ${result.openAPISpec.size} bytes\n`;
           }
 
-          // For agentic clients (Cline / Claude Desktop / Roo Code) the path
-          // is enough — they have a sibling filesystem MCP and will read it.
-          // For non-agent clients (LM Studio in chat mode) the path is
-          // unreachable, so embed the spec content inline up to OPENAPI_INLINE_CAP.
+          // Resolve the endpoint index. The extractor attaches it on a fresh
+          // download; on a warm-cache hit it is empty, so re-parse the saved
+          // file lazily (it's already on disk).
+          let endpoints = result.openAPISpec?.endpoints ?? [];
+          if (endpoints.length === 0 && result.downloadedFile?.localPath) {
+            try {
+              const raw = await fs.promises.readFile(result.downloadedFile.localPath, 'utf8');
+              const lower = result.downloadedFile.fileName.toLowerCase();
+              const parsed = lower.endsWith('.yaml') || lower.endsWith('.yml')
+                ? yaml.load(raw)
+                : JSON.parse(raw);
+              endpoints = buildEndpointIndex(parsed).endpoints;
+            } catch (err) {
+              console.log(`[MCP] Could not rebuild endpoint index from cache: ${err instanceof Error ? err.message : 'parse error'}`);
+            }
+          }
+
+          // Apply filters.
+          const filtered = endpoints.filter(e =>
+            (!methodFilter || e.method === methodFilter) &&
+            (!tagFilter || e.tags.some(t => t.toLowerCase() === tagFilter)) &&
+            (!pathFilter || e.path.toLowerCase().includes(pathFilter.toLowerCase())));
+
+          const filterActive = Boolean(methodFilter || tagFilter || pathFilter);
+          responseText += `\n**Endpoints:** ${endpoints.length} total`;
+          if (filterActive) responseText += ` (${filtered.length} match the filter)`;
+          responseText += `\n`;
+
+          if (endpoints.length === 0) {
+            responseText += `\n*No endpoint index available (the spec exposes no \`paths\`, or could not be re-parsed from cache — try \`forceRefresh: true\`). The full raw spec is on disk; read it with read-cached-document.*\n`;
+          } else {
+            const LIST_CAP = 200;
+            const shown = filtered.slice(0, LIST_CAP);
+            if (shown.length > 0) {
+              responseText += `\n**Endpoint index${filterActive ? ' (filtered)' : ''}:**\n`;
+              for (const e of shown) {
+                const tags = e.tags.length ? ` [${e.tags.join(', ')}]` : '';
+                const summary = e.summary ? ` — ${e.summary}` : '';
+                responseText += `- \`${e.method} ${e.path}\`${summary}${tags}\n`;
+              }
+              if (filtered.length > LIST_CAP) {
+                responseText += `\n*…and ${filtered.length - LIST_CAP} more. Narrow with \`pathFilter\`, \`tag\`, or \`method\`.*\n`;
+              }
+            } else if (filterActive) {
+              responseText += `\n*No endpoints matched the filter. Remove or broaden \`pathFilter\`/\`tag\`/\`method\`.*\n`;
+            }
+          }
+
+          // Saved path + how to read the full raw spec. Always present so the
+          // model can page the on-disk file regardless of client type.
           if (result.downloadedFile) {
             responseText += `\n**Saved to:** \`${result.downloadedFile.localPath}\`\n`;
+            responseText += `To read the full raw spec, call read-cached-document with fileName="${result.downloadedFile.fileName}" and offset=0, then follow the "Next offset" hint to page through it.\n`;
 
-            if (!isAgenticClient()) {
-              const inlineCap = parseInt(process.env.OPENAPI_INLINE_CAP || '50000', 10);
+            // Optionally inline the raw spec — but only when the caller opted in
+            // AND it fits whole. We never substring mid-JSON/YAML (that produced
+            // unparseable output before); if it doesn't fit, the index + paging
+            // instructions above are the complete, valid answer.
+            const inlineCap = parseInt(process.env.OPENAPI_INLINE_CAP || '50000', 10);
+            const wantsInline = !summaryOnly || !isAgenticClient();
+            if (wantsInline) {
               try {
                 const specBytes = await fs.promises.readFile(result.downloadedFile.localPath, 'utf8');
-                let chunk = specBytes;
-                let truncated = false;
-                if (chunk.length > inlineCap) {
-                  chunk = chunk.substring(0, inlineCap);
-                  truncated = true;
-                }
                 const isYaml = result.downloadedFile.fileName.endsWith('.yaml') || result.downloadedFile.fileName.endsWith('.yml');
-                responseText += `\n**Spec Content (inline for non-agent client):**\n\`\`\`${isYaml ? 'yaml' : 'json'}\n${chunk}\n\`\`\`\n`;
-                if (truncated) {
-                  responseText += `\n[Truncated to ${inlineCap} chars; full spec is at the path above. Re-call with \`forceRefresh: true\` and a wider \`OPENAPI_INLINE_CAP\` env if you need more.]\n`;
+                if (specBytes.length <= inlineCap) {
+                  responseText += `\n**Full spec (inline, ${specBytes.length} chars):**\n\`\`\`${isYaml ? 'yaml' : 'json'}\n${specBytes}\n\`\`\`\n`;
+                } else {
+                  responseText += `\n*Raw spec is ${specBytes.length} chars — too large to inline without corrupting it. Fetch it in pages via read-cached-document(fileName="${result.downloadedFile.fileName}", offset=0).*\n`;
                 }
               } catch (err) {
-                responseText += `\n[Unable to embed spec inline: ${err instanceof Error ? err.message : 'read error'}]\n`;
+                responseText += `\n[Unable to read saved spec: ${err instanceof Error ? err.message : 'read error'}]\n`;
               }
             }
           }
-          
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: responseText,
-              },
-            ],
-          };
+
+          return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'get-openapi-spec');
         }
@@ -1440,14 +1525,7 @@ export class WebSearchMCPServer {
             });
           }
 
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: responseText,
-              },
-            ],
-          };
+          return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'progressive-web-search');
         }
@@ -1506,14 +1584,7 @@ export class WebSearchMCPServer {
           }
           responseText += `\n**Content Preview:**\n${textContent}`;
 
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: responseText,
-              },
-            ],
-          };
+          return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'get-pdf-content');
         }
@@ -1550,16 +1621,31 @@ export class WebSearchMCPServer {
           // Research markdown files. The same project-root resolution that
           // research_and_save_to_markdown uses, so we look in the same dir.
           const researchFiles: Array<{ fileName: string; localPath: string; mtime: Date; size: number }> = [];
+          let researchScanTruncated = false;
           if (category === 'all' || category === 'research') {
             const isCwdProjectRoot = fs.existsSync(path.join(process.cwd(), 'package.json'));
             const projectRoot = isCwdProjectRoot ? process.cwd() : path.resolve(__dirname, '..', '..');
             const researchDir = path.join(projectRoot, 'docs', 'research-output');
             if (fs.existsSync(researchDir)) {
-              for (const entry of fs.readdirSync(researchDir)) {
-                if (!entry.endsWith('.md')) continue;
+              // Bound the scan so a pathologically large directory can't stat
+              // thousands of files (or overflow the response). Names are
+              // timestamp-prefixed, so a reverse lexicographic sort surfaces the
+              // newest first before we cap.
+              const MAX_LISTED = parseInt(process.env.MAX_LISTED_DOCS || '500', 10);
+              const realResearchDir = fs.realpathSync(researchDir);
+              let entries = fs.readdirSync(researchDir).filter(e => e.endsWith('.md'));
+              if (entries.length > MAX_LISTED) {
+                researchScanTruncated = true;
+                entries = entries.sort().reverse().slice(0, MAX_LISTED);
+              }
+              for (const entry of entries) {
                 const full = path.join(researchDir, entry);
                 try {
+                  // Symlink hardening: skip anything resolving outside the dir.
+                  const realFull = fs.realpathSync(full);
+                  if (!realFull.startsWith(realResearchDir + path.sep)) continue;
                   const stat = fs.statSync(full);
+                  if (!stat.isFile()) continue;
                   researchFiles.push({ fileName: entry, localPath: full, mtime: stat.mtime, size: stat.size });
                 } catch { /* unreadable entry — skip */ }
               }
@@ -1589,6 +1675,9 @@ export class WebSearchMCPServer {
             researchFiles.forEach((f, idx) => {
               responseText += `| ${idx + 1} | ${f.fileName} | ${(f.size / 1024).toFixed(1)} | ${f.mtime.toISOString()} |\n`;
             });
+            if (researchScanTruncated) {
+              responseText += `\n*Listing capped at ${researchFiles.length} most-recent research files (set MAX_LISTED_DOCS to change).*\n`;
+            }
             responseText += '\n';
           }
 
@@ -1605,14 +1694,7 @@ export class WebSearchMCPServer {
           }
           responseText += `\n`;
 
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: responseText,
-              },
-            ],
-          };
+          return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'list-cached-documents');
         }
@@ -1625,10 +1707,11 @@ export class WebSearchMCPServer {
     // listing was a dead end for LM Studio.
     target.tool(
       'read-cached-document',
-      'Return the contents of a previously-cached document by file name (as listed by list-cached-documents). Resolves the file from the OpenAPI cache directory or the research-output directory; returns text inline up to maxBytes. Refuses any name containing path separators or "..".',
+      'Return the contents of a previously-cached document by file name (as listed by list-cached-documents). Resolves the file from the OpenAPI cache directory or the research-output directory and returns a window of text. Large documents are paged: combine `offset` with `maxBytes` and follow the "Next offset" hint to read the whole file. Refuses any name containing path separators or "..".',
       {
         fileName: z.string().min(1).describe('File name as shown by list-cached-documents (e.g. "example-com-petstore.json" or "research-2026-04-28-….md").'),
-        maxBytes: z.number().optional().default(50000).describe('Maximum number of bytes to return inline (default 50000, max 200000). Larger documents are truncated with a note.'),
+        offset: z.number().int().nonnegative().optional().default(0).describe('Character offset to start reading from (default 0). Pass the "Next offset" value from a previous truncated response to continue paging through a large document. Measured in characters (JS string length), not raw bytes.'),
+        maxBytes: z.number().optional().default(50000).describe('Maximum number of characters to return in this page (default 50000, max 200000). Combine with `offset` to page through documents of any size.'),
       },
       async (args: unknown) => {
         try {
@@ -1644,49 +1727,61 @@ export class WebSearchMCPServer {
           if (fileName.includes('/') || fileName.includes('\\') || fileName.includes('..')) {
             throw new Error('Invalid file name: path separators and ".." are not permitted');
           }
-          const maxBytes = Math.min(200_000, Math.max(1_000, (obj.maxBytes as number) ?? 50_000));
+          // Window controls. `maxBytes` / `offset` are measured in characters
+          // (JS string length), which is how every truncation in this codebase
+          // works; document this in the schema rather than pretend it's bytes.
+          const maxBytes = Math.min(200_000, Math.max(1_000, Math.floor(Number(obj.maxBytes ?? 50_000)) || 50_000));
+          const offset = Math.max(0, Math.floor(Number(obj.offset ?? 0)) || 0);
 
           const isCwdProjectRoot = fs.existsSync(path.join(process.cwd(), 'package.json'));
           const projectRoot = isCwdProjectRoot ? process.cwd() : path.resolve(__dirname, '..', '..');
 
           // Search both well-known dirs in order: OpenAPI specs, then research output.
-          const openapiDir = path.join(projectRoot, 'docs', 'technical', 'openapi');
+          // CRITICAL: resolve the OpenAPI dir from the extractor's cache, NOT from
+          // cwd — the cache dir is module-relative (dist/../../docs/technical), so a
+          // cwd-based guess diverges from where get-openapi-spec actually saved the
+          // file and read-cached-document would report "not found".
+          const openapiDir = openAPIExtractor.getOpenAPIDir();
           const researchDir = path.join(projectRoot, 'docs', 'research-output');
 
           const candidates = [
-            { kind: 'openapi', full: path.join(openapiDir, fileName) },
-            { kind: 'research', full: path.join(researchDir, fileName) },
+            { kind: 'openapi', full: path.join(openapiDir, fileName), dir: openapiDir },
+            { kind: 'research', full: path.join(researchDir, fileName), dir: researchDir },
           ];
 
-          let found: { kind: string; full: string; size: number } | null = null;
+          let found: { kind: string; full: string; dir: string; size: number } | null = null;
           for (const c of candidates) {
             try {
               const st = fs.statSync(c.full);
               if (st.isFile()) {
-                found = { kind: c.kind, full: c.full, size: st.size };
+                found = { kind: c.kind, full: c.full, dir: c.dir, size: st.size };
                 break;
               }
             } catch { /* not in this dir, try next */ }
           }
 
           if (!found) {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `Document not found: ${fileName}. Use list-cached-documents to see available names.`,
-                },
-              ],
-            };
+            return this.respondText(
+              `Document not found: ${fileName}. Use list-cached-documents to see available names.`,
+            );
+          }
+
+          // Defense-in-depth: the string check above blocks "..", but a symlink
+          // inside the cache dir could still point outside it. Resolve real paths
+          // and require the file to stay within its cache directory.
+          try {
+            const realDir = fs.realpathSync(found.dir);
+            const realFull = fs.realpathSync(found.full);
+            if (realFull !== realDir && !realFull.startsWith(realDir + path.sep)) {
+              throw new Error('Invalid file name: resolves outside the cache directory');
+            }
+          } catch (err) {
+            if (err instanceof Error && err.message.startsWith('Invalid file name')) throw err;
+            // realpath failed for an unrelated reason — fall through to read attempt.
           }
 
           const raw = await fs.promises.readFile(found.full, 'utf8');
-          let body = raw;
-          let truncated = false;
-          if (body.length > maxBytes) {
-            body = body.substring(0, maxBytes);
-            truncated = true;
-          }
+          const { body, start, end, totalLen, hasMore } = clampReadWindow(raw, offset, maxBytes);
 
           const lower = fileName.toLowerCase();
           const fence = lower.endsWith('.md') ? 'markdown'
@@ -1694,20 +1789,16 @@ export class WebSearchMCPServer {
               : lower.endsWith('.json') ? 'json'
                 : '';
 
-          let responseText = `**Cached document:** \`${fileName}\` (${found.kind}, ${found.size} bytes)\n\n`;
+          let responseText = `**Cached document:** \`${fileName}\` (${found.kind}, ${totalLen} chars total)\n`;
+          responseText += `**Showing chars ${start}–${end} of ${totalLen}.**\n\n`;
           responseText += `\`\`\`${fence}\n${body}\n\`\`\`\n`;
-          if (truncated) {
-            responseText += `\n[Truncated to ${maxBytes} bytes; raise \`maxBytes\` (max 200000) to see more.]\n`;
+          if (hasMore) {
+            responseText += `\n[More content available. Re-call read-cached-document with the same fileName and offset=${end} to continue. Next offset: ${end}.]\n`;
+          } else if (start > 0) {
+            responseText += `\n[End of document reached.]\n`;
           }
 
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: responseText,
-              },
-            ],
-          };
+          return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'read-cached-document');
         }
@@ -1731,9 +1822,13 @@ export class WebSearchMCPServer {
       throw new Error('Invalid arguments: query cannot be empty or whitespace only');
     }
 
-    // Convert limit to number if it's a string
+    // Convert limit to number if it's a string. Reject junk like "5abc" — bare
+    // parseInt would silently accept the leading "5".
     let limit = 5; // default
     if (obj.limit !== undefined) {
+      if (typeof obj.limit === 'string' && !/^\d+$/.test(obj.limit.trim())) {
+        throw new Error('Invalid limit: must be an integer between 1 and 10');
+      }
       const limitValue = typeof obj.limit === 'string' ? parseInt(obj.limit, 10) : obj.limit;
       if (typeof limitValue !== 'number' || isNaN(limitValue) || limitValue < 1 || limitValue > 10) {
         throw new Error('Invalid limit: must be a number between 1 and 10');
@@ -1751,9 +1846,13 @@ export class WebSearchMCPServer {
       }
     }
 
-    // Convert maxContentLength to number if it's a string
+    // Convert maxContentLength to number if it's a string. Reject junk like
+    // "1000abc" — bare parseInt would silently accept the leading digits.
     let maxContentLength: number | undefined;
     if (obj.maxContentLength !== undefined) {
+      if (typeof obj.maxContentLength === 'string' && !/^\d+$/.test(obj.maxContentLength.trim())) {
+        throw new Error('Invalid maxContentLength: must be a non-negative integer');
+      }
       const maxLengthValue = typeof obj.maxContentLength === 'string' ? parseInt(obj.maxContentLength, 10) : obj.maxContentLength;
       if (typeof maxLengthValue !== 'number' || isNaN(maxLengthValue) || maxLengthValue < 0) {
         throw new Error('Invalid maxContentLength: must be a non-negative number');

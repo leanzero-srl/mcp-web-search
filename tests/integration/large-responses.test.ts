@@ -76,7 +76,7 @@ describe('Large Responses Tests', () => {
   it('should handle massive PDF file', async () => {
     try {
       const result = await client.callTool({
-        name: 'extract-pdf',
+        name: 'get-pdf-content',
         arguments: {
           url: 'https://arxiv.org/pdf/1706.03762.pdf', // Large paper
           maxContentLength: 5000,

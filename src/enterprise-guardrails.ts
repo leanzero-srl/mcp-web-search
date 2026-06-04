@@ -458,7 +458,10 @@ export class OutputLimiter {
       'Truncation'
     );
 
-    return truncated + `\n\n[Content truncated at ${this.maxLength} characters]`;
+    return (
+      truncated +
+      `\n\n[Response truncated at ${this.maxLength} characters. Any files referenced above are saved on disk — use list-cached-documents and read-cached-document (with offset to page) to retrieve the full content.]`
+    );
   }
 
   /**
