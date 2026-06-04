@@ -258,6 +258,24 @@ export class ProgressiveSearchEngine implements IProgressiveSearchEngine {
     return allResults;
   }
 
+  /**
+   * Normalizes a URL for dedup so that case-only host differences, trailing
+   * slashes, and fragments don't slip the same page through twice. Falls back
+   * to the raw string if the URL can't be parsed.
+   */
+  private normalizeUrl(u: string): string {
+    try {
+      const x = new URL(u);
+      x.hostname = x.hostname.toLowerCase();
+      x.hash = '';
+      let s = x.toString();
+      if (s.endsWith('/')) s = s.slice(0, -1);
+      return s;
+    } catch {
+      return u;
+    }
+  }
+
   private ingestResults(
     newResults: SearchResult[],
     stage: number,
@@ -266,8 +284,9 @@ export class ProgressiveSearchEngine implements IProgressiveSearchEngine {
     seenUrls: Set<string>
   ): void {
     for (const res of newResults) {
-      if (!seenUrls.has(res.url)) {
-        seenUrls.add(res.url);
+      const key = this.normalizeUrl(res.url);
+      if (!seenUrls.has(key)) {
+        seenUrls.add(key);
         targetList.push({
           ...res,
           stage,

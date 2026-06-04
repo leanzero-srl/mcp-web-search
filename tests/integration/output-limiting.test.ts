@@ -167,7 +167,7 @@ describe('Output Limiting Tests', () => {
   it('should limit PDF extraction content', async () => {
     try {
       const result = await client.callTool({
-        name: 'extract-pdf',
+        name: 'get-pdf-content',
         arguments: {
           url: 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf',
           maxContentLength: 200,

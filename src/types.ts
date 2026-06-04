@@ -84,6 +84,19 @@ export enum TechnicalDocType {
   TECHNICAL_PDF = 'technical-pdf',
 }
 
+/**
+ * One operation (method + path) extracted from an OpenAPI/Swagger `paths`
+ * object. The lightweight index of these is what get-openapi-spec returns by
+ * default, so the model gets a usable map of the API without the full spec
+ * (which is saved to disk and paged via read-cached-document).
+ */
+export interface OpenAPIEndpoint {
+  method: string;   // upper-case HTTP verb, e.g. "GET"
+  path: string;     // raw path key, e.g. "/pets/{id}"
+  summary: string;  // summary || operationId || ''
+  tags: string[];   // [] if none
+}
+
 export interface OpenAPISpecInfo {
   url: string;
   title?: string;
@@ -93,6 +106,10 @@ export interface OpenAPISpecInfo {
   docType: TechnicalDocType;
   size?: number;
   timestamp: string;
+  /** Endpoint index built from the spec's `paths`. Empty on a warm-cache hit
+   *  (the spec isn't re-parsed); callers can lazily rebuild from the saved file. */
+  endpoints?: OpenAPIEndpoint[];
+  endpointCount?: number;
 }
 
 export interface DownloadedOpenAPI {
