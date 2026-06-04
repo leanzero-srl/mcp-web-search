@@ -54,14 +54,14 @@ describe('Parallel Search Tests', () => {
     try {
       const promises = [
         client.callTool({
-          name: 'extract-pdf',
+          name: 'get-pdf-content',
           arguments: {
             url: 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf',
             maxContentLength: 500,
           },
         }, undefined, { timeout: testTimeout }),
         client.callTool({
-          name: 'extract-pdf',
+          name: 'get-pdf-content',
           arguments: {
             url: 'https://www.africau.edu/images/default/sample.pdf',
             maxContentLength: 500,

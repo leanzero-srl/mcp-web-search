@@ -33,6 +33,29 @@ export function getWordCount(text: string): number {
   return text.trim().split(/\s+/).filter(word => word.length > 0).length;
 }
 
+export interface ReadWindow {
+  body: string;
+  start: number;
+  end: number;
+  totalLen: number;
+  hasMore: boolean;
+}
+
+/**
+ * Computes a bounded read window over a string for paginated readback. `offset`
+ * and `maxChars` are clamped so the result is always a valid sub-range no matter
+ * the inputs; `hasMore` reports whether content remains past `end` — the caller
+ * uses `end` as the next page's offset. Measured in JS string characters.
+ */
+export function clampReadWindow(raw: string, offset: number, maxChars: number): ReadWindow {
+  const totalLen = raw.length;
+  const safeOffset = Math.max(0, Math.floor(offset) || 0);
+  const safeMax = Math.max(1, Math.floor(maxChars) || 1);
+  const start = Math.min(safeOffset, totalLen);
+  const end = Math.min(start + safeMax, totalLen);
+  return { body: raw.substring(start, end), start, end, totalLen, hasMore: end < totalLen };
+}
+
 export function getContentPreview(text: string, maxLength: number = 500): string {
   const cleaned = cleanText(text, maxLength);
   return cleaned.length === maxLength ? cleaned + '...' : cleaned;
