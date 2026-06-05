@@ -26,7 +26,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { WebSearchMCPServer } from './server.js';
 import { attachClientDetect } from './client-detect.js';
-import { requireBearer, tenantRateLimiter, mountAdminRoutes } from './auth.js';
+import { requireAuth, tenantRateLimiter, mountAdminRoutes } from './auth.js';
+import { mountOAuthMetadata } from './oauth.js';
+import { requestContext } from './request-context.js';
 import { logger } from './logger.js';
 
 const PORT = Number(process.env.PORT) || 8443;
@@ -40,6 +42,7 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
 
   app.use(cors({
     origin: '*',
+    allowedHeaders: ['Authorization', 'Content-Type', 'Accept', 'X-Serper-Key', 'Mcp-Session-Id', 'Mcp-Protocol-Version'],
     exposedHeaders: ['WWW-Authenticate', 'Mcp-Session-Id', 'Mcp-Protocol-Version'],
   }));
 
@@ -52,6 +55,7 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
   });
 
   mountAdminRoutes(app);
+  mountOAuthMetadata(app);
 
   const auditOnFinish = (req: Request, res: Response, started: number, toolName: string | undefined): void => {
     res.on('finish', () => {
@@ -68,11 +72,16 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
     });
   };
 
-  app.post('/mcp', requireBearer, tenantRateLimiter, async (req: Request, res: Response) => {
+  app.post('/mcp', requireAuth, tenantRateLimiter, async (req: Request, res: Response) => {
     const started = Date.now();
     const body = req.body as { method?: string; params?: { name?: string }; id?: string | number | null } | undefined;
     const toolName = body?.method === 'tools/call' ? body?.params?.name : body?.method;
     auditOnFinish(req, res, started, toolName);
+
+    // Per-request Serper key: `X-Serper-Key` header (header-capable clients) or
+    // `?serper_key=` query (Authorization-only clients like claude.ai web). Never
+    // logged; carried via AsyncLocalStorage to `search-engine.ts`.
+    const serperKey = req.get('x-serper-key') || (typeof req.query.serper_key === 'string' ? req.query.serper_key : undefined) || undefined;
 
     // Fresh McpServer per request (stateless transport requires it). The 11
     // tool handlers close over `sharedInstance.searchEngine` etc., so the
@@ -88,8 +97,20 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
       sessionIdGenerator: undefined,
     };
     if (PUBLIC_HOST) {
+      // Accept both `host:port` and bare `host`: Tailscale Funnel may or may not
+      // forward the non-default port in the Host header, and a mismatch would 403
+      // all traffic. `ALLOWED_HOSTS` (comma-separated) is an explicit override.
+      const hosts = new Set<string>([PUBLIC_HOST]);
+      const bareHost = PUBLIC_HOST.split(':')[0];
+      if (bareHost) hosts.add(bareHost);
+      if (process.env.ALLOWED_HOSTS) {
+        for (const h of process.env.ALLOWED_HOSTS.split(',')) {
+          const t = h.trim();
+          if (t) hosts.add(t);
+        }
+      }
       transportOpts.enableDnsRebindingProtection = true;
-      transportOpts.allowedHosts = [PUBLIC_HOST];
+      transportOpts.allowedHosts = [...hosts];
     }
     const transport = new StreamableHTTPServerTransport(transportOpts);
 
@@ -98,8 +119,10 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
     });
 
     try {
-      await mcpServer.connect(transport);
-      await transport.handleRequest(req, res, req.body);
+      await requestContext.run({ serperKey }, async () => {
+        await mcpServer.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+      });
     } catch (err) {
       logger.error('[mcp] handleRequest failed', { error: (err as Error).message });
       if (!res.headersSent) {

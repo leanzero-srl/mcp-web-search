@@ -15,6 +15,9 @@ import { semanticCache } from './semantic-cache.js';
 // Import request deduplicator to prevent duplicate concurrent API calls
 import { requestDeduplicator } from './request-deduplicator.js';
 
+// Per-request context: a caller-supplied Serper key overrides the process env.
+import { requestContext } from './request-context.js';
+
 export interface SearchEngineConfig {
   maxRequestsPerMinute?: number;
   resetIntervalMs?: number;
@@ -377,7 +380,9 @@ export class SearchEngine {
    * Runs a search with a specific browser engine
    */
   private async tryApiSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
-    const apiKey = process.env.SERPER_API_KEY;
+    // Prefer the per-request key (HTTP callers bring their own); fall back to the
+    // process env (stdio callers set it in their mcp.json `env`).
+    const apiKey = requestContext.getStore()?.serperKey || process.env.SERPER_API_KEY;
     if (!apiKey) {
       console.error('[SearchEngine] API search failed: SERPER_API_KEY is not set');
       return [];
