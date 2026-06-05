@@ -20,6 +20,7 @@ import argon2 from 'argon2';
 import express, { type Express, type Request, type Response, type NextFunction } from 'express';
 import rateLimit from 'express-rate-limit';
 import { logger } from './logger.js';
+import { verifyOAuth, oauthEnabled, protectedResourceMetadataUrl } from './oauth.js';
 
 const DATA_DIR = process.env.DATA_DIR || process.cwd();
 const TENANTS_PATH = path.join(DATA_DIR, 'tenants.json');
@@ -98,6 +99,76 @@ function activeHashes(record: TenantRecord): string[] {
   return hashes;
 }
 
+/** Match a presented token against the stored argon2id tenant bearers. */
+async function matchStaticBearer(token: string): Promise<{ id: string; displayName: string } | null> {
+  const tenants = await loadTenants();
+  for (const [tenantId, record] of Object.entries(tenants)) {
+    for (const h of activeHashes(record)) {
+      try {
+        if (await argon2.verify(h, token)) {
+          return { id: tenantId, displayName: record.displayName };
+        }
+      } catch {
+        // malformed hash — skip
+      }
+    }
+  }
+  return null;
+}
+
+/** Emit a 401. When OAuth is enabled, include the RFC 9728 discovery hint that
+ *  tells clients (e.g. claude.ai web) where to start the OAuth flow. */
+function unauthorized(res: Response): void {
+  if (oauthEnabled()) {
+    const url = protectedResourceMetadataUrl();
+    if (url) res.set('WWW-Authenticate', `Bearer resource_metadata="${url}"`);
+  }
+  res.status(401).json({ error: 'unauthorized' });
+}
+
+/**
+ * Dual auth for `/mcp`: accept either an IdP-issued OAuth 2.1 access token
+ * (claude.ai web / OAuth clients) OR a static argon2id tenant bearer (Claude API
+ * connector, Cursor, Forge). On failure, challenge with WWW-Authenticate so
+ * OAuth-capable clients can discover the authorization server.
+ */
+export const requireAuth = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  const auth = req.headers.authorization;
+  if (!auth || !/^Bearer\s+/i.test(auth)) {
+    unauthorized(res);
+    return;
+  }
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  if (!token) {
+    unauthorized(res);
+    return;
+  }
+
+  // 1) OAuth access token (JWT validated against the IdP JWKS).
+  const claims = await verifyOAuth(token);
+  if (claims) {
+    const sub = typeof claims.sub === 'string' ? claims.sub : 'oauth';
+    req.tenant = { id: `oauth:${sub}`, displayName: (claims.email as string) || sub };
+    return next();
+  }
+
+  // 2) Static tenant bearer.
+  try {
+    const tenant = await matchStaticBearer(token);
+    if (tenant) {
+      req.tenant = tenant;
+      return next();
+    }
+  } catch (err) {
+    logger.error('[auth] tenant load failed', { error: (err as Error).message });
+    res.status(500).json({ error: 'internal error' });
+    return;
+  }
+
+  unauthorized(res);
+};
+
+/** Back-compat: static-bearer-only guard (no OAuth path). */
 export const requireBearer = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   const auth = req.headers.authorization;
   if (!auth || !/^Bearer\s+/i.test(auth)) {
@@ -109,27 +180,17 @@ export const requireBearer = async (req: Request, res: Response, next: NextFunct
     res.status(401).json({ error: 'unauthorized' });
     return;
   }
-
   try {
-    const tenants = await loadTenants();
-    for (const [tenantId, record] of Object.entries(tenants)) {
-      for (const h of activeHashes(record)) {
-        try {
-          if (await argon2.verify(h, token)) {
-            req.tenant = { id: tenantId, displayName: record.displayName };
-            return next();
-          }
-        } catch {
-          // malformed hash — skip
-        }
-      }
+    const tenant = await matchStaticBearer(token);
+    if (tenant) {
+      req.tenant = tenant;
+      return next();
     }
   } catch (err) {
     logger.error('[auth] tenant load failed', { error: (err as Error).message });
     res.status(500).json({ error: 'internal error' });
     return;
   }
-
   res.status(401).json({ error: 'unauthorized' });
 };
 
