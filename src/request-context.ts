@@ -18,6 +18,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 export interface RequestCtx {
   /** Per-request Serper API key supplied by the caller (header or query param). */
   serperKey?: string;
+  /** Per-request GitHub token supplied by the caller (header or query param). */
+  githubToken?: string;
 }
 
 export const requestContext = new AsyncLocalStorage<RequestCtx>();

@@ -7,6 +7,7 @@ import { browserPool } from './browser-pool.js';
 import { scoreContentQuality, getBestContentSelector, cleanText as qualityCleanText } from './content-quality-scorer.js';
 import { sessionRateLimiter } from './enterprise-guardrails.js';
 import { requestDeduplicator } from './request-deduplicator.js';
+import { requestContext } from './request-context.js';
 
 /**
  * Parses a GitHub URL to extract owner, repo, and path information.
@@ -75,7 +76,7 @@ async function extractRawGitHubContent(url: string): Promise<string | null> {
       'User-Agent': 'Web-Search-MCP',
       'X-GitHub-Api-Version': '2022-11-28',
     };
-    const githubToken = process.env.GITHUB_TOKEN;
+    const githubToken = requestContext.getStore()?.githubToken || process.env.GITHUB_TOKEN;
     if (githubToken) {
       headers.Authorization = `Bearer ${githubToken}`;
     }
