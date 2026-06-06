@@ -206,6 +206,25 @@ export const tenantRateLimiter = rateLimit({
   },
 });
 
+/**
+ * Restrict the admin surface to genuine local processes only. Funnel proxies
+ * from localhost too, so a loopback socket alone is not sufficient — we also
+ * reject anything carrying `X-Forwarded-For` (which Tailscale Funnel/serve and
+ * any reverse proxy add). Net effect: `/v1/admin/*` is reachable only from a
+ * process on this machine, never over the public Funnel or the tailnet/LAN.
+ * `ADMIN_ALLOW_REMOTE=1` opts out (e.g. if you later front it with your own
+ * authenticated proxy).
+ */
+function localhostOnly(req: Request, res: Response, next: NextFunction): void {
+  if (process.env.ADMIN_ALLOW_REMOTE === '1') return next();
+  const ra = req.socket.remoteAddress || '';
+  const isLoopback = ra === '127.0.0.1' || ra === '::1' || ra === '::ffff:127.0.0.1';
+  const forwarded = req.headers['x-forwarded-for'];
+  if (isLoopback && !forwarded) return next();
+  logger.warn('[admin] rejected non-local admin request', { remote: ra, forwarded: forwarded || null });
+  res.status(403).json({ error: 'admin endpoints are localhost-only' });
+}
+
 function adminAuth(req: Request, res: Response, next: NextFunction): void {
   const expected = process.env.MCP_WEB_SEARCH_ADMIN_TOKEN;
   if (!expected) {
@@ -226,6 +245,7 @@ function generateBearer(): string {
 
 export function mountAdminRoutes(app: Express): void {
   const router = express.Router();
+  router.use(localhostOnly);
   router.use(express.json({ limit: '16kb' }));
 
   router.post('/tenants', adminAuth, async (req: Request, res: Response) => {

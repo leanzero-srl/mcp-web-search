@@ -32,6 +32,11 @@ import { requestContext } from './request-context.js';
 import { logger } from './logger.js';
 
 const PORT = Number(process.env.PORT) || 8443;
+// Bind loopback only by default. Tailscale Funnel/serve proxies inbound traffic
+// to 127.0.0.1:PORT, so loopback is sufficient — and it avoids colliding with
+// tailscaled's own bind on the tailnet IPs (which would EADDRINUSE a wildcard
+// bind after Funnel is enabled), while keeping the server off the tailnet/LAN.
+const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 const PUBLIC_HOST = process.env.PUBLIC_HOST;
 const SERVER_VERSION = '0.3.1';
 
@@ -148,8 +153,8 @@ if (isDirectRun) {
     logger.warn('[boot] PUBLIC_HOST not set — DNS rebinding protection disabled. Set PUBLIC_HOST before exposing this server publicly.');
   }
 
-  const server = app.listen(PORT, () => {
-    logger.info(`mcp-web-search HTTP listening on :${PORT}`);
+  const server = app.listen(PORT, BIND_HOST, () => {
+    logger.info(`mcp-web-search HTTP listening on ${BIND_HOST}:${PORT}`);
   });
 
   const shutdown = async (signal: string): Promise<void> => {
