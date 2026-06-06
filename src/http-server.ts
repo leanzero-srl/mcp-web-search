@@ -26,7 +26,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { WebSearchMCPServer } from './server.js';
 import { attachClientDetect } from './client-detect.js';
-import { requireAuth, tenantRateLimiter, mountAdminRoutes } from './auth.js';
+import { requireAuth, tenantRateLimiter, mountAdminRoutes, mountProvisionRoutes } from './auth.js';
 import { mountOAuthMetadata } from './oauth.js';
 import { requestContext } from './request-context.js';
 import { logger } from './logger.js';
@@ -60,6 +60,7 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
   });
 
   mountAdminRoutes(app);
+  mountProvisionRoutes(app);
   mountOAuthMetadata(app);
 
   const auditOnFinish = (req: Request, res: Response, started: number, toolName: string | undefined): void => {
