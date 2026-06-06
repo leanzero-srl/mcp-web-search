@@ -11,15 +11,21 @@ import { browserPool } from './browser-pool.js';
 import { auditLogger, telemetryCollector } from './observability.js';
 import { safeFetchUrl } from './utils.js';
 
-// Cached pdf-parse dynamic import to avoid repeated module loading
-let cachedPdfParseFn: ((buffer: Uint8Array) => Promise<any>) | null = null;
-async function getPdfParseFn(): Promise<(buffer: Uint8Array) => Promise<any>> {
-  if (!cachedPdfParseFn) {
+// pdf-parse v2 exposes a `PDFParse` CLASS (not a default function as in v1).
+// Usage: `new PDFParse({ data: bytes }).getText()` -> { pages, text, total }.
+// Cache the class to avoid repeated dynamic imports.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let cachedPDFParse: any = null;
+async function getPDFParseClass(): Promise<any> {
+  if (!cachedPDFParse) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const mod: any = await import('pdf-parse');
-    cachedPdfParseFn = mod.default || mod;
+    cachedPDFParse = mod.PDFParse || (mod.default && mod.default.PDFParse);
+    if (typeof cachedPDFParse !== 'function') {
+      throw new Error('pdf-parse: PDFParse class not found in module exports');
+    }
   }
-  return cachedPdfParseFn!;
+  return cachedPDFParse;
 }
 
 // ============================================================================
@@ -150,9 +156,15 @@ export class PdfExtractor {
       const arrayBuffer = await response.arrayBuffer();
       const uint8Array = new Uint8Array(arrayBuffer);
 
-      // Extract text using pdf-parse (cached dynamic import)
-      const pdfParseFn = await getPdfParseFn();
-      const data = await pdfParseFn(uint8Array);
+      // Extract text using pdf-parse v2 (PDFParse class).
+      const PDFParse = await getPDFParseClass();
+      const parser = new PDFParse({ data: uint8Array });
+      let data;
+      try {
+        data = await parser.getText();
+      } finally {
+        try { await parser.destroy?.(); } catch { /* best-effort cleanup */ }
+      }
 
       if (!data.text || data.text.trim().length === 0) {
         return null;
@@ -160,7 +172,7 @@ export class PdfExtractor {
 
       return {
         text: data.text,
-        pageCount: data.numpages,
+        pageCount: data.total,
         fileSize: uint8Array.length,
         extractionMethod: 'http',
       };
