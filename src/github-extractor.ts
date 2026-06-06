@@ -2,6 +2,7 @@ import axios, { AxiosRequestConfig, AxiosResponse } from 'axios';
 import pLimit from 'p-limit';
 import { getAxiosHttpAgentConfig } from './utils.js';
 import { GitHubFile } from './types.js';
+import { requestContext } from './request-context.js';
 
 // Extend AxiosRequestConfig to include the _retry flag for type-safe rate-limit handling
 declare module 'axios' {
@@ -419,9 +420,12 @@ export class GitHubExtractor {
       'X-GitHub-Api-Version': '2022-11-28'
     };
 
-    if (this.githubToken) {
+    // Prefer the per-request token (HTTP callers bring their own); fall back to
+    // the process env (stdio callers set GITHUB_TOKEN in their mcp.json env).
+    const token = requestContext.getStore()?.githubToken || this.githubToken;
+    if (token) {
       // Token masking is now handled by axios interceptor
-      headers['Authorization'] = `token ${this.githubToken}`;
+      headers['Authorization'] = `token ${token}`;
     }
 
     return headers;

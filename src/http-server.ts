@@ -47,7 +47,7 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
 
   app.use(cors({
     origin: '*',
-    allowedHeaders: ['Authorization', 'Content-Type', 'Accept', 'X-Serper-Key', 'Mcp-Session-Id', 'Mcp-Protocol-Version'],
+    allowedHeaders: ['Authorization', 'Content-Type', 'Accept', 'X-Serper-Key', 'X-GitHub-Token', 'Mcp-Session-Id', 'Mcp-Protocol-Version'],
     exposedHeaders: ['WWW-Authenticate', 'Mcp-Session-Id', 'Mcp-Protocol-Version'],
   }));
 
@@ -84,10 +84,12 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
     const toolName = body?.method === 'tools/call' ? body?.params?.name : body?.method;
     auditOnFinish(req, res, started, toolName);
 
-    // Per-request Serper key: `X-Serper-Key` header (header-capable clients) or
-    // `?serper_key=` query (Authorization-only clients like claude.ai web). Never
-    // logged; carried via AsyncLocalStorage to `search-engine.ts`.
+    // Per-request keys, brought by each caller (never the operator's): the Serper
+    // search key and an optional GitHub token for the github tool. Header for
+    // header-capable clients, query param for Authorization-only clients (e.g.
+    // claude.ai web). Never logged; carried via AsyncLocalStorage.
     const serperKey = req.get('x-serper-key') || (typeof req.query.serper_key === 'string' ? req.query.serper_key : undefined) || undefined;
+    const githubToken = req.get('x-github-token') || (typeof req.query.github_token === 'string' ? req.query.github_token : undefined) || undefined;
 
     // Fresh McpServer per request (stateless transport requires it). The 11
     // tool handlers close over `sharedInstance.searchEngine` etc., so the
@@ -125,7 +127,7 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
     });
 
     try {
-      await requestContext.run({ serperKey }, async () => {
+      await requestContext.run({ serperKey, githubToken }, async () => {
         await mcpServer.connect(transport);
         await transport.handleRequest(req, res, req.body);
       });
