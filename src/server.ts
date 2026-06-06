@@ -1134,7 +1134,7 @@ export class WebSearchMCPServer {
     // pulls full file content; the cap lives at the response layer.
     target.tool(
       'get-github-repo-content',
-      'Inspect a GitHub repository in three modes: `crawl` (default — README + recursive code-file crawl with per-file previews), `list` (one directory listing — files and folders by name), or `file` (full content of a single file at `path`). Set `previewLength` to widen the per-file preview cap in crawl mode (default 500, max 5000). Honors GITHUB_TOKEN for authenticated 5000 req/hr quota.',
+      'Inspect a GitHub repository in three modes: `crawl` (default — README + recursive code-file crawl with per-file previews), `list` (one directory listing — files and folders by name), or `file` (full content of a single file at `path`). Set `previewLength` to widen the per-file preview cap in crawl mode (default 500, max 5000). Honors a caller-supplied GitHub token (X-GitHub-Token header or ?github_token query over HTTP; GITHUB_TOKEN env on stdio) for the authenticated 5000 req/hr quota.',
       {
         url: z.string().url().describe('GitHub repo URL, e.g. https://github.com/owner/repo'),
         mode: z.enum(['crawl', 'list', 'file']).optional().default('crawl').describe('What to return. Default: crawl.'),
