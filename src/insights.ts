@@ -20,15 +20,39 @@ function insightsPath(): string {
   return path.join(base, 'logs', 'insights.jsonl');
 }
 
+let dirReady = false;
+
 /** Append one structured insight event (best-effort, never throws). */
 export function logInsight(event: Record<string, unknown>): void {
   try {
     const file = insightsPath();
-    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (!dirReady) { fs.mkdirSync(path.dirname(file), { recursive: true }); dirReady = true; }
     fs.appendFile(file, JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n', () => {});
   } catch (err) {
     logger.warn('[insights] failed to record event', { error: (err as Error).message });
   }
+}
+
+// IT JUST WORKS: teach once per session, don't nag. A nudge for a given
+// situation (keyed) is returned at most once per process (= per stdio session).
+const seenNudges = new Set<string>();
+function once(key: string): boolean {
+  if (seenNudges.has(key)) return false;
+  seenNudges.add(key);
+  return true;
+}
+
+/**
+ * Generic learning nudge for any tool outcome. Records the event always; returns
+ * a one-line nudge only for memory-capable agents, deduped per session by key.
+ */
+export function toolLearning(tool: string, event: string, detail: Record<string, unknown>, suggestion: string): string {
+  const client = getClientInfo()?.name || 'unknown';
+  const canMemo = clientCanPersistMemory();
+  logInsight({ server: 'web-search', tool, event, client, memoryCapable: canMemo, ...detail });
+  if (!canMemo || !suggestion) return '';
+  if (!once(`${tool}:${event}`)) return '';
+  return `\n\n💡 If you keep long-term memory: ${suggestion}`;
 }
 
 /**
@@ -41,12 +65,8 @@ export function logInsight(event: Record<string, unknown>): void {
  * @param count - number of results
  */
 export function searchLearning(tool: string, query: string, success: boolean, count: number): string {
-  const client = getClientInfo()?.name || 'unknown';
-  const canMemo = clientCanPersistMemory();
-  logInsight({ server: 'web-search', tool, event: success ? 'success' : 'no-results', client, memoryCapable: canMemo, query, count });
-  if (!canMemo) return '';
-  if (success) {
-    return `\n\n💡 If you keep long-term memory: note what made this search work (the query phrasing and that \`${tool}\` fit) so you reach the answer faster for similar questions.`;
-  }
-  return `\n\n💡 If you keep long-term memory: record a better strategy for queries like "${query}" — broaden or add context to the terms, try \`site:\`/exact-phrase operators, switch tool (full-web-search ↔ get-web-search-summaries), and save any phrasing that finally works.`;
+  const suggestion = success
+    ? `note what made this search work (the query phrasing and that \`${tool}\` fit) so you reach the answer faster for similar questions.`
+    : `record a better strategy for queries like "${query}" — broaden or add context to the terms, try \`site:\`/exact-phrase operators, switch tool (full-web-search ↔ get-web-search-summaries), and save any phrasing that finally works.`;
+  return toolLearning(tool, success ? 'success' : 'no-results', { query, count }, suggestion);
 }

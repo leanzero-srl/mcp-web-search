@@ -79,7 +79,7 @@ import { GitHubExtractor, parseGitHubUrl } from './github-extractor.js';
 import { openAPIExtractor, buildEndpointIndex } from './openapi-extractor.js';
 import * as yaml from 'js-yaml';
 import { attachClientDetect, isAgenticClient, getClientInfo } from './client-detect.js';
-import { searchLearning } from './insights.js';
+import { searchLearning, toolLearning } from './insights.js';
 
 // ============================================================================
 // Import observability module
@@ -346,7 +346,8 @@ export class WebSearchMCPServer {
             
             responseText += `\n---\n\n`;
           });
-          
+
+          responseText += searchLearning('full-web-search', result.query, result.results.length > 0, result.results.length);
           return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'full-web-search');
@@ -978,6 +979,14 @@ export class WebSearchMCPServer {
             });
           }
 
+          responseText += toolLearning(
+            'research_and_save_to_markdown',
+            successfulResults.length > 0 ? 'success' : 'no-results',
+            { urls: urls.length, saved: successfulResults.length, failed: failedResults.length },
+            successfulResults.length > 0
+              ? 'note which sources/domains produced good saved research for this topic so you revisit them next time.'
+              : 'none of these URLs yielded saved content — record which domains block extraction or need a different route (get-website-sitemap, get-pdf-content, or a broader search first).',
+          );
           return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'research_and_save_to_markdown');
@@ -1349,7 +1358,9 @@ export class WebSearchMCPServer {
 
           if (!result.success) {
             return this.respondText(
-              `Failed to extract OpenAPI specification:\n\nError: ${result.error || 'Unknown error'}`,
+              `Failed to extract OpenAPI specification:\n\nError: ${result.error || 'Unknown error'}` +
+              toolLearning('get-openapi-spec', 'no-results', { error: result.error || 'unknown' },
+                'this page exposed no discoverable OpenAPI/Swagger spec — record that for this domain, or try the API docs page URL or a known spec path (e.g. /openapi.json, /swagger.json, /v3/api-docs).'),
             );
           }
 
@@ -1445,6 +1456,8 @@ export class WebSearchMCPServer {
             }
           }
 
+          responseText += toolLearning('get-openapi-spec', 'success', { endpoints: endpoints.length },
+            'note that this domain has a fetchable OpenAPI spec (save the spec URL) so you can jump straight to it next time.');
           return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'get-openapi-spec');
@@ -1542,7 +1555,7 @@ export class WebSearchMCPServer {
             });
           }
 
-          responseText += searchLearning('full-web-search', obj.query, results.length > 0, results.length);
+          responseText += searchLearning('progressive-web-search', obj.query, results.length > 0, results.length);
           return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'progressive-web-search');
