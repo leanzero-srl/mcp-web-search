@@ -48,6 +48,21 @@ import { WebSearchToolInput, WebSearchToolOutput, SearchResult } from './types.j
 import { ProgressiveSearchEngine } from './progressive-search-engine.js';
 import { isPdfUrl, fetchSitemapUrls, withTimeout, clampReadWindow } from './utils.js';
 
+// Root directory for files this server writes (research-output markdown, and —
+// via the crawl cache — saved OpenAPI specs). Defaults to the launch dir when it
+// looks like a project (cwd has package.json), else the repo root. OUTPUT_DIR
+// (or DOC_OUTPUT_DIR) overrides both, so a stdio client can pin where documents
+// land on the CALLER's machine. NOTE: a remote/hosted server still writes on the
+// HOST — this only relocates within whatever machine the server runs on.
+function getOutputRoot(): string {
+  const override = process.env.OUTPUT_DIR || process.env.DOC_OUTPUT_DIR;
+  if (override && override.trim()) {
+    return path.isAbsolute(override) ? override : path.resolve(process.cwd(), override);
+  }
+  const isCwdProjectRoot = fs.existsSync(path.join(process.cwd(), 'package.json'));
+  return isCwdProjectRoot ? process.cwd() : path.resolve(__dirname, '..', '..');
+}
+
 // Per-tool wall-clock budgets. All sit comfortably below the Forge function
 // timeout (~25 s) so the upstream user request never inherits a hung MCP call.
 // Override individually via env if a deployment needs different ceilings.
@@ -714,8 +729,7 @@ export class WebSearchMCPServer {
           const timestamp = new Date().toISOString();
           
           // Ensure directory exists
-          const isCwdProjectRoot = fs.existsSync(path.join(process.cwd(), 'package.json'));
-          const projectRoot = isCwdProjectRoot ? process.cwd() : path.resolve(__dirname, '..', '..');
+          const projectRoot = getOutputRoot();
           const outputDir = path.join(projectRoot, 'docs', 'research-output');
           
           console.log(`[MCP] Resolved output directory: ${outputDir}`);
@@ -1623,8 +1637,7 @@ export class WebSearchMCPServer {
           const researchFiles: Array<{ fileName: string; localPath: string; mtime: Date; size: number }> = [];
           let researchScanTruncated = false;
           if (category === 'all' || category === 'research') {
-            const isCwdProjectRoot = fs.existsSync(path.join(process.cwd(), 'package.json'));
-            const projectRoot = isCwdProjectRoot ? process.cwd() : path.resolve(__dirname, '..', '..');
+            const projectRoot = getOutputRoot();
             const researchDir = path.join(projectRoot, 'docs', 'research-output');
             if (fs.existsSync(researchDir)) {
               // Bound the scan so a pathologically large directory can't stat
@@ -1733,8 +1746,7 @@ export class WebSearchMCPServer {
           const maxBytes = Math.min(200_000, Math.max(1_000, Math.floor(Number(obj.maxBytes ?? 50_000)) || 50_000));
           const offset = Math.max(0, Math.floor(Number(obj.offset ?? 0)) || 0);
 
-          const isCwdProjectRoot = fs.existsSync(path.join(process.cwd(), 'package.json'));
-          const projectRoot = isCwdProjectRoot ? process.cwd() : path.resolve(__dirname, '..', '..');
+          const projectRoot = getOutputRoot();
 
           // Search both well-known dirs in order: OpenAPI specs, then research output.
           // CRITICAL: resolve the OpenAPI dir from the extractor's cache, NOT from
