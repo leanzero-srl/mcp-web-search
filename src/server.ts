@@ -55,10 +55,27 @@ import { isPdfUrl, fetchSitemapUrls, withTimeout, clampReadWindow } from './util
 // land on the CALLER's machine. NOTE: a remote/hosted server still writes on the
 // HOST — this only relocates within whatever machine the server runs on.
 function getOutputRoot(): string {
+  // 1) Per-request override (hosted X-Output-Dir header), via AsyncLocalStorage.
+  //    SANDBOXED under a server base so a remote tenant can only organize files
+  //    within an allowed area — it can't write to arbitrary server paths, and
+  //    (being server-side) it does NOT reach the caller's machine. For files on
+  //    your own machine, self-host over stdio with OUTPUT_DIR.
+  const ctx = requestContext.getStore();
+  if (ctx?.outputDir && String(ctx.outputDir).trim()) {
+    const base = process.env.CLIENT_OUTPUT_BASE
+      || path.join(process.env.DATA_DIR || process.cwd(), 'client-output');
+    const sub = path.normalize(String(ctx.outputDir))
+      .replace(/^([./\\]|\.\.[/\\]?)+/, '')
+      .replace(/^[/\\]+/, '');
+    const resolved = path.resolve(base, sub);
+    return resolved.startsWith(path.resolve(base)) ? resolved : path.resolve(base);
+  }
+  // 2) Operator/self-host env (trusted), unsandboxed.
   const override = process.env.OUTPUT_DIR || process.env.DOC_OUTPUT_DIR;
   if (override && override.trim()) {
     return path.isAbsolute(override) ? override : path.resolve(process.cwd(), override);
   }
+  // 3) Default: launch dir if it's a project, else repo root.
   const isCwdProjectRoot = fs.existsSync(path.join(process.cwd(), 'package.json'));
   return isCwdProjectRoot ? process.cwd() : path.resolve(__dirname, '..', '..');
 }
@@ -80,6 +97,7 @@ import { openAPIExtractor, buildEndpointIndex } from './openapi-extractor.js';
 import * as yaml from 'js-yaml';
 import { attachClientDetect, isAgenticClient, getClientInfo } from './client-detect.js';
 import { searchLearning, toolLearning } from './insights.js';
+import { requestContext } from './request-context.js';
 
 // ============================================================================
 // Import observability module
