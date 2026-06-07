@@ -22,6 +22,8 @@
 import express, { type Express, type Request, type Response } from 'express';
 import cors from 'cors';
 import compression from 'compression';
+import fs from 'node:fs';
+import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { WebSearchMCPServer } from './server.js';
@@ -29,6 +31,7 @@ import { attachClientDetect } from './client-detect.js';
 import { requireAuth, tenantRateLimiter, mountAdminRoutes, mountProvisionRoutes } from './auth.js';
 import { mountOAuthMetadata } from './oauth.js';
 import { requestContext } from './request-context.js';
+import { verifyDownloadToken } from './download-registry.js';
 import { logger } from './logger.js';
 
 const PORT = Number(process.env.PORT) || 8443;
@@ -57,6 +60,29 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
 
   app.get('/healthz', (_req: Request, res: Response) => {
     res.json({ ok: true, version: SERVER_VERSION, tools: 11 });
+  });
+
+  // Public signed-file download. The HMAC token IS the credential, so this route
+  // is intentionally NOT behind requireAuth — it delivers files created by
+  // research_and_save_to_markdown / get-openapi-spec to callers without a
+  // sibling filesystem MCP. Tokens are ~24h, sandboxed to allowed bases; any
+  // failure returns a uniform 403 (no information leak). Mirrors doc-processor's
+  // GET /files/download.
+  app.get('/files/download', (req: Request, res: Response) => {
+    const token = typeof req.query.token === 'string' ? req.query.token : '';
+    const v = verifyDownloadToken(token);
+    if (!v) {
+      res.status(403).json({ error: 'invalid or expired token' });
+      return;
+    }
+    res.setHeader('Content-Disposition', `attachment; filename="${path.basename(v.path).replace(/"/g, '')}"`);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Cache-Control', 'private, no-store');
+    fs.createReadStream(v.path)
+      .on('error', () => {
+        if (!res.headersSent) res.status(500).json({ error: 'read failed' });
+      })
+      .pipe(res);
   });
 
   mountAdminRoutes(app);
