@@ -97,6 +97,7 @@ import { openAPIExtractor, buildEndpointIndex } from './openapi-extractor.js';
 import * as yaml from 'js-yaml';
 import { attachClientDetect, isAgenticClient, getClientInfo } from './client-detect.js';
 import { searchLearning, toolLearning } from './insights.js';
+import { buildDownloadUrl, mimeFor } from './download-registry.js';
 import { requestContext } from './request-context.js';
 
 // ============================================================================
@@ -224,6 +225,48 @@ export class WebSearchMCPServer {
     return {
       content: [{ type: 'text' as const, text: responseLimiter.truncate(text) }],
     };
+  }
+
+  /**
+   * Like respondText, but also emits an idiomatic MCP `resource_link` content
+   * block per saved file when the server is HOSTED (a public base is set). The
+   * signed download link is the universal delivery mechanism — agentic clients
+   * GET it, chat UIs render it as a saveable artifact. Unlike doc-processor
+   * (which suppresses the link for interactive callers that also receive the
+   * file via an upload bridge), web-search has no such bridge, so we emit the
+   * link whenever buildDownloadUrl() returns non-null. On stdio it returns null
+   * → text only (the file is already on the caller's machine).
+   */
+  private respondTextWithLinks(
+    text: string,
+    links: Array<{ filePath: string }>,
+  ): {
+    content: Array<
+      | { type: 'text'; text: string }
+      | { type: 'resource_link'; uri: string; name: string; mimeType: string; description: string }
+    >;
+  } {
+    const blocks: Array<{ type: 'resource_link'; uri: string; name: string; mimeType: string; description: string }> = [];
+    const crumbs: string[] = [];
+    for (const { filePath } of links) {
+      if (!filePath) continue;
+      const uri = buildDownloadUrl(filePath);
+      if (!uri) continue;
+      crumbs.push(`**Download:** ${uri}`);
+      blocks.push({
+        type: 'resource_link' as const,
+        uri,
+        name: path.basename(filePath),
+        mimeType: mimeFor(filePath),
+        description: 'Download the saved file (hosted link, valid ~24h).',
+      });
+    }
+    // Truncate the body FIRST (OutputLimiter is the global safety net), THEN
+    // append the short download breadcrumb so a large response can't chop the URL
+    // off the end. Clients that don't render resource_link still see it in text.
+    let outText = responseLimiter.truncate(text);
+    if (crumbs.length) outText += `\n\n${crumbs.join('\n')}`;
+    return { content: [{ type: 'text' as const, text: outText }, ...blocks] };
   }
 
   constructor(opts: WebSearchMCPServerOptions = {}) {
@@ -1017,7 +1060,7 @@ export class WebSearchMCPServer {
               ? 'note which sources/domains produced good saved research for this topic so you revisit them next time.'
               : 'none of these URLs yielded saved content — record which domains block extraction or need a different route (get-website-sitemap, get-pdf-content, or a broader search first).',
           );
-          return this.respondText(responseText);
+          return this.respondTextWithLinks(responseText, successfulResults.map(r => ({ filePath: r.filePath })));
         } catch (error) {
           this.handleError(error, 'research_and_save_to_markdown');
         }
@@ -1497,7 +1540,7 @@ export class WebSearchMCPServer {
 
           responseText += toolLearning('get-openapi-spec', 'success', { endpoints: endpoints.length },
             'note that this domain has a fetchable OpenAPI spec (save the spec URL) so you can jump straight to it next time.');
-          return this.respondText(responseText);
+          return this.respondTextWithLinks(responseText, result.downloadedFile ? [{ filePath: result.downloadedFile.localPath }] : []);
         } catch (error) {
           this.handleError(error, 'get-openapi-spec');
         }
