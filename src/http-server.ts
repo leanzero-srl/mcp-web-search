@@ -26,7 +26,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { WebSearchMCPServer } from './server.js';
+import { WebSearchMCPServer, WEB_SEARCH_INSTRUCTIONS } from './server.js';
 import { attachClientDetect } from './client-detect.js';
 import { requireAuth, tenantRateLimiter, mountAdminRoutes, mountProvisionRoutes } from './auth.js';
 import { mountOAuthMetadata } from './oauth.js';
@@ -126,7 +126,7 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
     const mcpServer = new McpServer({
       name: 'web-search-mcp',
       version: SERVER_VERSION,
-    });
+    }, { instructions: WEB_SEARCH_INSTRUCTIONS });
     attachClientDetect(mcpServer);
     sharedInstance.registerToolsOn(mcpServer);
 
