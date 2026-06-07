@@ -128,6 +128,21 @@ export interface WebSearchMCPServerOptions {
   skipShutdownHooks?: boolean;
 }
 
+/**
+ * Server-level guidance returned in the MCP initialize response so any model knows
+ * which of the 11 tools to pick (web-search previously shipped no instructions).
+ */
+export const WEB_SEARCH_INSTRUCTIONS = `web-search MCP — choose the RIGHT tool:
+• Quick facts / just titles & snippets → get-web-search-summaries (fastest).
+• General research needing real page content → full-web-search (default).
+• First wording might miss the best sources → progressive-web-search (auto-expands; slower).
+• One known URL's content → get-single-web-page-content.   A PDF's text → get-pdf-content.
+• Explore a known site's pages → get-website-sitemap, then full-web-search to extract.
+• Save cited research to a markdown file (give it URLs) → research_and_save_to_markdown.
+• A GitHub repo's code/README → get-github-repo-content.   An API's endpoints → get-openapi-spec.
+• Re-read something already fetched → list-cached-documents, then read-cached-document.
+Web searches can take 30–90s — use a generous client timeout. On the hosted server, searches need a Serper key (X-Serper-Key header).`;
+
 export class WebSearchMCPServer {
   private server: McpServer;
   private searchEngine: SearchEngine;
@@ -273,7 +288,7 @@ export class WebSearchMCPServer {
     this.server = new McpServer({
       name: 'web-search-mcp',
       version: '0.3.1',
-    });
+    }, { instructions: WEB_SEARCH_INSTRUCTIONS });
 
     // Detect the client (agentic vs LM-Studio-style) at the initialize
     // handshake. Tool handlers branch on the result to decide whether to
@@ -320,7 +335,7 @@ export class WebSearchMCPServer {
     // Register the main web search tool (primary choice for comprehensive searches)
     target.tool(
       'full-web-search',
-      'Search the web and fetch complete page content from top results. This is the most comprehensive general web search tool. It searches the web and then follows resulting links to extract full page content. Use get-web-search-summaries for a lightweight alternative. For domain-specific research on known companies, consider starting with get-website-sitemap to discover available pages before filtering and extracting.',
+      'Search the web AND fetch full page content from the top results — the DEFAULT for general research when you will actually read the results. WHEN TO USE vs siblings: use get-web-search-summaries instead if you only need titles/snippets (faster, cheaper); use progressive-web-search if your first query wording might not match the best sources (it auto-expands with synonyms). For a known website, run get-website-sitemap first to discover pages. Returns up to `limit` results with extracted page text. (A search can take 30–90s.)',
       {
         query: z.string().describe('Search query to execute (recommended for comprehensive research)'),
         limit: z.number().optional().default(5).describe('Number of results to return with full content (1-10)'),
@@ -419,7 +434,7 @@ export class WebSearchMCPServer {
     // Register the lightweight web search summaries tool (secondary choice for quick results)
     target.tool(
       'get-web-search-summaries',
-      'Search the web and return only the search result snippets/descriptions without following links to extract full page content. This is a lightweight alternative to full-web-search for when you only need brief search results. For comprehensive information, use full-web-search instead.',
+      'Search the web and return ONLY the result snippets/titles/URLs — no page content is fetched. WHEN TO USE: the fast, lightweight choice when snippets are enough (quick facts, or finding URLs to fetch next). Use full-web-search instead when you need the actual page content; use progressive-web-search when the query wording might not match the best sources.',
       {
         query: z.string().describe('Search query to execute (lightweight alternative)'),
         limit: z.number().optional().default(5).describe('Number of search results to return (1-10)'),
@@ -1550,7 +1565,7 @@ export class WebSearchMCPServer {
     // Register the progressive web search tool (advanced strategy with automatic query expansion)
     target.tool(
       'progressive-web-search',
-      'Advanced web search with automatic query expansion and multi-stage searching. This tool first tries the exact user query, then progressively expands using synonyms, related terms, and alternative phrasings if good results aren\'t found. Use this for complex research where the exact wording might not match the best sources.',
+      'Web search that AUTO-EXPANDS the query: it tries the exact query first, then progressively widens with synonyms, related terms, and alternative phrasings when results are weak. WHEN TO USE: research where the right wording is uncertain or a plain search underperforms. Slower (multi-stage) than full-web-search — prefer full-web-search for a well-specified query, or get-web-search-summaries when you only need snippets.',
       {
         query: z.string().describe('Search query to execute (uses progressive expansion strategy)'),
         maxDepth: z.number().optional().default(3).describe('Maximum number of expansion stages (1-5, default: 3)'),
