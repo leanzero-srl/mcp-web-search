@@ -79,6 +79,7 @@ import { GitHubExtractor, parseGitHubUrl } from './github-extractor.js';
 import { openAPIExtractor, buildEndpointIndex } from './openapi-extractor.js';
 import * as yaml from 'js-yaml';
 import { attachClientDetect, isAgenticClient, getClientInfo } from './client-detect.js';
+import { searchLearning } from './insights.js';
 
 // ============================================================================
 // Import observability module
@@ -413,7 +414,8 @@ export class WebSearchMCPServer {
           // Explicit empty-result message rather than a bare "0 results" + `[]`.
           if (summaryResults.length === 0) {
             return this.respondText(
-              `No results found for "${obj.query}". Try different or broader keywords, or use full-web-search for a deeper crawl.`,
+              `No results found for "${obj.query}". Try different or broader keywords, or use full-web-search for a deeper crawl.` +
+              searchLearning('get-web-search-summaries', obj.query, false, 0),
             );
           }
 
@@ -428,6 +430,7 @@ export class WebSearchMCPServer {
             responseText += `\n---\n\n`;
           });
 
+          responseText += searchLearning('get-web-search-summaries', obj.query, true, summaryResults.length);
           return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'get-web-search-summaries');
@@ -1539,6 +1542,7 @@ export class WebSearchMCPServer {
             });
           }
 
+          responseText += searchLearning('full-web-search', obj.query, results.length > 0, results.length);
           return this.respondText(responseText);
         } catch (error) {
           this.handleError(error, 'progressive-web-search');
