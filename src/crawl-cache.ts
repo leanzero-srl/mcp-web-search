@@ -43,13 +43,19 @@ export interface CacheIndex {
   totalEntries: number;
 }
 
-// Default cache directory. Module-relative by default, but overridable via
-// CRAWL_CACHE_DIR so a deployment (or a test) can pin it to a known location —
-// the module-relative path differs between the dist build and source, which
-// otherwise makes "where did my spec get saved?" environment-dependent.
+// Default cache directory. Module-relative by default, but overridable so a
+// deployment (or a test) can pin it to a known location — the module-relative
+// path differs between the dist build and source, which otherwise makes "where
+// did my spec get saved?" environment-dependent.
+// Priority: CRAWL_CACHE_DIR (most specific) → OUTPUT_DIR/DOC_OUTPUT_DIR (shared
+// "put my files here" override, kept in sync with the research-output root) →
+// module-relative repo path.
+const OUTPUT_DIR_OVERRIDE = process.env.OUTPUT_DIR || process.env.DOC_OUTPUT_DIR;
 const DEFAULT_CACHE_DIR = process.env.CRAWL_CACHE_DIR
   ? path.resolve(process.env.CRAWL_CACHE_DIR)
-  : path.join(moduleDir, '../../docs/technical');
+  : OUTPUT_DIR_OVERRIDE && OUTPUT_DIR_OVERRIDE.trim()
+    ? path.join(path.resolve(OUTPUT_DIR_OVERRIDE), 'docs', 'technical')
+    : path.join(moduleDir, '../../docs/technical');
 const CACHE_FILE = 'crawl-cache.json';
 const DEFAULT_TTL_MS = 86400000; // 24 hours
 
