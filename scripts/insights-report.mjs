@@ -34,7 +34,7 @@ const rows = fs.readFileSync(file, "utf8")
 if (!rows.length) { console.log(`Insights log is empty: ${file}`); process.exit(0); }
 
 const pct = (n, d) => (d ? `${Math.round((n / d) * 100)}%` : "—");
-const isFail = (e) => e === "no-results" || e === "failure" || e === "PLAIN_TEXT";
+const isFail = (e) => e === "no-results" || e === "failure" || e === "PLAIN_TEXT" || e === "error" || e === "duplicate";
 
 console.log(`\n📊 MCP Insights — ${rows.length} events`);
 console.log(`   file: ${file}`);

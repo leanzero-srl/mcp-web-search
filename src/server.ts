@@ -524,8 +524,20 @@ export class WebSearchMCPServer {
              responseText = header + fitsLabel + content;
            }
 
+            responseText += toolLearning(
+              'get-single-web-page-content',
+              wordCount > 0 ? 'success' : 'no-results',
+              {
+                url: obj.url,
+                wordCount,
+                chars: content.length,
+                truncated: !!(maxContentLength && maxContentLength > 0 && header.length + fitsLabel.length + content.length > maxContentLength),
+              },
+              '',
+            );
             return this.respondText(responseText);
           } catch (error) {
+            toolLearning('get-single-web-page-content', 'error', { url: (args as Record<string, unknown>)?.url ?? 'n/a', error: error instanceof Error ? error.message : String(error) }, '');
             this.handleError(error, 'get-single-web-page-content');
           }
         }
@@ -1084,6 +1096,7 @@ export class WebSearchMCPServer {
           const allUrls = await fetchSitemapUrls(obj.url);
 
           if (allUrls.length === 0) {
+            toolLearning('get-website-sitemap', 'no-results', { url: obj.url, reason: 'empty-or-missing-sitemap' }, '');
             return this.respondText(
               `No URLs found in the sitemap for ${obj.url}. The sitemap might not exist or could be empty.`,
             );
@@ -1157,8 +1170,11 @@ export class WebSearchMCPServer {
             }
           }
 
+          const sitemapEvent = (filtering && totalForPagination === 0) ? 'no-results' : 'success';
+          responseText += toolLearning('get-website-sitemap', sitemapEvent, { url: obj.url, totalUrls: allUrls.length, matched: totalForPagination, filtering, extractTopMatching }, '');
           return this.respondText(responseText);
         } catch (error) {
+          toolLearning('get-website-sitemap', 'error', { url: (args as Record<string, unknown>)?.url ?? 'n/a', error: error instanceof Error ? error.message : String(error) }, '');
           this.handleError(error, 'get-website-sitemap');
         }
       }
@@ -1233,6 +1249,7 @@ export class WebSearchMCPServer {
             );
 
             if (contents.length === 0) {
+              toolLearning('get-github-repo-content', 'no-results', { url: obj.url, mode: 'list', path: targetPath }, '');
               return this.respondText(`No contents found at path: ${targetPath || '/'}`);
             }
 
@@ -1243,6 +1260,7 @@ export class WebSearchMCPServer {
             if (dirs.length) body += `**Directories:**\n` + dirs.map((d) => `📁 ${d.name}/`).join('\n') + '\n\n';
             if (files.length) body += `**Files:**\n` + files.map((f) => `📄 ${f.name}`).join('\n') + '\n';
 
+            body += toolLearning('get-github-repo-content', 'success', { url: obj.url, mode: 'list', path: targetPath, dirs: dirs.length, files: files.length }, '');
             return this.respondText(body);
           }
 
@@ -1265,6 +1283,7 @@ export class WebSearchMCPServer {
 
             let body = `**File:** ${repoInfo.owner}/${repoInfo.repo}/${targetPath}${branch ? `@${branch}` : ''}\n**Bytes:** ${fileContent.length}\n\n`;
             body += `\`\`\`${fence}\n${fileContent}\n\`\`\`\n`;
+            body += toolLearning('get-github-repo-content', 'success', { url: obj.url, mode: 'file', path: targetPath, bytes: fileContent.length }, '');
             return this.respondText(body);
           }
 
@@ -1309,8 +1328,10 @@ export class WebSearchMCPServer {
             responseText += `**Files:** *(none found or all skipped)*\n`;
           }
 
+          responseText += toolLearning('get-github-repo-content', result.files.length > 0 ? 'success' : 'no-results', { url: obj.url, mode: 'crawl', files: result.files.length, hasReadme: !!result.readme }, '');
           return this.respondText(responseText);
         } catch (error) {
+          toolLearning('get-github-repo-content', 'error', { url: (args as Record<string, unknown>)?.url ?? 'n/a', mode: (args as Record<string, unknown>)?.mode ?? 'crawl', error: error instanceof Error ? error.message : String(error) }, '');
           this.handleError(error, 'get-github-repo-content');
         }
       }
@@ -1633,8 +1654,10 @@ export class WebSearchMCPServer {
           }
           responseText += `\n**Content Preview:**\n${textContent}`;
 
+          responseText += toolLearning('get-pdf-content', result.text.length > 0 ? 'success' : 'no-results', { url: obj.url, method: result.extractionMethod, chars: result.text.length, pages: result.pageCount ?? null }, '');
           return this.respondText(responseText);
         } catch (error) {
+          toolLearning('get-pdf-content', 'error', { url: (args as Record<string, unknown>)?.url ?? 'n/a', error: error instanceof Error ? error.message : String(error) }, '');
           this.handleError(error, 'get-pdf-content');
         }
       }
@@ -1742,8 +1765,10 @@ export class WebSearchMCPServer {
           }
           responseText += `\n`;
 
+          responseText += toolLearning('list-cached-documents', (openapiSpecs.length + researchFiles.length) > 0 ? 'success' : 'no-results', { category, openapi: openapiSpecs.length, research: researchFiles.length }, '');
           return this.respondText(responseText);
         } catch (error) {
+          toolLearning('list-cached-documents', 'error', { category: (args as Record<string, unknown>)?.category ?? 'all', error: error instanceof Error ? error.message : String(error) }, '');
           this.handleError(error, 'list-cached-documents');
         }
       }
@@ -1808,8 +1833,9 @@ export class WebSearchMCPServer {
           }
 
           if (!found) {
+            const notFoundNudge = toolLearning('read-cached-document', 'no-results', { fileName, reason: 'not-found' }, 'list-cached-documents first to get exact file names — names are case- and extension-sensitive.');
             return this.respondText(
-              `Document not found: ${fileName}. Use list-cached-documents to see available names.`,
+              `Document not found: ${fileName}. Use list-cached-documents to see available names.` + notFoundNudge,
             );
           }
 
@@ -1845,8 +1871,10 @@ export class WebSearchMCPServer {
             responseText += `\n[End of document reached.]\n`;
           }
 
+          responseText += toolLearning('read-cached-document', 'success', { fileName, kind: found.kind, totalLen, returned: end - start, hasMore }, '');
           return this.respondText(responseText);
         } catch (error) {
+          toolLearning('read-cached-document', 'error', { fileName: (args as Record<string, unknown>)?.fileName ?? 'n/a', error: error instanceof Error ? error.message : String(error) }, '');
           this.handleError(error, 'read-cached-document');
         }
       }
