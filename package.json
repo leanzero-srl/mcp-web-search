@@ -18,6 +18,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "node ./dist/index.js",
     "start:http": "node ./dist/http-server.js",
+    "insights": "node scripts/insights-report.mjs",
     "lint": "eslint \"src/**/*.ts\"",
     "format": "prettier --write .",
     "test": "vitest run",
