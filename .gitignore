@@ -111,3 +111,6 @@ jspm_packages/
 *.pem
 *.p12
 *.pfx
+docs/research-output/
+docs/technical/openapi/
+logs/
