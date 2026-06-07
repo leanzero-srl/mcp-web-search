@@ -47,7 +47,7 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
 
   app.use(cors({
     origin: '*',
-    allowedHeaders: ['Authorization', 'Content-Type', 'Accept', 'X-Serper-Key', 'X-GitHub-Token', 'Mcp-Session-Id', 'Mcp-Protocol-Version'],
+    allowedHeaders: ['Authorization', 'Content-Type', 'Accept', 'X-Serper-Key', 'X-GitHub-Token', 'X-Output-Dir', 'Mcp-Session-Id', 'Mcp-Protocol-Version'],
     exposedHeaders: ['WWW-Authenticate', 'Mcp-Session-Id', 'Mcp-Protocol-Version'],
   }));
 
@@ -90,6 +90,9 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
     // claude.ai web). Never logged; carried via AsyncLocalStorage.
     const serperKey = req.get('x-serper-key') || (typeof req.query.serper_key === 'string' ? req.query.serper_key : undefined) || undefined;
     const githubToken = req.get('x-github-token') || (typeof req.query.github_token === 'string' ? req.query.github_token : undefined) || undefined;
+    // Per-request output sub-dir (X-Output-Dir / ?output_dir). Sandboxed server-side
+    // in getOutputRoot(); does NOT reach the caller's machine (self-host for that).
+    const outputDir = req.get('x-output-dir') || (typeof req.query.output_dir === 'string' ? req.query.output_dir : undefined) || undefined;
 
     // Fresh McpServer per request (stateless transport requires it). The 11
     // tool handlers close over `sharedInstance.searchEngine` etc., so the
@@ -127,7 +130,7 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
     });
 
     try {
-      await requestContext.run({ serperKey, githubToken }, async () => {
+      await requestContext.run({ serperKey, githubToken, outputDir }, async () => {
         await mcpServer.connect(transport);
         await transport.handleRequest(req, res, req.body);
       });

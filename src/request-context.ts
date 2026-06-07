@@ -20,6 +20,9 @@ export interface RequestCtx {
   serperKey?: string;
   /** Per-request GitHub token supplied by the caller (header or query param). */
   githubToken?: string;
+  /** Per-request output sub-dir (X-Output-Dir header / ?output_dir), sandboxed
+   *  under the server output base by getOutputRoot() in server.ts. */
+  outputDir?: string;
 }
 
 export const requestContext = new AsyncLocalStorage<RequestCtx>();
