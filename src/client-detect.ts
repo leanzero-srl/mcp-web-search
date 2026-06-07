@@ -101,6 +101,34 @@ export function isAgenticClient(): boolean {
 }
 
 /**
+ * Coding/agentic frontends that maintain long-term MEMORY and run a tool loop —
+ * i.e. clients that can actually act on a "save a memory" nudge. Distinct from
+ * AGENTIC_NAMES (which is about a sibling filesystem). Substring match.
+ */
+const MEMORY_CAPABLE_NAMES = [
+  'claude-code', 'claude code', 'cursor', 'cline', 'roo', 'windsurf', 'aider',
+  'continue', 'opencode', 'open-code', 'qwen', 'hermes', 'codex', 'zed', 'cody',
+  'goose', 'kilo', 'amp', 'crush',
+];
+
+/**
+ * Whether the connecting client can persist long-term memories (so it's worth
+ * nudging it to save "how to search/use this tool better" notes). Chat UIs like
+ * LM Studio return false. `MCP_CLIENT_MEMORY` env forces it on/off.
+ *
+ * On the stateless HTTP server clientInfo is unknown at tool time, so this is
+ * false unless the operator sets the env — which is exactly right (LM Studio
+ * over the Funnel should get no nudge).
+ */
+export function clientCanPersistMemory(): boolean {
+  const v = (process.env.MCP_CLIENT_MEMORY || '').toLowerCase();
+  if (/^(1|true|yes|on)$/.test(v)) return true;
+  if (/^(0|false|no|off)$/.test(v)) return false;
+  const name = (cached?.name || '').toLowerCase();
+  return MEMORY_CAPABLE_NAMES.some((n) => name.includes(n));
+}
+
+/**
  * Test-only: force a specific client info value. Used by smoke tests that
  * drive an `initialize` request through the in-process server.
  * @internal
