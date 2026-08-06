@@ -463,4 +463,4 @@ If you see **"Request timed out" (-32001)** errors:
 
 ## ⚖️ License
 
-This project is part of the [LeanZero](https://leanzero.atlascrafted.com) ecosystem by AtlasCraft. See LICENSE file for details.
+This project is part of the [LeanZero](https://leanzero.net) ecosystem by AtlasCraft. See LICENSE file for details.
