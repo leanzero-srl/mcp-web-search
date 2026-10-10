@@ -18,6 +18,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { getTenantWorkspace } from './request-context.js';
 
 /** Directory that holds one sub-directory per hosted key. */
@@ -25,18 +26,113 @@ export function getWorkspacesBase(): string {
   return path.join(process.env.DATA_DIR || process.cwd(), 'workspaces');
 }
 
+const SAFE_ID = /^[A-Za-z0-9_:-]{1,128}$/;
+
 /**
- * Create (if needed) and return the real path of a tenant's workspace. The
- * tenant id is a server-minted UUID; validate defensively anyway so it can
- * never contain a path separator.
+ * The folder name for a tenant's workspace. Server-minted UUIDs are used as-is.
+ * Any other id (an OAuth `sub` such as "oauth:auth0|123") is mapped to a stable
+ * hash, so it can never contain a path separator — and, unlike before, such a
+ * key still GETS a workspace instead of running unconfined.
  */
+export function workspaceDirName(tenantId: string): string {
+  const id = String(tenantId || '');
+  if (!id) throw new Error('invalid tenant id for workspace');
+  if (SAFE_ID.test(id)) return id;
+  return `h-${crypto.createHash('sha256').update(id).digest('hex').slice(0, 40)}`;
+}
+
+/** Create (if needed) and return the real path of a tenant's workspace. */
 export function workspaceForTenant(tenantId: string): string {
-  if (!/^[A-Za-z0-9_:-]{1,128}$/.test(String(tenantId || ''))) {
-    throw new Error('invalid tenant id for workspace');
-  }
-  const dir = path.join(getWorkspacesBase(), tenantId);
+  const dir = path.join(getWorkspacesBase(), workspaceDirName(tenantId));
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return fs.realpathSync(dir);
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Where revoked keys' workspaces wait out their retention before deletion. */
+export function getRevokedWorkspacesBase(): string {
+  return path.join(process.env.DATA_DIR || process.cwd(), 'revoked-workspaces');
+}
+
+/** Retention for a revoked key's files (REVOKED_WORKSPACE_RETENTION_DAYS, default 7; 0 = delete at once). */
+export function revokedRetentionMs(): number {
+  const days = Number(process.env.REVOKED_WORKSPACE_RETENTION_DAYS);
+  return (Number.isFinite(days) && days >= 0 ? days : 7) * DAY_MS;
+}
+
+/**
+ * Delete archived workspaces whose retention has run out. The revocation time
+ * is in the folder name (<dir>--<epochMs>) because a rename does not touch the
+ * folder's mtime. Never throws; returns the names it removed.
+ */
+export function purgeExpiredRevokedWorkspaces(now: number = Date.now()): string[] {
+  const base = getRevokedWorkspacesBase();
+  const removed: string[] = [];
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(base);
+  } catch {
+    return removed;
+  }
+  for (const name of entries) {
+    const m = /--(\d{13})$/.exec(name);
+    if (!m || now - Number(m[1]) < revokedRetentionMs()) continue;
+    try {
+      fs.rmSync(path.join(base, name), { recursive: true, force: true });
+      removed.push(name);
+    } catch { /* retried on the next sweep */ }
+  }
+  return removed;
+}
+
+/**
+ * Take a revoked key's workspace out of service: move it to
+ * <DATA_DIR>/revoked-workspaces/<dir>--<epochMs> (kept for the retention period,
+ * then deleted by purgeExpiredRevokedWorkspaces). Returns the archive path, or
+ * null when the key never had a workspace.
+ */
+export function archiveTenantWorkspace(tenantId: string, now: number = Date.now()): string | null {
+  const name = workspaceDirName(tenantId);
+  const src = path.join(getWorkspacesBase(), name);
+  let archived: string | null = null;
+  if (fs.existsSync(src)) {
+    const base = getRevokedWorkspacesBase();
+    fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+    archived = path.join(base, `${name}--${now}`);
+    fs.renameSync(src, archived);
+  }
+  purgeExpiredRevokedWorkspaces(now);
+  return archived;
+}
+
+/** Per-key disk cap in bytes (WORKSPACE_QUOTA_MB, default 100). */
+export function workspaceQuotaBytes(): number {
+  const mb = Number(process.env.WORKSPACE_QUOTA_MB);
+  return Math.floor((Number.isFinite(mb) && mb > 0 ? mb : 100) * 1024 * 1024);
+}
+
+/** Total bytes of the regular files under `dir` (symlinks are not followed). */
+export function directorySizeBytes(dir: string): number {
+  let total = 0;
+  const stack = [dir];
+  while (stack.length) {
+    const cur = stack.pop() as string;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(cur, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const p = path.join(cur, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.isFile()) {
+        try { total += fs.lstatSync(p).size; } catch { /* vanished */ }
+      }
+    }
+  }
+  return total;
 }
 
 /**
