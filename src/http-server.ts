@@ -28,9 +28,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { WebSearchMCPServer, WEB_SEARCH_INSTRUCTIONS } from './server.js';
 import { attachClientDetect } from './client-detect.js';
-import { requireAuth, tenantRateLimiter, mountAdminRoutes, mountProvisionRoutes } from './auth.js';
+import { requireAuth, tenantRateLimiter, mountAdminRoutes, mountProvisionRoutes, touchTenantLastUsed } from './auth.js';
 import { mountOAuthMetadata } from './oauth.js';
 import { requestContext } from './request-context.js';
+import { workspaceForTenant } from './doc-root.js';
 import { verifyDownloadToken } from './download-registry.js';
 import { logger } from './logger.js';
 
@@ -120,6 +121,23 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
     // in getOutputRoot(); does NOT reach the caller's machine (self-host for that).
     const outputDir = req.get('x-output-dir') || (typeof req.query.output_dir === 'string' ? req.query.output_dir : undefined) || undefined;
 
+    // Per-key workspace: every file this request writes/reads/lists (research
+    // markdown, OpenAPI/crawl cache) is rooted here, so one demo key never sees
+    // or overwrites another's. Keyed by the authenticated tenant id. Omitted
+    // only if something upstream failed to set req.tenant (requireAuth would
+    // already have 401'd), in which case we fall back to no workspace.
+    const tenantId = req.tenant?.id;
+    let workspace: string | undefined;
+    if (tenantId) {
+      try {
+        workspace = workspaceForTenant(tenantId);
+      } catch (err) {
+        logger.error('[mcp] workspace setup failed', { tenant: tenantId, error: (err as Error).message });
+      }
+    }
+    // Best-effort lastUsedAt (≤1/min), for the operator's audit of key activity.
+    if (tenantId) void touchTenantLastUsed(tenantId);
+
     // Fresh McpServer per request (stateless transport requires it). The 11
     // tool handlers close over `sharedInstance.searchEngine` etc., so the
     // heavy state remains process-shared.
@@ -156,7 +174,7 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
     });
 
     try {
-      await requestContext.run({ serperKey, githubToken, outputDir }, async () => {
+      await requestContext.run({ serperKey, githubToken, outputDir, tenantId, workspace }, async () => {
         await mcpServer.connect(transport);
         await transport.handleRequest(req, res, req.body);
       });

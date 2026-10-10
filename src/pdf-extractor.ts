@@ -7,9 +7,10 @@
  * - Fallback mechanisms for unreliable sources
  */
 
+import axios from 'axios';
 import { browserPool } from './browser-pool.js';
 import { auditLogger, telemetryCollector } from './observability.js';
-import { safeFetchUrl } from './utils.js';
+import { safeFetchUrl, getAxiosHttpAgentConfig, SSRF_BLOCK_MARKER } from './utils.js';
 
 // pdf-parse v2 exposes a `PDFParse` CLASS (not a default function as in v1).
 // Usage: `new PDFParse({ data: bytes }).getText()` -> { pages, text, total }.
@@ -140,21 +141,22 @@ export class PdfExtractor {
     const timeout = config.timeout || this.defaultTimeout;
 
     try {
-      // Use fetch to get the PDF as an ArrayBuffer
-      const response = await fetch(url, {
-        method: 'GET',
+      // Download via the SSRF-guarded axios agents (NOT global fetch/undici,
+      // which ignores our agents and follows redirects — a redirect from a
+      // public URL to http://127.0.0.1:PORT would otherwise be fetched).
+      const response = await axios.get<ArrayBuffer>(url, {
+        responseType: 'arraybuffer',
+        timeout,
+        maxContentLength: 50 * 1024 * 1024,
+        maxBodyLength: 50 * 1024 * 1024,
+        validateStatus: (status: number) => status < 400,
         headers: {
           'User-Agent': 'Mozilla/5.0 (compatible; WebSearchMCP/1.0)',
         },
-        signal: AbortSignal.timeout(timeout),
+        ...getAxiosHttpAgentConfig(),
       });
 
-      if (!response.ok) {
-        return null;
-      }
-
-      const arrayBuffer = await response.arrayBuffer();
-      const uint8Array = new Uint8Array(arrayBuffer);
+      const uint8Array = new Uint8Array(response.data);
 
       // Extract text using pdf-parse v2 (PDFParse class).
       const PDFParse = await getPDFParseClass();
@@ -177,6 +179,13 @@ export class PdfExtractor {
         extractionMethod: 'http',
       };
     } catch (error) {
+      // An SSRF refusal (initial URL or a redirect hop to a private address)
+      // must NOT degrade into a browser fetch of the same URL — the headless
+      // browser follows server redirects we cannot intercept. Re-throw so the
+      // caller aborts instead of falling back.
+      if (error instanceof Error && error.message.includes(SSRF_BLOCK_MARKER)) {
+        throw error;
+      }
       console.error(`[PdfExtractor] HTTP extraction failed for ${url}:`, error);
       return null;
     }

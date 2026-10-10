@@ -23,6 +23,25 @@ export interface RequestCtx {
   /** Per-request output sub-dir (X-Output-Dir header / ?output_dir), sandboxed
    *  under the server output base by getOutputRoot() in server.ts. */
   outputDir?: string;
+  /** Hosted caller's tenant id (null on stdio / unauthenticated). */
+  tenantId?: string;
+  /** Absolute path of the hosted caller's private workspace, or undefined on
+   *  stdio. When set, every file this server writes/reads/lists on the caller's
+   *  behalf (research markdown, OpenAPI/crawl cache) is rooted here, so one
+   *  demo key never sees or overwrites another's files. */
+  workspace?: string;
 }
 
 export const requestContext = new AsyncLocalStorage<RequestCtx>();
+
+/** The calling key's workspace, or null for stdio / trusted local callers. */
+export function getTenantWorkspace(): string | null {
+  const ctx = requestContext.getStore();
+  return ctx && ctx.workspace ? ctx.workspace : null;
+}
+
+/** The calling key's tenant id, or null outside a hosted request. */
+export function getTenantId(): string | null {
+  const ctx = requestContext.getStore();
+  return ctx && ctx.tenantId ? ctx.tenantId : null;
+}

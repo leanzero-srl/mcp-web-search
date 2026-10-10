@@ -55,29 +55,27 @@ import { isPdfUrl, fetchSitemapUrls, withTimeout, clampReadWindow } from './util
 // land on the CALLER's machine. NOTE: a remote/hosted server still writes on the
 // HOST — this only relocates within whatever machine the server runs on.
 function getOutputRoot(): string {
-  // 1) Per-request override (hosted X-Output-Dir header), via AsyncLocalStorage.
-  //    SANDBOXED under a server base so a remote tenant can only organize files
-  //    within an allowed area — it can't write to arbitrary server paths, and
-  //    (being server-side) it does NOT reach the caller's machine. For files on
-  //    your own machine, self-host over stdio with OUTPUT_DIR.
+  // Base root for this request's files: the caller's private workspace when
+  // hosted (per-key isolation), else the operator's OUTPUT_DIR / cwd / repo.
+  // See src/doc-root.ts for the precedence.
+  const base = getDocRoot();
+
+  // Per-request X-Output-Dir (hosted only): a sub-folder of the base, so a
+  // tenant can organise its own files but can never climb out of its workspace.
+  // `..`, `~` and leading separators are stripped; the result is re-confined to
+  // `base`. (Being server-side, this never reaches the caller's machine.)
   const ctx = requestContext.getStore();
   if (ctx?.outputDir && String(ctx.outputDir).trim()) {
-    const base = process.env.CLIENT_OUTPUT_BASE
-      || path.join(process.env.DATA_DIR || process.cwd(), 'client-output');
     const sub = path.normalize(String(ctx.outputDir))
       .replace(/^([./\\]|\.\.[/\\]?)+/, '')
       .replace(/^[/\\]+/, '');
-    const resolved = path.resolve(base, sub);
-    return resolved.startsWith(path.resolve(base)) ? resolved : path.resolve(base);
+    const resolvedBase = path.resolve(base);
+    const resolved = path.resolve(resolvedBase, sub);
+    return resolved === resolvedBase || resolved.startsWith(resolvedBase + path.sep)
+      ? resolved
+      : resolvedBase;
   }
-  // 2) Operator/self-host env (trusted), unsandboxed.
-  const override = process.env.OUTPUT_DIR || process.env.DOC_OUTPUT_DIR;
-  if (override && override.trim()) {
-    return path.isAbsolute(override) ? override : path.resolve(process.cwd(), override);
-  }
-  // 3) Default: launch dir if it's a project, else repo root.
-  const isCwdProjectRoot = fs.existsSync(path.join(process.cwd(), 'package.json'));
-  return isCwdProjectRoot ? process.cwd() : path.resolve(__dirname, '..', '..');
+  return base;
 }
 
 // Per-tool wall-clock budgets. All sit comfortably below the Forge function
@@ -99,6 +97,7 @@ import { attachClientDetect, isAgenticClient, getClientInfo } from './client-det
 import { searchLearning, toolLearning } from './insights.js';
 import { buildDownloadUrl, mimeFor } from './download-registry.js';
 import { requestContext } from './request-context.js';
+import { getDocRoot, confineBasename } from './doc-root.js';
 
 // ============================================================================
 // Import observability module
@@ -807,7 +806,11 @@ export class WebSearchMCPServer {
           const maxContentLength = maxContentLengthRaw === 0 ? undefined : maxContentLengthRaw;
 
           const maxFiles = (obj.maxFiles as number) ?? 50;
-          const filenamePrefix = typeof obj.filenamePrefix === 'string' ? obj.filenamePrefix : undefined;
+          // Confine the caller-supplied prefix to a single safe filename segment:
+          // it is interpolated into the output filename, so "../../x" or "~/x"
+          // must not be able to steer the write out of research-output. Empty
+          // after sanitising -> treated as no prefix.
+          const filenamePrefix = confineBasename(typeof obj.filenamePrefix === 'string' ? obj.filenamePrefix : undefined) || undefined;
 
           // Parse template parameter
           const customTemplate = typeof obj.template === 'string' && obj.template.length > 0 ? obj.template : undefined;
