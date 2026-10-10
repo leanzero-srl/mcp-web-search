@@ -154,9 +154,11 @@ export function getDocRoot(): string {
   }
 
   const isCwdProjectRoot = fs.existsSync(path.join(process.cwd(), 'package.json'));
-  // __dirname is available in the CJS bundle the service actually runs; fall
-  // back to cwd in the ESM/source path where it is not.
-  const repoRoot = typeof __dirname !== 'undefined' ? path.resolve(__dirname, '..', '..') : process.cwd();
+  // __dirname is available in the CJS bundle (dist/bundle.cjs) and under vitest
+  // (src/); the repo is ONE level up from either. It was '..', '..' = the repo's
+  // PARENT, which is how stdio research reports landed in mcp-web-search-upd/docs
+  // (2026-10-10). The ESM build has no __dirname and uses the cwd.
+  const repoRoot = typeof __dirname !== 'undefined' ? path.resolve(__dirname, '..') : process.cwd();
   return isCwdProjectRoot ? process.cwd() : repoRoot;
 }
 

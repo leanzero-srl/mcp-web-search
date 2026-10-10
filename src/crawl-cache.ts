@@ -8,24 +8,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-
-// Get the directory where this module is located
-// In CommonJS: use __dirname directly
-// In ES modules: resolve from import.meta.url (not available in CJS bundle)
-const getModuleDir = (): string => {
-  if (typeof __dirname !== 'undefined') {
-    return __dirname;
-  }
-  // Fallback to resolving from the file
-  try {
-    const url = new URL('file:' + __filename);
-    return path.dirname(url.pathname);
-  } catch {
-    return path.resolve();
-  }
-};
-
-const moduleDir = getModuleDir();
+import { getDocRoot } from './doc-root.js';
 
 export interface CrawlCacheEntry {
   url: string;
@@ -43,19 +26,18 @@ export interface CacheIndex {
   totalEntries: number;
 }
 
-// Default cache directory. Module-relative by default, but overridable so a
-// deployment (or a test) can pin it to a known location — the module-relative
-// path differs between the dist build and source, which otherwise makes "where
-// did my spec get saved?" environment-dependent.
-// Priority: CRAWL_CACHE_DIR (most specific) → OUTPUT_DIR/DOC_OUTPUT_DIR (shared
-// "put my files here" override, kept in sync with the research-output root) →
-// module-relative repo path.
-const OUTPUT_DIR_OVERRIDE = process.env.OUTPUT_DIR || process.env.DOC_OUTPUT_DIR;
+// Default cache directory (stdio; hosted keys use getCrawlCacheForRoot on their
+// workspace). Priority: CRAWL_CACHE_DIR (most specific) → <doc root>/docs/technical,
+// the SAME root the research files use (OUTPUT_DIR/DOC_OUTPUT_DIR → the launch dir
+// when it is a project → the repo), so it lands in the repo's git-ignored
+// docs/technical when run from the repo.
+// WHY (2026-10-10): this used to be `<module dir>/../../docs/technical`, and in the
+// ESM build the module dir fell back to the cwd — two levels ABOVE the repo. Every
+// server start created ~/Projects/docs/technical and stdio saved OpenAPI specs
+// there, where no .gitignore reaches (tests/unit/runtime-output-paths.test.ts).
 const DEFAULT_CACHE_DIR = process.env.CRAWL_CACHE_DIR
   ? path.resolve(process.env.CRAWL_CACHE_DIR)
-  : OUTPUT_DIR_OVERRIDE && OUTPUT_DIR_OVERRIDE.trim()
-    ? path.join(path.resolve(OUTPUT_DIR_OVERRIDE), 'docs', 'technical')
-    : path.join(moduleDir, '../../docs/technical');
+  : path.join(getDocRoot(), 'docs', 'technical');
 const CACHE_FILE = 'crawl-cache.json';
 const DEFAULT_TTL_MS = 86400000; // 24 hours
 

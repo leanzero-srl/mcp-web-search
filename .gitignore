@@ -113,4 +113,5 @@ jspm_packages/
 *.pfx
 docs/research-output/
 docs/technical/openapi/
+docs/technical/crawl-cache.json
 logs/
