@@ -13,7 +13,7 @@
  * window so a swap doesn't break in-flight callers.
  */
 
-import { promises as fs } from 'node:fs';
+import { promises as fs, realpathSync } from 'node:fs';
 import { randomBytes, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import argon2 from 'argon2';
@@ -21,6 +21,8 @@ import express, { type Express, type Request, type Response, type NextFunction }
 import rateLimit from 'express-rate-limit';
 import { logger } from './logger.js';
 import { verifyOAuth, oauthEnabled, protectedResourceMetadataUrl } from './oauth.js';
+import { archiveTenantWorkspace, getWorkspacesBase, workspaceDirName } from './doc-root.js';
+import { forgetCrawlCacheForRoot } from './crawl-cache.js';
 
 const DATA_DIR = process.env.DATA_DIR || process.cwd();
 const TENANTS_PATH = path.join(DATA_DIR, 'tenants.json');
@@ -289,12 +291,25 @@ async function createTenant(displayName: string): Promise<CreatedTenant> {
   return { tenantId, bearer, displayName };
 }
 
-/** Revoke a tenant by id. Returns false if it didn't exist. */
+/**
+ * Revoke a tenant by id. Returns false if it didn't exist. Its workspace is
+ * moved out of service at once and deleted after the retention period
+ * (doc-root.ts archiveTenantWorkspace); its memoised crawl cache is dropped.
+ */
 async function revokeTenant(tenantId: string): Promise<boolean> {
   const tenants = await loadTenants();
   if (!tenants[tenantId]) return false;
   delete tenants[tenantId];
   await saveTenants(tenants);
+  try {
+    try {
+      forgetCrawlCacheForRoot(realpathSync(path.join(getWorkspacesBase(), workspaceDirName(tenantId))));
+    } catch { /* never had a workspace */ }
+    const archived = archiveTenantWorkspace(tenantId);
+    logger.info('[auth] revoked key\'s workspace archived', { tenantId, archived: !!archived });
+  } catch (err) {
+    logger.warn('[auth] could not archive revoked key\'s workspace', { tenantId, error: (err as Error).message });
+  }
   return true;
 }
 

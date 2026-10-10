@@ -31,11 +31,22 @@ import { attachClientDetect } from './client-detect.js';
 import { requireAuth, tenantRateLimiter, mountAdminRoutes, mountProvisionRoutes, touchTenantLastUsed } from './auth.js';
 import { mountOAuthMetadata } from './oauth.js';
 import { requestContext } from './request-context.js';
-import { workspaceForTenant } from './doc-root.js';
+import { workspaceForTenant, directorySizeBytes, workspaceQuotaBytes, purgeExpiredRevokedWorkspaces } from './doc-root.js';
 import { verifyDownloadToken } from './download-registry.js';
 import { logger } from './logger.js';
 
 const PORT = Number(process.env.PORT) || 8443;
+
+/**
+ * The tools that write files into a key's workspace. A key at its disk cap is
+ * refused these. tests/integration/workspace-lifecycle.test.ts fails if a tool
+ * is added without being classified here or in NO_FILE_WRITE_TOOLS.
+ */
+export const WRITE_TOOLS = new Set(['research_and_save_to_markdown', 'get-openapi-spec']);
+export const NO_FILE_WRITE_TOOLS = new Set([
+  'full-web-search', 'get-web-search-summaries', 'get-single-web-page-content', 'get-website-sitemap',
+  'get-github-repo-content', 'progressive-web-search', 'get-pdf-content', 'list-cached-documents', 'read-cached-document',
+]);
 // Bind loopback only by default. Tailscale Funnel/serve proxies inbound traffic
 // to 127.0.0.1:PORT, so loopback is sufficient — and it avoids colliding with
 // tailscaled's own bind on the tailnet IPs (which would EADDRINUSE a wildcard
@@ -132,7 +143,35 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
       try {
         workspace = workspaceForTenant(tenantId);
       } catch (err) {
+        // Fail CLOSED: a hosted call without its workspace would fall back to the
+        // operator's shared directories (stdio behaviour) — never run it.
         logger.error('[mcp] workspace setup failed', { tenant: tenantId, error: (err as Error).message });
+        res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'internal error' }, id: body?.id ?? null });
+        return;
+      }
+    }
+
+    // Per-key disk cap: a key whose workspace is at or over WORKSPACE_QUOTA_MB
+    // cannot run the tools that write files; everything else keeps working.
+    if (workspace && toolName && WRITE_TOOLS.has(toolName)) {
+      const cap = workspaceQuotaBytes();
+      const used = directorySizeBytes(workspace);
+      if (used >= cap) {
+        const mb = (n: number): string => (n / (1024 * 1024)).toFixed(1);
+        logger.info('[mcp] workspace full', { tenant: tenantId, tool: toolName });
+        res.status(200).json({
+          jsonrpc: '2.0',
+          id: body?.id ?? null,
+          result: {
+            isError: true,
+            content: [{
+              type: 'text',
+              text: `Workspace full: this key's files use ${mb(used)} MB of its ${mb(cap)} MB limit, so "${toolName}" was not run. ` +
+                'Searching, reading and listing still work. Ask the server operator to clear old files, or use a new key.',
+            }],
+          },
+        });
+        return;
       }
     }
     // Best-effort lastUsedAt (≤1/min), for the operator's audit of key activity.
@@ -206,6 +245,15 @@ if (isDirectRun) {
   const server = app.listen(PORT, BIND_HOST, () => {
     logger.info(`mcp-web-search HTTP listening on ${BIND_HOST}:${PORT}`);
   });
+
+  // Revoked keys' archived workspaces are deleted once their retention ends
+  // (also swept on every revoke).
+  const sweep = (): void => {
+    const removed = purgeExpiredRevokedWorkspaces();
+    if (removed.length) logger.info('[boot] purged expired revoked workspaces', { count: removed.length });
+  };
+  sweep();
+  setInterval(sweep, 6 * 60 * 60 * 1000).unref();
 
   const shutdown = async (signal: string): Promise<void> => {
     logger.info(`[boot] ${signal} received, shutting down`);

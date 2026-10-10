@@ -375,3 +375,12 @@ export function getCrawlCacheForRoot(root: string): CrawlCache {
   }
   return cache;
 }
+
+/**
+ * Drop the memoised cache for `root` (a revoked key's workspace), so a moved
+ * workspace is never written through a stale instance and the map does not
+ * grow with every key ever seen.
+ */
+export function forgetCrawlCacheForRoot(root: string): void {
+  perRootCaches.delete(path.resolve(root));
+}
