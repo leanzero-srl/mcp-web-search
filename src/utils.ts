@@ -7,18 +7,112 @@ import * as cheerio from 'cheerio';
 import http from 'http';
 import https from 'https';
 import dns from 'dns/promises';
+import dnsCb from 'dns';
 import net from 'net';
 
-// Shared HTTP/HTTPS agents with keep-alive connection pooling
-const httpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000 });
-const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000 });
+/**
+ * Substring stamped into every SSRF refusal so callers can tell a deliberate
+ * block apart from a transient network failure (e.g. the PDF extractor must NOT
+ * fall back to a headless browser — which follows redirects we cannot police —
+ * when the HTTP path was refused for pointing at an internal address).
+ */
+export const SSRF_BLOCK_MARKER = 'ssrf-blocked';
 
 /**
- * Get shared axios config with connection pooling (keep-alive)
- * Use this for all HTTP clients to reduce TCP handshake overhead
+ * IP ranges a URL-fetching server must never be steered into by an LLM-supplied
+ * URL: loopback, RFC1918 private, CGNAT (100.64/10 — this is the Tailscale
+ * tailnet range, and the workhorse's own services answer on 100.122.51.13),
+ * link-local + cloud metadata (169.254/16), multicast/reserved, NAT64, ULA, and
+ * — because Node's BlockList evaluates an IPv4-mapped IPv6 address against the
+ * IPv4 rules itself — the ::ffff: forms of all of the above. Using a BlockList
+ * (not string prefixes) is what closes the `[::ffff:127.0.0.1]` bypass the old
+ * hand-rolled check let through.
  */
-export function getAxiosHttpAgentConfig(): { httpAgent: http.Agent; httpsAgent: https.Agent } {
-  return { httpAgent, httpsAgent };
+const BLOCKED = new net.BlockList();
+for (const [subnet, prefix] of [
+  ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8],
+  ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24],
+  ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24],
+  ['224.0.0.0', 4], ['240.0.0.0', 4],
+] as Array<[string, number]>) BLOCKED.addSubnet(subnet, prefix, 'ipv4');
+for (const [subnet, prefix] of [
+  ['::', 128], ['::1', 128], ['64:ff9b::', 96], ['100::', 64],
+  ['2001:db8::', 32], ['fc00::', 7], ['fe80::', 10], ['fec0::', 10], ['ff00::', 8],
+] as Array<[string, number]>) BLOCKED.addSubnet(subnet, prefix, 'ipv6');
+
+/**
+ * True when an IP literal (v4 or v6) is in a range this server must not reach.
+ * Anything that is not a parseable IP returns true (fail closed).
+ */
+export function isBlockedAddress(ip: string): boolean {
+  const family = net.isIP(ip);
+  if (family === 4) return BLOCKED.check(ip, 'ipv4');
+  if (family === 6) return BLOCKED.check(ip, 'ipv6');
+  return true;
+}
+
+/**
+ * A `dns.lookup`-shaped function for http/https Agents that refuses to hand the
+ * socket layer a blocked address. Because it runs at CONNECT time it also
+ * covers redirect hops to hostnames and DNS-rebinding (the resolved address is
+ * re-checked for every connection), which a one-shot pre-flight check cannot.
+ * NOTE: Node skips `lookup` entirely when the host is already an IP literal, so
+ * literal-IP targets are caught by `safeFetchUrl` (initial URL) and
+ * `beforeRedirectGuard` (redirect hops), not here.
+ */
+function guardedLookup(
+  hostname: string,
+  options: dnsCb.LookupOneOptions | dnsCb.LookupAllOptions | dnsCb.LookupOptions | ((err: NodeJS.ErrnoException | null, address: string, family: number) => void),
+  callback?: (err: NodeJS.ErrnoException | null, address: string | dnsCb.LookupAddress[], family: number) => void,
+): void {
+  const cb = (typeof options === 'function' ? options : callback) as (err: NodeJS.ErrnoException | null, address: unknown, family: number) => void;
+  const opts = (typeof options === 'function' ? {} : options) as dnsCb.LookupOptions;
+  dnsCb.lookup(hostname, opts, (err, address, family) => {
+    if (err) return cb(err, address as unknown, family);
+    const addrs = Array.isArray(address) ? address.map((a) => a.address) : [address];
+    for (const a of addrs) {
+      if (isBlockedAddress(a)) {
+        const e = new Error(`${SSRF_BLOCK_MARKER}: refused connection to private/reserved address ${a} (for host ${hostname})`) as NodeJS.ErrnoException;
+        e.code = 'ESSRFBLOCKED';
+        return cb(e, '', 0);
+      }
+    }
+    cb(null, address as unknown, family);
+  });
+}
+
+// Shared HTTP/HTTPS agents with keep-alive connection pooling AND the SSRF
+// lookup guard, so every axios call that spreads getAxiosHttpAgentConfig() is
+// protected on the initial connection and on every redirect hop.
+const httpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, lookup: guardedLookup });
+const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, lookup: guardedLookup });
+
+/**
+ * Follow-redirects `beforeRedirect` hook: refuse a redirect hop whose target is
+ * a literal blocked IP. The agent `lookup` already covers hostname hops; this
+ * closes the gap Node leaves for IP-literal hosts (e.g. a 302 to
+ * `http://127.0.0.1:10000/…`), which skip `lookup` entirely.
+ */
+export function beforeRedirectGuard(options: { hostname?: string; host?: string }): void {
+  const raw = options.hostname || options.host || '';
+  const host = raw.replace(/^\[|\]$/g, '');
+  if (net.isIP(host) && isBlockedAddress(host)) {
+    throw new Error(`${SSRF_BLOCK_MARKER}: refused redirect to private/reserved address ${host}`);
+  }
+}
+
+/**
+ * Shared axios config for any request to a CALLER-SUPPLIED URL: connection
+ * pooling + the SSRF-guarded agents + the redirect guard. Spreading this into
+ * an axios call is the single thing that makes that call safe against loopback /
+ * private-range SSRF, including via redirects and DNS rebinding.
+ */
+export function getAxiosHttpAgentConfig(): {
+  httpAgent: http.Agent;
+  httpsAgent: https.Agent;
+  beforeRedirect: typeof beforeRedirectGuard;
+} {
+  return { httpAgent, httpsAgent, beforeRedirect: beforeRedirectGuard };
 }
 
 export function cleanText(text: string, maxLength: number = 10000): string {
@@ -75,96 +169,58 @@ export function validateUrl(url: string): boolean {
 }
 
 /**
- * Returns true when an IP address (v4 or v6) lives in a range that should never
- * be reachable from a server fetching arbitrary URLs supplied by an LLM:
- * loopback, link-local, RFC1918 private, multicast, broadcast, cloud metadata
- * (169.254.169.254), unique local addresses (fc00::/7), and the IPv6 mappings
- * of all of the above.
- */
-function isPrivateOrReservedIp(ip: string): boolean {
-  if (!ip) return true;
-
-  if (net.isIPv4(ip)) {
-    const [a, b] = ip.split('.').map((n) => parseInt(n, 10));
-    if (Number.isNaN(a) || Number.isNaN(b)) return true;
-    if (a === 0) return true;                       // 0.0.0.0/8
-    if (a === 10) return true;                      // 10.0.0.0/8 RFC1918
-    if (a === 127) return true;                     // 127.0.0.0/8 loopback
-    if (a === 169 && b === 254) return true;        // 169.254.0.0/16 link-local + cloud metadata
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 RFC1918
-    if (a === 192 && b === 168) return true;        // 192.168.0.0/16 RFC1918
-    if (a === 192 && b === 0) return true;          // 192.0.0.0/24 IETF protocol
-    if (a >= 224) return true;                      // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved
-    return false;
-  }
-
-  if (net.isIPv6(ip)) {
-    const lower = ip.toLowerCase();
-    if (lower === '::' || lower === '::1') return true;
-    if (lower.startsWith('fe80:') || lower.startsWith('fe8') || lower.startsWith('fec') || lower.startsWith('fea') || lower.startsWith('feb')) return true; // link-local fe80::/10
-    if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // unique-local fc00::/7
-    if (lower.startsWith('ff')) return true;        // multicast ff00::/8
-    // IPv4-mapped IPv6 (::ffff:a.b.c.d) — recurse on the v4 portion
-    if (lower.startsWith('::ffff:')) {
-      const v4 = lower.split('::ffff:')[1];
-      if (v4 && net.isIPv4(v4)) return isPrivateOrReservedIp(v4);
-    }
-    return false;
-  }
-
-  return true; // not a parseable IP
-}
-
-/**
- * Validates a URL is safe to fetch. Rejects non-http(s) schemes, malformed
+ * Validates a URL is safe to fetch: rejects non-http(s) schemes, malformed
  * URLs, and (after DNS resolution) addresses pointing at loopback / link-local /
- * RFC1918 / cloud-metadata / multicast targets. Throws on rejection so callers
- * surface a structured error instead of silently fetching an internal target.
+ * RFC1918 / CGNAT / cloud-metadata / multicast targets. Throws on rejection so
+ * callers surface a structured error instead of silently fetching an internal
+ * target. Every refusal message contains SSRF_BLOCK_MARKER.
  *
- * Note: DNS resolution is best-effort for SSRF defense — a TOCTOU window
- * between resolution and the actual axios/playwright fetch still exists. For
- * stronger guarantees, route requests through a custom http.Agent that blocks
- * the same ranges in `lookup`. This guard catches the common cases.
+ * This is the PRE-FLIGHT gate on the initial URL. The redirect/rebinding gaps a
+ * one-shot check leaves open are closed separately by the SSRF-guarded agents
+ * (hostname hops) and beforeRedirectGuard (IP-literal hops) wired through
+ * getAxiosHttpAgentConfig(); the browser path never fetches a URL this gate
+ * rejected, and refuses to fall back to the browser for a blocked HTTP error.
  */
 export async function safeFetchUrl(url: string): Promise<void> {
   if (typeof url !== 'string' || url.length === 0) {
-    throw new Error('Invalid URL: must be a non-empty string');
+    throw new Error(`Invalid URL: must be a non-empty string (${SSRF_BLOCK_MARKER})`);
   }
   if (!validateUrl(url)) {
-    throw new Error(`Invalid URL: only http and https schemes are allowed (got: ${url.slice(0, 80)})`);
+    throw new Error(`Invalid URL: only http and https schemes are allowed (got: ${url.slice(0, 80)}) (${SSRF_BLOCK_MARKER})`);
   }
 
   const parsed = new URL(url);
   // URL.hostname wraps IPv6 literals in brackets ("[::1]") — strip them so
-  // net.isIP / our range check see the bare address.
+  // net.isIP / the BlockList see the bare address. (This also normalises forms
+  // like [::ffff:127.0.0.1] → ::ffff:7f00:1, which the BlockList catches.)
   const host = parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
     ? parsed.hostname.slice(1, -1)
     : parsed.hostname;
 
   // Reject literal IP hostnames in private ranges directly (no DNS needed)
   if (net.isIP(host)) {
-    if (isPrivateOrReservedIp(host)) {
-      throw new Error(`Refused to fetch private/reserved address: ${host}`);
+    if (isBlockedAddress(host)) {
+      throw new Error(`Refused to fetch private/reserved address: ${host} (${SSRF_BLOCK_MARKER})`);
     }
     return;
   }
 
   // Hostname-level shortcut for "localhost"
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) {
-    throw new Error(`Refused to fetch local hostname: ${host}`);
+    throw new Error(`Refused to fetch local hostname: ${host} (${SSRF_BLOCK_MARKER})`);
   }
 
   try {
     const records = await dns.lookup(host, { all: true, verbatim: true });
     for (const rec of records) {
-      if (isPrivateOrReservedIp(rec.address)) {
-        throw new Error(`Refused to fetch ${host}: resolves to private/reserved address ${rec.address}`);
+      if (isBlockedAddress(rec.address)) {
+        throw new Error(`Refused to fetch ${host}: resolves to private/reserved address ${rec.address} (${SSRF_BLOCK_MARKER})`);
       }
     }
   } catch (err) {
     // Re-throw our own refusals; DNS errors (NXDOMAIN, etc.) bubble up as the
     // caller will see them anyway during the actual fetch.
-    if (err instanceof Error && err.message.startsWith('Refused to fetch')) {
+    if (err instanceof Error && err.message.includes(SSRF_BLOCK_MARKER)) {
       throw err;
     }
     // DNS lookup failure: let the actual request fail naturally with a clearer
@@ -259,9 +315,10 @@ export async function fetchSitemapUrls(baseUrl: string): Promise<string[]> {
   try {
     const robotsUrl = `${origin}/robots.txt`;
     console.log(`[Utils] Checking robots.txt at: ${robotsUrl}`);
-    const robotsResponse = await axios.get(robotsUrl, { 
-      timeout: 5000, 
-      headers: { 'User-Agent': getRandomUserAgent() } 
+    const robotsResponse = await axios.get(robotsUrl, {
+      timeout: 5000,
+      headers: { 'User-Agent': getRandomUserAgent() },
+      ...getAxiosHttpAgentConfig(),
     });
     const robotsText = robotsResponse.data as string;
     const sitemapMatches = robotsText.matchAll(/^Sitemap:\s*(https?:\/\/[^\s]+)/gmi);

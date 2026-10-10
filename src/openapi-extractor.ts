@@ -9,8 +9,10 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import pLimit from 'p-limit';
 import * as yaml from 'js-yaml';
-import { CrawlCache, crawlCache } from './crawl-cache.js';
+import { CrawlCache, crawlCache, getCrawlCacheForRoot } from './crawl-cache.js';
 import { getAxiosHttpAgentConfig, safeFetchUrl } from './utils.js';
+import { getTenantWorkspace } from './request-context.js';
+import { getDocRoot } from './doc-root.js';
 import {
   TechnicalDocType,
   DownloadedOpenAPI,
@@ -446,12 +448,21 @@ function getStandardHeaders(): Record<string, string> {
  * Main OpenAPI Extractor class
  */
 export class OpenAPIExtractor {
-  private cache: CrawlCache;
   private defaultMaxContentLength: number;
 
   constructor(options?: { maxContentLength?: number }) {
-    this.cache = crawlCache;
     this.defaultMaxContentLength = options?.maxContentLength || 10000000; // 10MB
+  }
+
+  /**
+   * The CrawlCache for the CURRENT request: a per-key cache under the hosted
+   * caller's workspace when one is active (so one demo key's saved/listed specs
+   * never leak to another), else the process-shared singleton (stdio — on-disk
+   * location unchanged). Resolved per call because the extractor is a singleton
+   * shared across all requests.
+   */
+  private get cache(): CrawlCache {
+    return getTenantWorkspace() ? getCrawlCacheForRoot(getDocRoot()) : crawlCache;
   }
 
   /**

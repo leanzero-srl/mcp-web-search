@@ -2,7 +2,7 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import pLimit from 'p-limit';
 import { ContentExtractionOptions, SearchResult, ResearchDigest } from './types.js';
-import { cleanText, getContentPreview, generateTimestamp, isPdfUrl, getAxiosHttpAgentConfig, safeFetchUrl } from './utils.js';
+import { cleanText, getContentPreview, generateTimestamp, isPdfUrl, getAxiosHttpAgentConfig, safeFetchUrl, SSRF_BLOCK_MARKER } from './utils.js';
 import { browserPool } from './browser-pool.js';
 import { scoreContentQuality, getBestContentSelector, cleanText as qualityCleanText } from './content-quality-scorer.js';
 import { sessionRateLimiter } from './enterprise-guardrails.js';
@@ -460,6 +460,14 @@ export class EnhancedContentExtractor {
 
     // GitHub raw URLs should NOT use browser fallback - they have direct API
     if (url.includes('raw.githubusercontent.com')) {
+      return false;
+    }
+
+    // An SSRF refusal (initial URL, a redirect hop, or DNS rebinding to a
+    // private address) must NEVER degrade into a browser fetch: Playwright does
+    // not intercept server-side redirect hops, so the headless browser would
+    // follow a public→loopback redirect we cannot police. Fail closed.
+    if (error?.message?.includes(SSRF_BLOCK_MARKER)) {
       return false;
     }
 

@@ -352,5 +352,26 @@ export class CrawlCache {
   }
 }
 
-// Create a singleton instance
+// Create a singleton instance (the default used on stdio / when no per-key
+// workspace is active — on-disk location unchanged).
 export const crawlCache = new CrawlCache();
+
+// Per-root CrawlCache instances, so each hosted key's OpenAPI/crawl cache lives
+// under its own workspace (<workspace>/docs/technical) instead of one shared
+// directory. Memoised by resolved root so we don't rebuild (and re-read the
+// index file) on every request.
+const perRootCaches = new Map<string, CrawlCache>();
+
+/**
+ * The CrawlCache rooted at `root`/docs/technical. Used by openapi-extractor
+ * when a hosted caller has a private workspace; stdio keeps using `crawlCache`.
+ */
+export function getCrawlCacheForRoot(root: string): CrawlCache {
+  const resolved = path.resolve(root);
+  let cache = perRootCaches.get(resolved);
+  if (!cache) {
+    cache = new CrawlCache({ cacheDir: path.join(resolved, 'docs', 'technical') });
+    perRootCaches.set(resolved, cache);
+  }
+  return cache;
+}

@@ -85,6 +85,33 @@ export function invalidateTenantsCache(): void {
   cache = null;
 }
 
+// Throttle lastUsedAt writes so a burst of calls doesn't rewrite tenants.json
+// on every request. Keyed by tenant id -> last-persisted epoch ms.
+const LAST_USED_MIN_INTERVAL_MS = 60_000;
+const lastUsedPersistedAt = new Map<string, number>();
+
+/**
+ * Record that a tenant's bearer was just used, at most once per minute per
+ * tenant. Best-effort and non-blocking: a failure here must never fail the
+ * request, and nothing sensitive (no token, no URL) is written — only an ISO
+ * timestamp on the existing record. Mirrors mcp-doc-processor's lastUsedAt.
+ */
+export async function touchTenantLastUsed(tenantId: string): Promise<void> {
+  try {
+    const now = Date.now();
+    const prev = lastUsedPersistedAt.get(tenantId) || 0;
+    if (now - prev < LAST_USED_MIN_INTERVAL_MS) return;
+    lastUsedPersistedAt.set(tenantId, now);
+    const tenants = await loadTenants();
+    const record = tenants[tenantId];
+    if (!record) return;
+    record.lastUsedAt = new Date(now).toISOString();
+    await saveTenants(tenants);
+  } catch {
+    // best-effort audit metadata — never disrupt the request
+  }
+}
+
 function activeHashes(record: TenantRecord): string[] {
   const now = Date.now();
   const hashes: string[] = [];
