@@ -38,22 +38,17 @@ function downloadBase(): string | null {
   return null;
 }
 
-// Files may only be served from under these roots (defense in depth). WIDER than
-// the doc-processor template on purpose: research markdown lands under
-// getOutputRoot() (≈ process.cwd()), while OpenAPI specs land under the
-// crawl-cache root — which, in this ESM build where __dirname is unavailable,
-// can resolve to the launch dir's PARENT (e.g. <repo>/.. /docs/technical/openapi).
-// Including cwd + its parent + the explicit output/cache env dirs covers both
-// observed locations without leaking outside the project tree. Combined with the
-// HMAC signature (paths can't be forged), this is defense-in-depth, not the
-// primary control.
+// Files may only be served from under these roots (defense in depth; the HMAC
+// signature is the primary control — paths can't be forged). Since 1b63a06 every
+// output (research markdown, the crawl cache, hosted per-key workspaces under
+// DATA_DIR) lives inside the repo or DATA_DIR, so the launch dir's PARENT (which
+// is ~/Projects on the workhorse) is no longer allowed (2026-10-10).
 function allowedBases(): string[] {
   const bases = new Set<string>();
   const add = (p?: string | null): void => {
     if (p && String(p).trim()) bases.add(path.resolve(String(p)));
   };
   add(process.cwd());
-  add(path.resolve(process.cwd(), '..'));
   add(process.env.DATA_DIR);
   if (process.env.DATA_DIR) add(path.join(process.env.DATA_DIR, 'client-output')); // default CLIENT_OUTPUT_BASE
   add(process.env.CLIENT_OUTPUT_BASE);
