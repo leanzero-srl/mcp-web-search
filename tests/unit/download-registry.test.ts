@@ -106,3 +106,18 @@ describe('download-registry sign/verify', () => {
     expect(mimeFor('spec.bin')).toBe('application/octet-stream');
   });
 });
+
+describe('download-registry allowed roots (2026-10-10)', () => {
+  it("refuses a correctly signed token for a file in the launch dir's PARENT (no longer an allowed root)", () => {
+    const parentDir = path.resolve(process.cwd(), '..');
+    const f = path.join(parentDir, `.dl-parent-probe-${process.pid}.txt`);
+    writeFileSync(f, 'x');
+    try {
+      const url = buildDownloadUrl(f);
+      expect(url).toBeTruthy();
+      expect(verifyDownloadToken(tokenOf(url!))).toBeNull();
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+});
