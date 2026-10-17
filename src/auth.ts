@@ -70,9 +70,17 @@ async function loadTenants(): Promise<TenantMap> {
   return cache;
 }
 
-async function saveTenants(tenants: TenantMap): Promise<void> {
+// Writes are serialised. Two overlapping saves used to share one tmp file
+// name, so one rename hit ENOENT (the request then hung with no response), and
+// a stale snapshot could land last: a lastUsedAt write that serialised the map
+// before a revoke and renamed after it put the revoked key back on disk.
+// Each queued write serialises the map when its turn comes, so the last write
+// on disk is always the newest state.
+let saveChain: Promise<void> = Promise.resolve();
+
+async function writeTenantsFile(tenants: TenantMap): Promise<void> {
   await fs.mkdir(path.dirname(TENANTS_PATH), { recursive: true });
-  const tmp = `${TENANTS_PATH}.tmp.${process.pid}`;
+  const tmp = `${TENANTS_PATH}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
   await fs.writeFile(tmp, JSON.stringify(tenants, null, 2), { mode: 0o600 });
   await fs.rename(tmp, TENANTS_PATH);
   try {
@@ -80,7 +88,13 @@ async function saveTenants(tenants: TenantMap): Promise<void> {
   } catch {
     // best-effort on non-POSIX filesystems
   }
+}
+
+async function saveTenants(tenants: TenantMap): Promise<void> {
   cache = tenants;
+  const run = saveChain.then(() => writeTenantsFile(tenants));
+  saveChain = run.catch(() => { /* the caller sees the error; the chain keeps going */ });
+  await run;
 }
 
 export function invalidateTenantsCache(): void {

@@ -317,7 +317,7 @@ async function downloadOpenAPISpec(
       }
 
       // Detect content type
-      const contentType = response.headers['content-type'] || '';
+      const contentType = String(response.headers['content-type'] ?? '');
       let docType: TechnicalDocType = TechnicalDocType.OPENAPI_JSON;
 
       if (contentType.includes('yaml') || url.toLowerCase().endsWith('.yaml')) {

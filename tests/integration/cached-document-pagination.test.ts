@@ -140,12 +140,22 @@ describe('read-cached-document pagination + offline validation', () => {
   }, testTimeout);
 
   it('rejects a junk numeric string limit on full-web-search (offline validation)', async () => {
-    // The typed Zod schema (limit: number) rejects a string at the protocol
-    // layer, so the call is refused outright rather than returning isError.
-    await expect(client.callTool(
-      { name: 'full-web-search', arguments: { query: 'anything', limit: '5abc' } },
-      undefined, { timeout: testTimeout },
-    )).rejects.toThrow();
+    // The typed Zod schema (limit: number) rejects a string before the handler
+    // runs. MCP SDK 1.2x+ reports schema failures as a tool result with
+    // isError (per spec) instead of a JSON-RPC error, so accept either shape
+    // as long as the refusal is the SDK's input-validation error.
+    let text = '';
+    try {
+      const r = await client.callTool(
+        { name: 'full-web-search', arguments: { query: 'anything', limit: '5abc' } },
+        undefined, { timeout: testTimeout },
+      );
+      expect(r.isError).toBe(true);
+      text = ((r.content as Array<{ text?: string }>) || []).map((c) => c.text || '').join('\n');
+    } catch (err) {
+      text = (err as Error).message;
+    }
+    expect(text).toMatch(/Input validation error/);
   }, testTimeout);
 
   it('rejects path traversal on get-github-repo-content (offline validation)', async () => {
