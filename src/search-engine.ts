@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { createHash } from 'node:crypto';
 import * as cheerio from 'cheerio';
 import { SearchOptions, SearchResult, SearchResultWithMetadata } from './types.js';
 import { generateTimestamp, sanitizeQuery, getAxiosHttpAgentConfig } from './utils.js';
@@ -331,20 +332,39 @@ export class SearchEngine {
   // After N consecutive failures we stop calling Serper for `cooldownMs` and
   // let the fallback chain take over immediately. After the cooldown a single
   // probe request is allowed; on success we close, on failure we re-open.
-  // Process-wide state is fine — there's typically one SearchEngine per process.
-  private static serperBreaker = {
-    consecutiveFailures: 0,
-    openedAt: 0,
-    halfOpen: false,
+  //
+  // PER KEY (2026-10-24): the hosted server is keyless — every caller brings
+  // their own Serper key — so one process-wide breaker let ONE caller with a
+  // bad or exhausted key (5 failed calls) switch Serper off for EVERY other
+  // tenant for the cooldown: their searches came back empty. State is now kept
+  // per sha256(key) (never the key itself), bounded in size.
+  private static readonly serperBreakerConfig = {
     failureThreshold: parseInt(process.env.SERPER_BREAKER_FAILURES || '5', 10),
     cooldownMs: parseInt(process.env.SERPER_BREAKER_COOLDOWN_MS || '30000', 10),
+    maxKeys: 1000,
   };
+  private static serperBreakers = new Map<string, { consecutiveFailures: number; openedAt: number; halfOpen: boolean }>();
 
-  private static serperBreakerShouldSkip(): boolean {
-    const b = SearchEngine.serperBreaker;
+  private static serperBreakerFor(apiKey: string) {
+    const id = createHash('sha256').update(apiKey).digest('hex');
+    let b = SearchEngine.serperBreakers.get(id);
+    if (!b) {
+      if (SearchEngine.serperBreakers.size >= SearchEngine.serperBreakerConfig.maxKeys) {
+        const oldest = SearchEngine.serperBreakers.keys().next().value;
+        if (oldest !== undefined) SearchEngine.serperBreakers.delete(oldest);
+      }
+      b = { consecutiveFailures: 0, openedAt: 0, halfOpen: false };
+      SearchEngine.serperBreakers.set(id, b);
+    }
+    return b;
+  }
+
+  /** @internal exported for tests/unit/serper-breaker-per-key.test.ts */
+  static serperBreakerShouldSkip(apiKey: string): boolean {
+    const b = SearchEngine.serperBreakerFor(apiKey);
     if (b.openedAt === 0) return false;
     const sinceOpen = Date.now() - b.openedAt;
-    if (sinceOpen >= b.cooldownMs) {
+    if (sinceOpen >= SearchEngine.serperBreakerConfig.cooldownMs) {
       // Allow one probe request through.
       if (!b.halfOpen) {
         b.halfOpen = true;
@@ -356,22 +376,24 @@ export class SearchEngine {
     return true;
   }
 
-  private static serperBreakerRecordSuccess(): void {
-    const b = SearchEngine.serperBreaker;
+  /** @internal */
+  static serperBreakerRecordSuccess(apiKey: string): void {
+    const b = SearchEngine.serperBreakerFor(apiKey);
     b.consecutiveFailures = 0;
     b.openedAt = 0;
     b.halfOpen = false;
   }
 
-  private static serperBreakerRecordFailure(): void {
-    const b = SearchEngine.serperBreaker;
+  /** @internal */
+  static serperBreakerRecordFailure(apiKey: string): void {
+    const b = SearchEngine.serperBreakerFor(apiKey);
     b.consecutiveFailures += 1;
     b.halfOpen = false;
-    if (b.consecutiveFailures >= b.failureThreshold && b.openedAt === 0) {
+    if (b.consecutiveFailures >= SearchEngine.serperBreakerConfig.failureThreshold && b.openedAt === 0) {
       b.openedAt = Date.now();
       console.error(
-        `[SearchEngine] Serper circuit breaker OPENED after ${b.consecutiveFailures} ` +
-          `consecutive failures; cooldown ${b.cooldownMs}ms`,
+        `[SearchEngine] Serper circuit breaker OPENED for one key after ${b.consecutiveFailures} ` +
+          `consecutive failures; cooldown ${SearchEngine.serperBreakerConfig.cooldownMs}ms`,
       );
     }
   }
@@ -388,7 +410,7 @@ export class SearchEngine {
       return [];
     }
 
-    if (SearchEngine.serperBreakerShouldSkip()) {
+    if (SearchEngine.serperBreakerShouldSkip(apiKey)) {
       console.error('[SearchEngine] Serper circuit breaker OPEN — skipping API call, using fallback');
       return [];
     }
@@ -439,10 +461,10 @@ export class SearchEngine {
         console.log(`[SearchEngine] Cached results for query: "${query}"`);
       }
 
-      SearchEngine.serperBreakerRecordSuccess();
+      SearchEngine.serperBreakerRecordSuccess(apiKey);
       return results;
     } catch (error) {
-      SearchEngine.serperBreakerRecordFailure();
+      SearchEngine.serperBreakerRecordFailure(apiKey);
       console.error(`[SearchEngine] API search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       if (axios.isAxiosError(error)) {
         console.error('[SearchEngine] API Axios error details:', {
