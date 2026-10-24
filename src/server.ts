@@ -339,7 +339,7 @@ export class WebSearchMCPServer {
         query: z.string().describe('Search query to execute (recommended for comprehensive research)'),
         limit: z.number().optional().default(5).describe('Number of results to return with full content (1-10)'),
         includeContent: z.boolean().optional().default(true).describe('Whether to fetch full page content (default: true)'),
-        maxContentLength: z.number().optional().describe('Maximum characters per result content (0 = no limit). Usually not needed - content length is automatically optimized.'),
+        maxContentLength: z.number().int().nonnegative().optional().describe('Maximum characters per result content (0 = no limit). Usually not needed - content length is automatically optimized.'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: full-web-search`);
@@ -520,7 +520,7 @@ export class WebSearchMCPServer {
       'Extract and return the full content from a single web page URL. This tool follows a provided URL and extracts the main page content. Useful for getting detailed content from a specific webpage without performing a search.',
       {
         url: z.string().url().describe('The URL of the web page to extract content from'),
-        maxContentLength: z.number().optional().describe('Maximum characters for the extracted content (0 = no limit). Usually not needed - content length is automatically optimized.'),
+        maxContentLength: z.number().int().nonnegative().optional().describe('Maximum characters for the extracted content (0 = no limit). Usually not needed - content length is automatically optimized.'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-single-web-page-content`);
@@ -773,7 +773,7 @@ export class WebSearchMCPServer {
       'Research web pages and save their content, research digest (entities, claims, terms), and source information into structured markdown files in the /docs/research-output directory for future reference. Supports batch research, content sanitization, quality scoring, and auto-cleanup of old files.',
       {
         url: z.union([z.string().url(), z.array(z.string().url())]).describe('The URL of the web page(s) to research and save. Can be a single URL or an array of URLs for batch processing.'),
-        maxContentLength: z.number().optional().describe('Maximum characters per result content (0 = no limit)'),
+        maxContentLength: z.number().int().nonnegative().optional().describe('Maximum characters per result content (0 = no limit)'),
         maxFiles: z.number().optional().default(50).describe('Maximum number of research files to keep. Oldest files are auto-deleted when limit is reached.'),
         filenamePrefix: z.string().optional().describe('Custom prefix for the output filename (e.g., "my-research" creates "my-research-2026-01-01-...")'),
         template: z.string().optional().describe('Custom markdown template for the research file. Use placeholders: {title}, {url}, {timestamp}, {wordCount}, {readingTime}, {qualityScore}, {entities}, {claims}, {keyTerms}, {content}. If not provided, default template is used.'),
@@ -1669,7 +1669,7 @@ export class WebSearchMCPServer {
       'Extract and return text content from a PDF document. This tool uses HTTP-based extraction with browser fallback for complex PDFs. Use this when you need to extract readable text from PDF files found during web research.',
       {
         url: z.string().url().describe('The URL of the PDF file to extract content from'),
-        maxContentLength: z.number().optional().describe('Maximum characters for the extracted content (0 = no limit).'),
+        maxContentLength: z.number().int().nonnegative().optional().describe('Maximum characters for the extracted content (0 = no limit).'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-pdf-content`);
