@@ -65,9 +65,10 @@ export class SearchEngine {
 
     // OPTIMIZATION 3: Deduplicate concurrent identical search requests
     // This prevents duplicate API/browser calls when the same query arrives simultaneously
+    // numResults is part of the key: a 2-result answer must not be reused for a caller asking for 10.
     return requestDeduplicator.deduplicate(
       sanitizedQuery,
-      'search',
+      `search|n=${numResults}`,
       () => this.executeSearch(sanitizedQuery, numResults, timeout)
     );
   }

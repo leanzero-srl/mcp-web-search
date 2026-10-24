@@ -37,8 +37,9 @@ export class RequestDeduplicator {
   /**
    * Creates a deduplication key from query and parameters
    */
-  private getDedupeKey(query: string, ...args: (string | number | boolean)[]): string {
-    const normalized = this.normalizeQuery(query);
+  private getDedupeKey(query: string, caseSensitive: boolean, ...args: (string | number | boolean)[]): string {
+    // URLs are case-sensitive in their path/query, so callers pass caseSensitive for them.
+    const normalized = caseSensitive ? query.trim() : this.normalizeQuery(query);
     return `${this.callerScope()}:${normalized}:${args.join('|')}`;
   }
 
@@ -62,14 +63,23 @@ export class RequestDeduplicator {
    * @param query - The search query
    * @param operation - Unique identifier for the type of operation (e.g., 'search', 'content')
    * @param fn - The async function to execute
+   * @param opts.caseSensitive - keep the query's case in the key (URLs)
    * @returns The result of the operation
+   *
+   * `operation` MUST encode every option that changes the result (limit,
+   * maxContentLength, ...): a finished result is reused for maxAgeMs, so a key
+   * without them served one caller's truncated page / short result list to the
+   * next caller who asked for more (2026-10-24, found by
+   * tests/integration/output-limiting.test.ts). A FAILED request is dropped as
+   * soon as it settles, so a transient error is not replayed for 30 s.
    */
   async deduplicate<T>(
     query: string,
     operation: string,
-    fn: () => Promise<T>
+    fn: () => Promise<T>,
+    opts: { caseSensitive?: boolean } = {},
   ): Promise<T> {
-    const key = this.getDedupeKey(query, operation);
+    const key = this.getDedupeKey(query, opts.caseSensitive ?? false, operation);
     const now = Date.now();
 
     // Clean up expired entries periodically
@@ -99,9 +109,10 @@ export class RequestDeduplicator {
       const oldestKey = this.pendingRequests.keys().next().value;
       if (oldestKey) this.pendingRequests.delete(oldestKey);
     }
-    this.pendingRequests.set(key, {
-      promise,
-      timestamp: now
+    const entry = { promise, timestamp: now };
+    this.pendingRequests.set(key, entry);
+    promise.catch(() => {
+      if (this.pendingRequests.get(key) === entry) this.pendingRequests.delete(key);
     });
 
     console.log(`[RequestDeduplicator] 🆕 New request for "${query}" (${operation})`);

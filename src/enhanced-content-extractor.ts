@@ -152,10 +152,13 @@ export class EnhancedContentExtractor {
 
     // OPTIMIZATION: Deduplicate concurrent extractions of the same URL
     // This prevents redundant HTTP/browser calls when the same URL appears in multiple searches
+    // The key carries maxContentLength (a capped extraction must never be
+    // served to a caller who asked for the whole page) and keeps the URL's case.
     return requestDeduplicator.deduplicate(
       url,
-      'extract',
-      () => this.executeExtraction(options)
+      `extract|max=${options.maxContentLength ?? 'default'}`,
+      () => this.executeExtraction(options),
+      { caseSensitive: true },
     );
   }
 
