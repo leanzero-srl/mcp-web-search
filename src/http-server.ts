@@ -34,6 +34,7 @@ import { requestContext } from './request-context.js';
 import { workspaceForTenant, directorySizeBytes, workspaceQuotaBytes, purgeExpiredRevokedWorkspaces } from './doc-root.js';
 import { verifyDownloadToken } from './download-registry.js';
 import { logger } from './logger.js';
+import { refusedLogger } from './refused-log.js';
 
 const PORT = Number(process.env.PORT) || 8443;
 
@@ -59,6 +60,9 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
   const app = express();
   // Funnel terminates TLS upstream; req.ip needs the X-Forwarded-For chain.
   app.set('trust proxy', true);
+
+  // Audit every refused request (401/403/404/405/429) before anything can answer.
+  app.use(refusedLogger('web-search'));
 
   app.use(cors({
     origin: '*',
