@@ -11,11 +11,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          # Node 24 / npm 11 = what the workhorse runs in production. The lockfile is written by npm 11;
+          # npm 10 (Node 20) rejects it ("Missing: esbuild@0.28.2 from lock file") and every run failed at npm ci.
+          node-version: '24'
           cache: 'npm'
 
       - name: Install dependencies
