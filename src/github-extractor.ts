@@ -20,8 +20,8 @@ declare module 'axios' {
  * - Directory structure information
  */
 
-// Create axios instance with token masking interceptor
-function createGitHubAxiosClient(githubToken?: string) {
+// Create the GitHub axios instance. Exported for tests/unit/github-auth-header.test.ts.
+export function createGitHubAxiosClient(githubToken?: string) {
   const client = axios.create({
     timeout: 10000,
     headers: {
@@ -32,15 +32,12 @@ function createGitHubAxiosClient(githubToken?: string) {
     ...getAxiosHttpAgentConfig(),
   });
 
-  // Request interceptor to mask token in logs
-  client.interceptors.request.use((config) => {
-    if (githubToken && config.headers?.Authorization) {
-      const originalValue = String(config.headers.Authorization);
-      // Mask the token value while keeping the structure visible for debugging
-      config.headers.Authorization = `token ***${originalValue.slice(-8)}***`;
-    }
-    return config;
-  });
+  // NOTE: there used to be a request interceptor here that "masked" the token
+  // by rewriting config.headers.Authorization to `token ***<last 8>***`.
+  // Request interceptors run BEFORE the request is sent, so that masked string
+  // is what went over the wire: every call made with GITHUB_TOKEN set (stdio
+  // users) got HTTP 401. Masking belongs in log lines only — see maskToken()
+  // and the error-message scrub in the response interceptor below.
 
   // Response interceptor to mask tokens and handle rate limiting
   client.interceptors.response.use(
