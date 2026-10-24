@@ -98,6 +98,23 @@ async function extractRawGitHubContent(url: string): Promise<string | null> {
   }
 }
 
+/**
+ * Visible text of the first element matching `selector` (falling back to
+ * <body>), with non-rendered elements stripped first. cheerio's `.text()`
+ * returns the raw text of <style>/<script> children too, so without the strip
+ * a page that injects a <style> into <body> (example.com does since 2025)
+ * came back as "svg{display:block;margin:...}This domain is for use...".
+ * Exported for tests/unit/extract-visible-text.test.ts.
+ */
+export function extractVisibleText(html: string, selector: string): string {
+  const $ = cheerio.load(html);
+  let $content = $(selector).first();
+  if ($content.length === 0) $content = $('body').first();
+  if ($content.length === 0) return '';
+  $content.find('script, style, noscript, template, svg').remove();
+  return $content.text().trim();
+}
+
 export class EnhancedContentExtractor {
   private readonly defaultTimeout: number;
   private readonly maxContentLength: number;
@@ -406,16 +423,10 @@ export class EnhancedContentExtractor {
       
       let mainContent = '';
       try {
-        const $ = cheerio.load(html);
-        const $content = $(selector).first();
-        if ($content.length > 0) {
-          mainContent = $content.text().trim();
-        }
+        mainContent = extractVisibleText(html, selector);
       } catch (_parseError: unknown) {
         console.log(`[BrowserExtractor] Selector parsing failed, using body content`);
-        // Re-load HTML after catching error
-        const $$ = cheerio.load(html);
-        mainContent = $$('#body').text().trim();
+        mainContent = extractVisibleText(html, 'body');
       }
 
       await context.close();
