@@ -190,6 +190,13 @@ export class PdfExtractor {
       if (error instanceof Error && error.message.includes(SSRF_BLOCK_MARKER)) {
         throw error;
       }
+      // A document that does not exist (404/410) will not exist for a browser
+      // either. Falling back used to render the site's HTML error page and
+      // return it as "PDF Content" with isError false.
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status === 404 || status === 410) {
+        throw new Error(`HTTP ${status}: PDF not found at ${url}`);
+      }
       console.error(`[PdfExtractor] HTTP extraction failed for ${url}:`, error);
       return null;
     }
@@ -207,7 +214,11 @@ export class PdfExtractor {
 
     try {
       // Navigate to the PDF URL
-      await page.goto(url, { waitUntil: 'networkidle', timeout });
+      const response = await page.goto(url, { waitUntil: 'networkidle', timeout });
+      // Never return an HTTP error page as document text.
+      if (response && response.status() >= 400) {
+        throw new Error(`HTTP ${response.status()}: could not load PDF at ${url}`);
+      }
 
       // Wait for PDF to load
       await page.waitForSelector('body', { timeout });
