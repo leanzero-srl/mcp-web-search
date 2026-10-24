@@ -157,6 +157,10 @@ export class PdfExtractor {
       });
 
       const uint8Array = new Uint8Array(response.data);
+      // Read the size BEFORE parsing: pdf-parse v2 hands the buffer to pdf.js,
+      // which transfers (detaches) it, so uint8Array.length reads 0 afterwards
+      // and every response said "File Size: 0 bytes".
+      const fileSize = uint8Array.length;
 
       // Extract text using pdf-parse v2 (PDFParse class).
       const PDFParse = await getPDFParseClass();
@@ -175,7 +179,7 @@ export class PdfExtractor {
       return {
         text: data.text,
         pageCount: data.total,
-        fileSize: uint8Array.length,
+        fileSize,
         extractionMethod: 'http',
       };
     } catch (error) {
