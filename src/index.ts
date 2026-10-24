@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
-// Install the stdio-safe console shim BEFORE any other import. Some
-// transitive deps (cheerio, playwright internals, undici) print to console at
-// module-load time; without this redirect they would corrupt the MCP JSON-RPC
-// frame stream on stdout.
-import { installStdioSafeConsoleShim } from './logger.js';
-installStdioSafeConsoleShim();
+// Install the stdio-safe console shim BEFORE any other module is evaluated.
+// Our own module-level singletons and some transitive deps print to console at
+// module-load time; without this redirect they corrupt the MCP JSON-RPC frame
+// stream on stdout. It MUST be a side-effect import listed first (imports are
+// hoisted, so a plain call statement here would run after server.js loaded).
+import './stdio-shim.js';
 
 import { WebSearchMCPServer } from './server.js';
 
