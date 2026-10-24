@@ -5,6 +5,9 @@
  * When multiple identical queries arrive simultaneously, only one makes the actual API call.
  */
 
+import { createHash } from 'node:crypto';
+import { requestContext } from './request-context.js';
+
 interface PendingRequest<T> {
   promise: Promise<T>;
   timestamp: number;
@@ -36,7 +39,20 @@ export class RequestDeduplicator {
    */
   private getDedupeKey(query: string, ...args: (string | number | boolean)[]): string {
     const normalized = this.normalizeQuery(query);
-    return `${normalized}:${args.join('|')}`;
+    return `${this.callerScope()}:${normalized}:${args.join('|')}`;
+  }
+
+  /**
+   * Scopes the key to the caller (2026-10-24). Without it, a call made with one
+   * caller's Serper key/GitHub token/tenant reused another caller's in-flight or
+   * just-finished result for the same query — seen live: a keyed search got the
+   * empty result of an unkeyed one moments earlier. Hashed, never the raw key.
+   */
+  private callerScope(): string {
+    const ctx = requestContext.getStore();
+    if (!ctx) return 'local';
+    const raw = [ctx.serperKey ?? '', ctx.githubToken ?? '', ctx.tenantId ?? '', ctx.workspace ?? ''].join('\u0000');
+    return createHash('sha256').update(raw).digest('hex').slice(0, 16);
   }
 
   /**
