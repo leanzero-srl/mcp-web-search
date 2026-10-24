@@ -1,0 +1,50 @@
+name: Integration (live web)
+
+# The integration suites call real websites, the GitHub API and (with a key) Serper, so they are NOT run on
+# every push/PR (third-party flakiness would block merges). They run daily and on demand, on GitHub-hosted
+# runners with NO secrets: search tests skip with "[SKIPPED: no SERPER_API_KEY ...]" in their names and GitHub
+# tests skip only on an anonymous rate-limit 403 (runner IPs share GitHub's 60 req/h anonymous quota).
+# The fuller run (Serper + GitHub token) is the workhorse's daily launchd job scripts/live-tests.sh; there is
+# deliberately no self-hosted runner for this PUBLIC repo (fork PRs would run code on the workhorse).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '40 4 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers (the extractor's browser fallback)
+        run: npx playwright install --with-deps chromium firefox webkit
+
+      - name: Build (the stdio suites spawn dist/index.js)
+        run: npm run build
+
+      - name: Integration tests (one file at a time)
+        env:
+          RUN_STREAMING_TEST: '1'
+          MCP_TEST_LOG_DIR: ${{ runner.temp }}/server-logs
+        run: npx vitest run tests/integration --no-file-parallelism
+
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-logs
+          path: ${{ runner.temp }}/server-logs
