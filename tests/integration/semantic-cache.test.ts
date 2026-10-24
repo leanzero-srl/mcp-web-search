@@ -1,201 +1,36 @@
-// Shared console redirection setup
+/**
+ * Semantic cache. The separate `cached-web-search` tool these tests used to call
+ * was removed in e5d26a6 (13 -> 11 tools): the Upstash semantic cache now sits
+ * inside the search engine, and a hit shows as "Search engine: semantic-cache"
+ * in full-web-search's Status line. The cache only exists when
+ * UPSTASH_VECTOR_REST_URL / UPSTASH_VECTOR_REST_TOKEN are set, so the round
+ * trip skips (with the reason in its name) without them.
+ */
 import './setup.ts';
-
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { startStdioServer, callOk, HAS_SERPER, resultUrls, type Started } from './utils.js';
 
-describe('Semantic Cache Tests', () => {
-  let client: Client;
-  let transport: StdioClientTransport;
+const HAS_UPSTASH = !!(process.env.UPSTASH_VECTOR_REST_URL && process.env.UPSTASH_VECTOR_REST_TOKEN);
 
-  const testTimeout = 60000; // 60 seconds for semantic cache tests
+describe('Semantic cache (stdio, live)', () => {
+  let s: Started;
+  beforeAll(async () => { s = await startStdioServer('semantic-cache'); }, 120000);
+  afterAll(async () => { await s?.close(); });
 
-  beforeAll(async () => {
-    transport = new StdioClientTransport({
-      command: 'node',
-      args: ['dist/index.js'],
-      stdioBufferMaxSize: 1024 * 1024 * 50,
-    });
-
-    client = new Client({ name: 'semantic-cache-test-client', version: '1.0.0' });
-    
-    client.onerror = (error) => {
-      console.error('MCP Transport Error:', error);
-    };
-
-    await client.connect(transport);
-  }, 120000);
-
-  afterAll(async () => {
-    await client.close();
+  it('the removed cached-web-search tool stays removed (one search tool, cache built in)', async () => {
+    const { tools } = await s.client.listTools();
+    expect(tools.map((t) => t.name)).not.toContain('cached-web-search');
+    expect(tools.map((t) => t.name)).toContain('full-web-search');
   });
 
-  it('should execute cached-web-search successfully', async () => {
-    const query = 'semantic caching test';
-    
-    // First request - should miss cache
-    const result1 = await client.callTool({
-      name: 'cached-web-search',
-      arguments: {
-        query,
-        limit: 2,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result1.isError) {
-      throw new Error(`First call failed: ${JSON.stringify(result1.content)}`);
-    }
-
-    // Second request with same query - should hit cache
-    const result2 = await client.callTool({
-      name: 'cached-web-search',
-      arguments: {
-        query,
-        limit: 2,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result2.isError) {
-      throw new Error(`Second call failed: ${JSON.stringify(result2.content)}`);
-    }
-
-    // Both should return results
-    expect(Array.isArray(result1.content)).toBe(true);
-    expect(Array.isArray(result2.content)).toBe(true);
-  }, testTimeout * 2);
-
-  it('should handle semantically similar queries', async () => {
-    // First query
-    const result1 = await client.callTool({
-      name: 'cached-web-search',
-      arguments: {
-        query: 'TypeScript programming language',
-        limit: 2,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result1.isError) {
-      throw new Error(`First call failed: ${JSON.stringify(result1.content)}`);
-    }
-
-    // Similar query - may hit semantic cache
-    const result2 = await client.callTool({
-      name: 'cached-web-search',
-      arguments: {
-        query: 'TypeScript programming tutorial',
-        limit: 2,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result2.isError) {
-      throw new Error(`Second call failed: ${JSON.stringify(result2.content)}`);
-    }
-
-    // Should return results
-    expect(Array.isArray(result2.content)).toBe(true);
-  }, testTimeout * 2);
-
-  it('should handle cache expiration correctly', async () => {
-    const query = 'cache expiration test';
-    
-    // First request
-    await client.callTool({
-      name: 'cached-web-search',
-      arguments: {
-        query,
-        limit: 1,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    // Second request (should use cache)
-    const result2 = await client.callTool({
-      name: 'cached-web-search',
-      arguments: {
-        query,
-        limit: 1,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result2.isError) {
-      throw new Error(`Second call failed: ${JSON.stringify(result2.content)}`);
-    }
-
-    expect(Array.isArray(result2.content)).toBe(true);
-  }, testTimeout * 2);
-
-  it('should cache PDF extraction via web search', async () => {
-    const query = 'sample pdf document download';
-    
-    // First request
-    await client.callTool({
-      name: 'cached-web-search',
-      arguments: {
-        query,
-        limit: 1,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    // Second request - should use cache
-    const result2 = await client.callTool({
-      name: 'cached-web-search',
-      arguments: {
-        query,
-        limit: 1,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result2.isError) {
-      throw new Error(`Second call failed: ${JSON.stringify(result2.content)}`);
-    }
-
-    expect(Array.isArray(result2.content)).toBe(true);
-  }, testTimeout * 2);
-
-  it('should cache GitHub repository info via search', async () => {
-    const query = 'microsoft/TypeScript github repository';
-    
-    // First request
-    await client.callTool({
-      name: 'cached-web-search',
-      arguments: {
-        query,
-        limit: 1,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    // Second request - should use cache
-    const result2 = await client.callTool({
-      name: 'cached-web-search',
-      arguments: {
-        query,
-        limit: 1,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result2.isError) {
-      throw new Error(`Second call failed: ${JSON.stringify(result2.content)}`);
-    }
-
-    expect(Array.isArray(result2.content)).toBe(true);
-  }, testTimeout * 2);
-
-  it('should handle many cache requests gracefully', async () => {
-    // Make many requests to fill cache
-    for (let i = 0; i < 10; i++) {
-      try {
-        await client.callTool({
-          name: 'cached-web-search',
-          arguments: {
-            query: `cache limit test ${i}`,
-            limit: 1,
-          },
-        }, undefined, { timeout: testTimeout });
-      } catch (error) {
-        console.log(`Request ${i} error:`, error instanceof Error ? error.message : 'No error');
-      }
-    }
-    
-    // Server should handle cache size limits
-  }, testTimeout * 2);
+  const roundTrip = HAS_UPSTASH && HAS_SERPER ? it : it.skip;
+  const note = HAS_UPSTASH && HAS_SERPER ? '' : ' [SKIPPED: needs UPSTASH_VECTOR_REST_URL/TOKEN and SERPER_API_KEY]';
+  roundTrip('a repeated query is answered from the semantic cache with the same results' + note, async () => {
+    const query = `semantic cache probe ${new Date().toISOString().slice(0, 10)} typescript decorators`;
+    const first = await callOk(s.client, 'full-web-search', { query, limit: 2, includeContent: false });
+    expect(first).not.toContain('Search engine: semantic-cache');
+    const second = await callOk(s.client, 'full-web-search', { query, limit: 2, includeContent: false });
+    expect(second).toContain('Search engine: semantic-cache');
+    expect(resultUrls(second)).toEqual(resultUrls(first));
+  }, 180000);
 });

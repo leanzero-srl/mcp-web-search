@@ -1,204 +1,53 @@
-// Shared console redirection setup
+/**
+ * Error handling over stdio: each failure mode must come back as a tool error
+ * with a useful message, and the server must stay usable afterwards. The old
+ * version only logged whatever happened and asserted nothing.
+ */
 import './setup.ts';
-
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { startStdioServer, callTool, callOk, type Started } from './utils.js';
 
-describe('Error Handling Tests', () => {
-  let client: Client;
-  let transport: StdioClientTransport;
+describe('Error handling (stdio, live)', () => {
+  let s: Started;
+  beforeAll(async () => { s = await startStdioServer('error-handling'); }, 120000);
+  afterAll(async () => { await s?.close(); });
 
-  const testTimeout = 30000; // 30 seconds for error handling tests
-
-  beforeAll(async () => {
-    transport = new StdioClientTransport({
-      command: 'node',
-      args: ['dist/index.js'],
-      stdioBufferMaxSize: 1024 * 1024 * 50,
-    });
-
-    client = new Client({ name: 'error-handling-test-client', version: '1.0.0' });
-    
-    client.onerror = (error) => {
-      console.error('MCP Transport Error:', error);
-    };
-
-    await client.connect(transport);
-  }, 120000);
-
-  afterAll(async () => {
-    await client.close();
+  it('DNS failure is a tool error naming the lookup failure', async () => {
+    const r = await callTool(s.client, 'get-single-web-page-content', { url: 'https://this-domain-does-not-exist-12345.com/page.html' }, 30000);
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/ENOTFOUND|getaddrinfo/);
   });
 
-  it('should handle network timeout gracefully', async () => {
-    try {
-      // This test may or may not trigger a timeout depending on server implementation
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: 'timeout test',
-          limit: 1,
-        },
-      }, undefined, { timeout: 5000 }); // Short timeout
-      
-      // May succeed or timeout
-    } catch (error) {
-      console.log('Timeout error handled:', error instanceof Error ? error.message : 'Unknown error');
-    }
+  it('HTTP 404 is a tool error saying not found', async () => {
+    const r = await callTool(s.client, 'get-single-web-page-content', { url: 'https://example.com/definitely-missing-page-xyz' }, 30000);
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/404|not found/i);
   });
 
-  it('should handle invalid tool name gracefully', async () => {
-    try {
-      await client.callTool({
-        name: 'non-existent-tool-12345',
-        arguments: {},
-      }, undefined, { timeout: testTimeout });
-      
-      // Should return an error for non-existent tool
-    } catch (error) {
-      console.log('Expected error for invalid tool:', error instanceof Error ? error.message : 'Unknown error');
-    }
+  it('a missing GitHub repository is a tool error saying not found', async () => {
+    const r = await callTool(s.client, 'get-github-repo-content', { url: 'https://github.com/octocat/this-repo-does-not-exist-xyz' }, 30000);
+    expect(r.isError).toBe(true);
+    // Anonymous callers can be rate limited (403) before the 404 is reached; both are explicit refusals.
+    expect(r.text).toMatch(/404|not found|403|rate limit/i);
   });
 
-  it('should handle malformed JSON response gracefully', async () => {
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: 'malformed test',
-          limit: 1,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      // Server should return valid JSON
-    } catch (error) {
-      console.log('Malformed response error:', error instanceof Error ? error.message : 'Unknown error');
-    }
+  it('a client-side timeout rejects the call, and the server still answers the next one', async () => {
+    await expect(
+      s.client.callTool({ name: 'get-single-web-page-content', arguments: { url: 'https://en.wikipedia.org/wiki/Web_search_engine' } },
+        undefined, { timeout: 1 }),
+    ).rejects.toThrow(/timed out|timeout/i);
+    const text = await callOk(s.client, 'get-single-web-page-content', { url: 'https://example.com' }, 60000);
+    expect(text).toContain('This domain is for use in documentation examples');
   });
 
-  it('should handle rate limiting errors gracefully', async () => {
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: 'rate limit test',
-          limit: 1,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      // May succeed or return rate limit error
-    } catch (error) {
-      console.log('Rate limiting handled:', error instanceof Error ? error.message : 'No error');
-    }
-  });
-
-  it('should handle invalid URL gracefully', async () => {
-    try {
-      await client.callTool({
-        name: 'get-single-web-page-content',
-        arguments: {
-          url: 'https://this-domain-does-not-exist-12345.com/page.html',
-          maxContentLength: 1000,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      // Should handle DNS failure gracefully
-    } catch (error) {
-      console.log('DNS error handled:', error instanceof Error ? error.message : 'Unknown error');
-    }
-  });
-
-  it('should handle server shutdown gracefully', async () => {
-    // First verify server is running
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: 'server test',
-          limit: 1,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      // Server should be running
-    } catch (error) {
-      console.log('Server error:', error instanceof Error ? error.message : 'Unknown error');
-    }
-  });
-
-  it('should handle too many requests gracefully', async () => {
-    const promises = [];
-    
-    for (let i = 0; i < 10; i++) {
-      promises.push(
-        client.callTool({
-          name: 'get-web-search-summaries',
-          arguments: {
-            query: `concurrent error test ${i}`,
-            limit: 1,
-          },
-        }, undefined, { timeout: 5000 })
-      );
-    }
-    
-    const results = await Promise.allSettled(promises);
-    
-    // At least some should succeed
-    console.log(`Concurrent requests: ${results.length} total, ${results.filter(r => r.status === 'fulfilled').length} successful`);
-  }, testTimeout * 2);
-
-  it('should handle interrupted search gracefully', async () => {
-    const controller = new AbortController();
-    
-    try {
-      // Start a search
-      const promise = client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: 'interrupt test',
-          limit: 5,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      // Let it run for a bit then... we can't actually interrupt from client side
-      await promise;
-    } catch (error) {
-      console.log('Interrupt error handled:', error instanceof Error ? error.message : 'No error');
-    }
-  });
-
-  it('should return proper error message format', async () => {
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: '', // Empty query should cause an error
-          limit: -1,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      expect(true).toBe(false); // Should not reach here
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : '';
-      
-      // Error message should be descriptive
-      expect(errorMessage.length).toBeGreaterThan(0);
-    }
-  });
-
-  it('should handle unknown errors gracefully', async () => {
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: 'unknown error test',
-          limit: 1,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      // May succeed or fail with any error
-    } catch (error) {
-      console.log('Unknown error handled:', error instanceof Error ? error.message : 'No error');
-    }
+  it('one failing call in a parallel batch does not affect the others', async () => {
+    const [good, bad] = await Promise.all([
+      callTool(s.client, 'get-single-web-page-content', { url: 'https://example.com' }, 60000),
+      callTool(s.client, 'get-single-web-page-content', { url: 'https://nonexistent-domain-12345.com/page.html' }, 60000),
+    ]);
+    expect(good.isError).toBe(false);
+    expect(good.text).toContain('**Source:** https://example.com');
+    expect(bad.isError).toBe(true);
+    expect(bad.text).toMatch(/ENOTFOUND|getaddrinfo/);
   });
 });
