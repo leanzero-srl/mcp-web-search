@@ -1,31 +1,38 @@
+/**
+ * SearchEngine (in-process): the Serper path and the documented keyless
+ * behaviour. The old version ran without a key and asserted only that
+ * `results` was defined, so it could not fail.
+ */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { SearchEngine } from '../../src/search-engine.js';
+import { requestContext } from '../../src/request-context.js';
+import { searchIt } from './utils.js';
 
-describe('SearchEngine API Integration', () => {
+describe('SearchEngine (in-process)', () => {
   let engine: SearchEngine;
+  beforeAll(() => { engine = new SearchEngine(); });
+  afterAll(async () => { await engine.closeAll(); });
 
-  beforeAll(async () => {
-    engine = new SearchEngine();
-  });
+  searchIt('returns Serper results with titles and http URLs', async () => {
+    const r = await engine.search({ query: 'Model Context Protocol specification', numResults: 3 });
+    expect(r.engine).toBe('serper-only');
+    expect(r.results.length).toBeGreaterThanOrEqual(1);
+    for (const item of r.results) {
+      expect(item.url).toMatch(/^https?:\/\//);
+      expect(item.title.length).toBeGreaterThan(0);
+    }
+  }, 60000);
 
-  afterAll(async () => {
-    await engine.closeAll();
-  });
-
-  it('should attempt API search when SERPER_API_KEY is provided', async () => {
-    // We can't easily set env vars in a running process without side effects,
-    // but we can check if the logic handles missing keys gracefully.
-    const result = await engine.search({ query: 'test query', numResults: 1 });
-    
-    // Since SERPER_API_KEY is likely not set in the test environment, 
-    // it should fall back to other engines or return empty if all fail.
-    // We just want to ensure it doesn't crash.
-    expect(result).toBeDefined();
-    expect(result.results).toBeDefined();
-  }, 30000); // Increased timeout for fallback engines
-
-  it('should handle empty results gracefully', async () => {
-    const result = await engine.search({ query: '', numResults: 1 });
-    expect(result.results).toBeInstanceOf(Array);
-  }, 30000); // Increased timeout for fallback engines
+  it('without any Serper key it returns no results and names why (engine "serper-failed-no-fallback")', async () => {
+    const saved = process.env.SERPER_API_KEY;
+    delete process.env.SERPER_API_KEY;
+    try {
+      // An explicit empty per-request context: no caller key either.
+      const r = await requestContext.run({} as never, () => engine.search({ query: 'keyless probe ' + Date.now(), numResults: 1 }));
+      expect(r.results).toEqual([]);
+      expect(r.engine).toBe('serper-failed-no-fallback');
+    } finally {
+      if (saved !== undefined) process.env.SERPER_API_KEY = saved;
+    }
+  }, 30000);
 });

@@ -1,199 +1,43 @@
-// Shared console redirection setup
+/**
+ * Input validation over stdio. Every case asserts the SPECIFIC refusal; the old
+ * version wrapped `expect(true).toBe(false)` in try/catch, which caught its own
+ * assertion error, so every case passed whatever the server did.
+ * Hermetic except the one search case (skips without SERPER_API_KEY).
+ */
 import './setup.ts';
-
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { startStdioServer, callTool, callOk, searchIt, summaryItems, type Started } from './utils.js';
 
-describe('Input Validation Tests', () => {
-  let client: Client;
-  let transport: StdioClientTransport;
+describe('Input validation (stdio)', () => {
+  let s: Started;
+  beforeAll(async () => { s = await startStdioServer('input-validation'); }, 120000);
+  afterAll(async () => { await s?.close(); });
 
-  const testTimeout = 15000; // 15 seconds for validation tests
-
-  beforeAll(async () => {
-    transport = new StdioClientTransport({
-      command: 'node',
-      args: ['dist/index.js'],
-      stdioBufferMaxSize: 1024 * 1024 * 50,
+  const rejects = (name: string, tool: string, args: Record<string, unknown>, message: RegExp) =>
+    it(name, async () => {
+      const r = await callTool(s.client, tool, args, 15000);
+      expect(r.isError, `expected a tool error, got: ${r.text.slice(0, 200)}`).toBe(true);
+      expect(r.text).toMatch(message);
     });
 
-    client = new Client({ name: 'input-validation-test-client', version: '1.0.0' });
-    
-    client.onerror = (error) => {
-      console.error('MCP Transport Error:', error);
-    };
+  rejects('empty query', 'full-web-search', { query: '', limit: 5 }, /query is required/);
+  rejects('missing query', 'full-web-search', { limit: 5 }, /query|Required/i);
+  rejects('negative limit', 'full-web-search', { query: 'x', limit: -1 }, /Invalid limit: must be a number between 1 and 10/);
+  rejects('zero limit', 'full-web-search', { query: 'x', limit: 0 }, /Invalid limit: must be a number between 1 and 10/);
+  rejects('limit above 10', 'full-web-search', { query: 'x', limit: 10000 }, /Invalid limit: must be a number between 1 and 10/);
+  rejects('summaries limit above 10', 'get-web-search-summaries', { query: 'x', limit: 50 }, /limit/i);
+  rejects('not a URL', 'get-single-web-page-content', { url: 'not-a-valid-url-format' }, /Invalid url/);
+  rejects('ftp scheme', 'get-single-web-page-content', { url: 'ftp://invalid-scheme.com/file.pdf' }, /only http and https.*ssrf-blocked/);
+  rejects('file scheme', 'get-single-web-page-content', { url: 'file:///etc/passwd' }, /only http and https.*ssrf-blocked/);
+  rejects('loopback target', 'get-single-web-page-content', { url: 'http://127.0.0.1:1/' }, /ssrf-blocked/);
+  rejects('negative maxContentLength', 'get-single-web-page-content', { url: 'https://example.com', maxContentLength: -500 },
+    /greater than or equal to 0.*maxContentLength/);
+  rejects('fractional maxContentLength', 'get-pdf-content', { url: 'https://example.com/a.pdf', maxContentLength: 10.5 },
+    /integer.*maxContentLength|maxContentLength.*integer/i);
+  rejects('unknown tool', 'non-existent-tool-12345', {}, /not found/);
 
-    await client.connect(transport);
+  searchIt('accepts a query with quotes and parentheses and returns results', async () => {
+    const text = await callOk(s.client, 'get-web-search-summaries', { query: 'TypeScript "generics" tutorial (handbook)', limit: 2 });
+    expect(summaryItems(text).length).toBeGreaterThanOrEqual(1);
   }, 120000);
-
-  afterAll(async () => {
-    await client.close();
-  });
-
-  it('should reject empty query in web search', async () => {
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: '',
-          limit: 5,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      // Should not reach here
-      expect(true).toBe(false);
-    } catch (error) {
-      console.log('Expected error for empty query:', error instanceof Error ? error.message : 'Unknown error');
-    }
-  });
-
-  it('should reject negative limit value', async () => {
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: 'test query',
-          limit: -1,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      expect(true).toBe(false);
-    } catch (error) {
-      console.log('Expected error for negative limit:', error instanceof Error ? error.message : 'Unknown error');
-    }
-  });
-
-  it('should reject zero limit value', async () => {
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: 'test query',
-          limit: 0,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      expect(true).toBe(false);
-    } catch (error) {
-      console.log('Expected error for zero limit:', error instanceof Error ? error.message : 'Unknown error');
-    }
-  });
-
-  it('should reject extremely large limit value', async () => {
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: 'test query',
-          limit: 10000,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      // May either fail or return limited results
-    } catch (error) {
-      console.log('Expected behavior for large limit:', error instanceof Error ? error.message : 'No error');
-    }
-  });
-
-  it('should reject invalid URL format', async () => {
-    try {
-      await client.callTool({
-        name: 'get-single-web-page-content',
-        arguments: {
-          url: 'not-a-valid-url-format',
-          maxContentLength: 1000,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      expect(true).toBe(false);
-    } catch (error) {
-      console.log('Expected error for invalid URL:', error instanceof Error ? error.message : 'Unknown error');
-    }
-  });
-
-  it('should reject missing required parameter', async () => {
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          // Missing query
-          limit: 5,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      expect(true).toBe(false);
-    } catch (error) {
-      console.log('Expected error for missing parameter:', error instanceof Error ? error.message : 'Unknown error');
-    }
-  });
-
-  it('should accept valid query with special characters', async () => {
-    const result = await client.callTool({
-      name: 'get-web-search-summaries',
-      arguments: {
-        query: 'TypeScript "generics" tutorial (2024)',
-        limit: 2,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
-    }
-
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
-    // Should process the query with special characters
-    expect(textContent.length).toBeGreaterThan(0);
-  }, testTimeout);
-
-  it('should handle very long query string', async () => {
-    const longQuery = 'test '.repeat(100); // 500+ character query
-    
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: longQuery,
-          limit: 2,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      // Should either process or truncate the query
-    } catch (error) {
-      console.log('Expected behavior for long query:', error instanceof Error ? error.message : 'No error');
-    }
-  });
-
-  it('should validate URL scheme', async () => {
-    try {
-      await client.callTool({
-        name: 'get-single-web-page-content',
-        arguments: {
-          url: 'ftp://invalid-scheme.com/file.pdf',
-          maxContentLength: 1000,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      // Should reject invalid schemes
-    } catch (error) {
-      console.log('Expected error for invalid scheme:', error instanceof Error ? error.message : 'No error');
-    }
-  });
-
-  it('should validate maxContentLength parameter', async () => {
-    try {
-      await client.callTool({
-        name: 'get-single-web-page-content',
-        arguments: {
-          url: 'https://example.com',
-          maxContentLength: -500,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      expect(true).toBe(false);
-    } catch (error) {
-      console.log('Expected error for negative content length:', error instanceof Error ? error.message : 'Unknown error');
-    }
-  });
 });

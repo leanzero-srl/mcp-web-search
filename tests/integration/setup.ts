@@ -2,9 +2,10 @@
 // This must run before any other imports in tests
 
 function redirectConsoleMethod(method: string) {
-  const original = console[method];
+  const c = console as unknown as Record<string, (...args: unknown[]) => void>;
+  const original = c[method];
   if (typeof original === 'function') {
-    console[method] = (...args) => {
+    c[method] = (...args: unknown[]) => {
       const message = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)).join(' ');
       process.stderr.write(`[${method.toUpperCase()}] ${message}\n`);
     };
@@ -25,7 +26,7 @@ process.stdout.write = ((chunk: string | Buffer, encoding?: BufferEncoding | nul
   const text = typeof chunk === 'string' ? chunk : chunk.toString();
   // Only allow output that looks like MCP JSON-RPC (starts with { or [)
   if (text.trim().startsWith('{') || text.trim().startsWith('[')) {
-    return originalStdoutWrite.call(process.stdout, chunk, encoding);
+    return originalStdoutWrite.call(process.stdout, chunk, encoding ?? undefined);
   }
   // Everything else goes to stderr
   process.stderr.write(`[STDOUT_REDIRECTED] ${text}`);

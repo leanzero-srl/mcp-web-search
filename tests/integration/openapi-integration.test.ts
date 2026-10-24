@@ -1,126 +1,47 @@
-// Shared console redirection setup
+/**
+ * get-openapi-spec + the cache tools against the public Swagger Petstore spec.
+ * The old version never called get-openapi-spec (it ran web searches mentioning
+ * "openapi" and passed on any text). Uses a private CRAWL_CACHE_DIR so it never
+ * touches a developer's own cache.
+ */
 import './setup.ts';
-
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { startStdioServer, callOk, type Started } from './utils.js';
 
-describe('OpenAPI Integration Tests', () => {
-  let client: Client;
-  let transport: StdioClientTransport;
+const SPEC = 'https://petstore3.swagger.io/api/v3/openapi.json';
 
-  const testTimeout = 60000; // 60 seconds for OpenAPI extraction
+describe('OpenAPI extraction (stdio, live)', () => {
+  let s: Started;
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-openapi-it-'));
+  beforeAll(async () => { s = await startStdioServer('openapi', { CRAWL_CACHE_DIR: cacheDir }); }, 120000);
+  afterAll(async () => { await s?.close(); fs.rmSync(cacheDir, { recursive: true, force: true }); });
 
-  beforeAll(async () => {
-    transport = new StdioClientTransport({
-      command: 'node',
-      args: ['dist/index.js'],
-      stdioBufferMaxSize: 1024 * 1024 * 50,
-    });
-
-    client = new Client({ name: 'openapi-test-client', version: '1.0.0' });
-    
-    client.onerror = (error) => {
-      console.error('MCP Transport Error:', error);
-    };
-
-    await client.connect(transport);
-  }, 120000);
-
-  afterAll(async () => {
-    await client.close();
+  it('extracts the spec, indexes its endpoints and saves it to the cache dir', async () => {
+    const text = await callOk(s.client, 'get-openapi-spec', { url: SPEC });
+    expect(text).toContain('OpenAPI Specification Extracted Successfully');
+    expect(text).toContain('Swagger Petstore');
+    const total = Number(text.match(/\*\*Endpoints:\*\* (\d+) total/)?.[1]);
+    expect(total).toBeGreaterThanOrEqual(10);
+    expect(text).toMatch(/`GET \/pet\/\{petId\}`/);
+    const saved = fs.readdirSync(path.join(cacheDir, 'openapi'));
+    expect(saved.some((f) => f.startsWith('petstore3.swagger.io'))).toBe(true);
   });
 
-  it('should search for OpenAPI documentation on Swagger UI page', async () => {
-    const result = await client.callTool({
-      name: 'get-web-search-summaries',
-      arguments: {
-        query: 'swagger petstore openapi documentation site:swagger.io',
-        limit: 2,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
-    }
-
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-
-    // Should search for Swagger-related content
-    expect(textContent.length).toBeGreaterThan(50);
-  }, testTimeout);
-
-  it('should extract API documentation from GitHub pages', async () => {
-    const result = await client.callTool({
-      name: 'full-web-search',
-      arguments: {
-        query: 'github api rest documentation site:docs.github.com',
-        limit: 2,
-        includeContent: true,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
-    }
-
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
-    // Should extract documentation content
-    expect(textContent.length).toBeGreaterThan(100);
-  }, testTimeout);
-
-  it('should discover OpenAPI specs via search', async () => {
-    const result = await client.callTool({
-      name: 'get-web-search-summaries',
-      arguments: {
-        query: 'openapi specification swagger json site:swagger.io',
-        limit: 3,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
-    }
-
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
-    // Should return discovery results
-    expect(textContent.length).toBeGreaterThan(50);
-  }, testTimeout);
-
-  it('should handle non-OpenAPI website gracefully', async () => {
-    try {
-      await client.callTool({
-        name: 'get-web-search-summaries',
-        arguments: {
-          query: 'example.com documentation',
-          limit: 2,
-        },
-      }, undefined, { timeout: testTimeout });
-      
-      // Should return results for the search
-    } catch (error) {
-      console.log('Expected behavior for non-OpenAPI site:', error instanceof Error ? error.message : 'No error');
-    }
+  it('filters the endpoint index by method and path', async () => {
+    const text = await callOk(s.client, 'get-openapi-spec', { url: SPEC, method: 'DELETE', pathFilter: '/store' });
+    const listed = [...text.matchAll(/^- `([A-Z]+) (\S+)`/gm)].map((m) => `${m[1]} ${m[2]}`);
+    expect(listed).toEqual(['DELETE /store/order/{orderId}']);
   });
 
-  it('should extract OpenAPI spec info from web pages', async () => {
-    const result = await client.callTool({
-      name: 'get-single-web-page-content',
-      arguments: {
-        url: 'https://swagger.io/docs/',
-        maxContentLength: 3000,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
-    }
-
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-
-    // Should return OpenAPI spec content
-    expect(textContent.length).toBeGreaterThan(50);
-  }, testTimeout);
+  it('list-cached-documents shows the saved spec and read-cached-document returns it', async () => {
+    const list = await callOk(s.client, 'list-cached-documents', { category: 'openapi' });
+    const file = list.match(/\| (petstore3\.swagger\.io[^|\s]+\.json) \|/)?.[1];
+    expect(file, list).toBeTruthy();
+    const doc = await callOk(s.client, 'read-cached-document', { fileName: file!, maxBytes: 5000 });
+    expect(doc).toContain('"openapi"');
+    expect(doc).toContain('Swagger Petstore');
+  });
 });

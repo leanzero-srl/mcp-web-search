@@ -1,223 +1,44 @@
-// Shared console redirection setup
+/**
+ * Concurrency integrity: parallel calls each get THEIR OWN answer (the request
+ * deduplicator keys must never cross results). Kept small on purpose — this
+ * runs daily against real sites; the old version fired 15-way search bursts and
+ * asserted only that something resolved.
+ */
 import './setup.ts';
-
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { startStdioServer, callOk, searchIt, summaryItems, type Started } from './utils.js';
 
-describe('Parallel Search Tests', () => {
-  let client: Client;
-  let transport: StdioClientTransport;
+describe('Parallel calls (stdio, live)', () => {
+  let s: Started;
+  beforeAll(async () => { s = await startStdioServer('parallel'); }, 120000);
+  afterAll(async () => { await s?.close(); });
 
-  const testTimeout = 60000; // 60 seconds for parallel search tests
-
-  beforeAll(async () => {
-    transport = new StdioClientTransport({
-      command: 'node',
-      args: ['dist/index.js'],
-      stdioBufferMaxSize: 1024 * 1024 * 50,
+  it('three different pages fetched in parallel each return their own content', async () => {
+    const pages = [
+      ['https://en.wikipedia.org/wiki/TypeScript', 'TypeScript'],
+      ['https://en.wikipedia.org/wiki/Rust_(programming_language)', 'Rust'],
+      ['https://example.com', 'This domain is for use in documentation examples'],
+    ] as const;
+    const texts = await Promise.all(pages.map(([url]) => callOk(s.client, 'get-single-web-page-content', { url, maxContentLength: 3000 })));
+    texts.forEach((t, i) => {
+      expect(t).toContain(`**Source:** ${pages[i][0]}`);
+      expect(t).toContain(pages[i][1]);
     });
-
-    client = new Client({ name: 'parallel-search-test-client', version: '1.0.0' });
-    
-    client.onerror = (error) => {
-      console.error('MCP Transport Error:', error);
-    };
-
-    await client.connect(transport);
   }, 120000);
 
-  afterAll(async () => {
-    await client.close();
-  });
+  it('the same page requested twice at once is served to both callers', async () => {
+    const [a, b] = await Promise.all([1, 2].map(() =>
+      callOk(s.client, 'get-single-web-page-content', { url: 'https://en.wikipedia.org/wiki/Node.js', maxContentLength: 2000 })));
+    expect(a).toContain('**Source:** https://en.wikipedia.org/wiki/Node.js');
+    expect(b).toContain('**Source:** https://en.wikipedia.org/wiki/Node.js');
+  }, 120000);
 
-  it('should execute parallel web searches', async () => {
-    const queries = ['TypeScript', 'JavaScript', 'Node.js'];
-    const promises = queries.map(query =>
-      client.callTool({
-        name: 'get-web-search-summaries',
-        arguments: {
-          query,
-          limit: 2,
-        },
-      }, undefined, { timeout: testTimeout })
-    );
-    
-    const results = await Promise.allSettled(promises);
-    
-    // At least one should succeed
-    const successful = results.filter(r => r.status === 'fulfilled');
-    expect(successful.length).toBeGreaterThan(0);
-  }, testTimeout * 2);
-
-  it('should execute concurrent PDF extractions', async () => {
-    try {
-      const promises = [
-        client.callTool({
-          name: 'get-pdf-content',
-          arguments: {
-            url: 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf',
-            maxContentLength: 500,
-          },
-        }, undefined, { timeout: testTimeout }),
-        client.callTool({
-          name: 'get-pdf-content',
-          arguments: {
-            url: 'https://www.africau.edu/images/default/sample.pdf',
-            maxContentLength: 500,
-          },
-        }, undefined, { timeout: testTimeout }),
-      ];
-      
-      const results = await Promise.allSettled(promises);
-      
-      // At least one should succeed
-      const successful = results.filter(r => r.status === 'fulfilled');
-      expect(successful.length).toBeGreaterThan(0);
-    } catch (error) {
-      console.log('Concurrent PDF extraction:', error instanceof Error ? error.message : 'No error');
-    }
-  }, testTimeout * 2);
-
-  it('should handle parallel GitHub extractions', async () => {
-    const repos = [
-      'microsoft/TypeScript',
-      'facebook/react',
-    ];
-
-    const promises = repos.map(repo =>
-      client.callTool({
-        name: 'get-github-repo-content',
-        arguments: {
-          url: `https://github.com/${repo}`,
-          maxFiles: 3,
-        },
-      }, undefined, { timeout: testTimeout })
-    );
-
-    const results = await Promise.allSettled(promises);
-
-    // At least one should succeed
-    const successful = results.filter(r => r.status === 'fulfilled');
-    expect(successful.length).toBeGreaterThan(0);
-  }, testTimeout * 2);
-
-  it('should execute mixed search types in parallel', async () => {
-    const mixedPromises = [
-      client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: 'TypeScript MCP',
-          limit: 1,
-        },
-      }, undefined, { timeout: testTimeout }),
-      client.callTool({
-        name: 'get-single-web-page-content',
-        arguments: {
-          url: 'https://example.com',
-          maxContentLength: 500,
-        },
-      }, undefined, { timeout: testTimeout }),
-    ];
-    
-    const results = await Promise.allSettled(mixedPromises);
-    
-    // At least one should succeed
-    const successful = results.filter(r => r.status === 'fulfilled');
-    expect(successful.length).toBeGreaterThan(0);
-  }, testTimeout * 2);
-
-  it('should scale parallel searches with timeout management', async () => {
-    const promises = [];
-    
-    for (let i = 0; i < 8; i++) {
-      promises.push(
-        client.callTool({
-          name: 'get-web-search-summaries',
-          arguments: {
-            query: `parallel test ${i}`,
-            limit: 1,
-          },
-        }, undefined, { timeout: 15000 })
-      );
-    }
-    
-    const results = await Promise.allSettled(promises);
-    
-    // At least some should succeed
-    const successful = results.filter(r => r.status === 'fulfilled');
-    console.log(`Parallel scaling: ${successful.length}/${promises.length} succeeded`);
-  }, testTimeout * 4);
-
-  it('should handle parallel search with error recovery', async () => {
-    const promises = [
-      client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: 'valid query for parallel test',
-          limit: 1,
-        },
-      }, undefined, { timeout: testTimeout }),
-      client.callTool({
-        name: 'get-single-web-page-content',
-        arguments: {
-          url: 'https://nonexistent-domain-12345.com/page.html',
-          maxContentLength: 500,
-        },
-      }, undefined, { timeout: 5000 }), // This one should fail
-    ];
-    
-    const results = await Promise.allSettled(promises);
-    
-    // First should succeed, second may fail but shouldn't crash client
-    console.log(`Parallel error recovery: ${results.length} total`);
-    
-    const successful = results.filter(r => r.status === 'fulfilled');
-    expect(successful.length).toBeGreaterThan(0);
-  }, testTimeout * 2);
-
-  it('should maintain result integrity in parallel searches', async () => {
-    const queries = ['MCP', 'protocol', 'server'];
-    const promises = queries.map(query =>
-      client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query,
-          limit: 2,
-        },
-      }, undefined, { timeout: testTimeout })
-    );
-    
-    const results = await Promise.allSettled(promises);
-    
-    // Verify each result is independent
-    results.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
-        expect(Array.isArray(result.value.content)).toBe(true);
-      }
+  searchIt('three searches in parallel each return results for their own query', async () => {
+    const queries = ['SQLite WAL mode', 'Redis streams consumer groups', 'nginx reverse proxy websocket'];
+    const texts = await Promise.all(queries.map((query) => callOk(s.client, 'get-web-search-summaries', { query, limit: 2 }, 120000)));
+    texts.forEach((t, i) => {
+      expect(t).toContain(`Search summaries for "${queries[i]}"`);
+      expect(summaryItems(t).length).toBeGreaterThanOrEqual(1);
     });
-  }, testTimeout * 2);
-
-  it('should handle high concurrency stress test', async () => {
-    const promises = [];
-    
-    // Many concurrent requests
-    for (let i = 0; i < 15; i++) {
-      promises.push(
-        client.callTool({
-          name: 'get-web-search-summaries',
-          arguments: {
-            query: `stress test ${i}`,
-            limit: 1,
-          },
-        }, undefined, { timeout: 20000 })
-      );
-    }
-    
-    const results = await Promise.allSettled(promises);
-    
-    // Even under stress, at least some should complete
-    const successful = results.filter(r => r.status === 'fulfilled');
-    console.log(`Stress test: ${successful.length}/${promises.length} succeeded`);
-  }, testTimeout * 4);
+  }, 150000);
 });

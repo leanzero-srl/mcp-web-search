@@ -1,198 +1,74 @@
-import './setup.ts'; // Redirect console.log to stderr first
-
+/**
+ * Core tools over stdio, against the live web. See ./utils.ts for the rules
+ * (search tests skip with the reason in their name when SERPER_API_KEY is absent).
+ */
+import './setup.ts';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { startStdioServer, callOk, callTool, searchIt, resultUrls, summaryItems, type Started } from './utils.js';
 
-// MCP SDK callTool signature: callTool(params, resultSchema?, options?)
-// When passing only 2 args where second is an object with timeout, it's treated as resultSchema!
-// Solution: use default schema (pass undefined explicitly) and pass options as third arg
+const EXPECTED_TOOLS = [
+  'full-web-search', 'get-web-search-summaries', 'get-single-web-page-content', 'research_and_save_to_markdown',
+  'get-website-sitemap', 'get-github-repo-content', 'get-openapi-spec', 'progressive-web-search', 'get-pdf-content',
+  'list-cached-documents', 'read-cached-document',
+];
 
-// Check if Playwright browsers are installed
-async function checkPlaywrightAvailability(): Promise<boolean> {
-  try {
-    const playwright = await import('playwright');
-    // Try to launch a browser to verify it works
-    await playwright.chromium.launch({ headless: true, timeout: 5000 });
-    return true;
-  } catch (error) {
-    return false;
-  }
-}
+describe('MCP tools over stdio (live)', () => {
+  let s: Started;
+  beforeAll(async () => { s = await startStdioServer('mcp-tools'); }, 120000);
+  afterAll(async () => { await s?.close(); });
 
-let browsersAvailable = false;
-
-describe('MCP Integration Tests - Real Tool Execution', () => {
-  let client: Client;
-  let transport: StdioClientTransport;
-
-  const testTimeout = 90000; // 90 seconds for web search
-
-  beforeAll(async () => {
-    // Check for Playwright browser availability at startup
-    browsersAvailable = await checkPlaywrightAvailability();
-    
-    if (!browsersAvailable) {
-      console.warn('Warning: Playwright browsers not available. Some integration tests will be skipped.');
-    }
-    
-    // Run server directly - MCP protocol messages will be read from stdout
-    transport = new StdioClientTransport({
-      command: 'node',
-      args: ['dist/index.js'],
-      // Buffer size for large responses (in bytes)
-      stdioBufferMaxSize: 1024 * 1024 * 50, // 50MB
-    });
-
-    client = new Client({ name: 'integration-test-client', version: '1.0.0' });
-    
-    // Set up error handlers
-    client.onerror = (error) => {
-      console.error('MCP Transport Error:', error);
-    };
-
-    await client.connect(transport);
-  }, 120000); // 120 second timeout for beforeAll hook
-
-  afterAll(async () => {
-    await client.close(); // Graceful shutdown
+  it('lists exactly the 11 shipped tools (cached-web-search was folded into full-web-search in e5d26a6)', async () => {
+    const { tools } = await s.client.listTools();
+    expect(tools.map((t) => t.name).sort()).toEqual([...EXPECTED_TOOLS].sort());
   });
 
-  it('should execute full-web-search with real web requests', async () => {
-    // Use undefined for resultSchema (default) and pass options as third arg
-    const result = await client.callTool({
-      name: 'full-web-search',
-      arguments: {
-        query: 'TypeScript MCP server documentation',
-        limit: 2,
-        includeContent: true,
-      },
-    }, undefined, { timeout: testTimeout });
+  searchIt('full-web-search returns real results with extracted content', async () => {
+    const text = await callOk(s.client, 'full-web-search', { query: 'TypeScript handbook generics', limit: 2, includeContent: true });
+    const urls = resultUrls(text);
+    expect(urls.length).toBeGreaterThanOrEqual(1);
+    expect(urls.length).toBeLessThanOrEqual(2);
+    expect(text).toMatch(/Search completed for ".*" with [1-9]\d* results/);
+    expect(text.toLowerCase()).toContain('typescript');
+  }, 120000);
 
-    // Check for tool-level errors
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
+  searchIt('get-web-search-summaries returns titled results with http URLs and no page content', async () => {
+    const text = await callOk(s.client, 'get-web-search-summaries', { query: 'Node.js release schedule', limit: 3 });
+    const items = summaryItems(text);
+    expect(items.length).toBeGreaterThanOrEqual(1);
+    expect(items.length).toBeLessThanOrEqual(3);
+    for (const item of items) {
+      expect(item.url).toMatch(/^https?:\/\//);
+      expect(item.title.length).toBeGreaterThan(0);
     }
+    expect(text).not.toContain('Full Content');
+  }, 120000);
 
-    // Verify response structure
-    expect(Array.isArray(result.content)).toBe(true);
-    
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
-    // Verify actual search content was returned
-    expect(textContent).toContain('TypeScript');
-    expect(textContent).toContain('MCP');
-  }, testTimeout);
+  searchIt('progressive-web-search returns ranked results within the limit', async () => {
+    const text = await callOk(s.client, 'progressive-web-search', { query: 'vitest snapshot testing', maxDepth: 2, limit: 3 });
+    const urls = resultUrls(text);
+    expect(urls.length).toBeGreaterThanOrEqual(1);
+    expect(urls.length).toBeLessThanOrEqual(3);
+    expect(text).toMatch(/Relevance Score: \d/);
+  }, 150000);
 
-  it('should execute get-web-search-summaries without content extraction', async () => {
-    // Use undefined for resultSchema (default) and pass options as third arg
-    const result = await client.callTool({
-      name: 'get-web-search-summaries',
-      arguments: {
-        query: 'AI news today',
-        limit: 3,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
-    }
-
-    expect(Array.isArray(result.content)).toBe(true);
-    
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    expect(textContent).toContain('AI');
-  }, testTimeout);
-
-  // Browser-dependent test - skip if browsers unavailable
-  (browsersAvailable ? it : it.skip)('should extract content from a single webpage', async () => {
-    // Use undefined for resultSchema (default) and pass options as third arg
-    const result = await client.callTool({
-      name: 'get-single-web-page-content',
-      arguments: {
-        url: 'https://en.wikipedia.org/wiki/TypeScript',
-        maxContentLength: 2000,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
-    }
-
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    expect(textContent).toContain('TypeScript');
-  }, testTimeout);
-
-  it('should handle tool errors gracefully with invalid input', async () => {
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: '', // Empty query should fail
-          limit: -1, // Invalid limit
-        },
-      }, undefined, { timeout: 5000 });
-      
-      expect(true).toBe(false); // Should not reach here
-    } catch (error) {
-      console.log('Expected error occurred:', error instanceof Error ? error.message : 'Unknown error');
-    }
+  it('get-single-web-page-content extracts the article text of a real page', async () => {
+    const text = await callOk(s.client, 'get-single-web-page-content', { url: 'https://en.wikipedia.org/wiki/TypeScript' });
+    expect(text).toContain('**Source:** https://en.wikipedia.org/wiki/TypeScript');
+    expect(text).toContain('Microsoft');
+    expect(text).toMatch(/superset of JavaScript|static typing/i);
+    const words = Number(text.match(/\*\*Words:\*\* (\d+)/)?.[1]);
+    expect(words).toBeGreaterThan(1000);
   });
 
-  // Browser-dependent test - skip if browsers unavailable
-  (browsersAvailable ? it : it.skip)('should execute progressive-web-search with expansion', async () => {
-    // Use undefined for resultSchema (default) and pass options as third arg
-    const result = await client.callTool({
-      name: 'progressive-web-search',
-      arguments: {
-        query: 'best coding tools',
-        maxDepth: 2,
-        limit: 3,
-      },
-    }, undefined, { timeout: testTimeout });
+  it('get-single-web-page-content returns visible text only — no CSS/JS (example.com injects a <style> into <body>)', async () => {
+    const text = await callOk(s.client, 'get-single-web-page-content', { url: 'https://example.com' });
+    expect(text).toContain('This domain is for use in documentation examples');
+    expect(text).not.toMatch(/\{\s*display\s*:|margin:\s*-?\d|function\s*\(/);
+  });
 
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
-    }
-
-    expect(Array.isArray(result.content)).toBe(true);
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    expect(textContent).toContain('best');
-  }, testTimeout);
-
-  // Browser-dependent test - skip if browsers unavailable
-  (browsersAvailable ? it : it.skip)('should execute cached-web-search and use cache on second call', async () => {
-    const query = 'MCP testing framework';
-    
-    // First call - should miss cache
-    const result1 = await client.callTool({
-      name: 'cached-web-search',
-      arguments: {
-        query,
-        limit: 2,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result1.isError) {
-      throw new Error(`First tool execution failed: ${JSON.stringify(result1.content)}`);
-    }
-
-    // Second call with same query - should hit cache
-    const result2 = await client.callTool({
-      name: 'cached-web-search',
-      arguments: {
-        query,
-        limit: 2,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result2.isError) {
-      throw new Error(`Second tool execution failed: ${JSON.stringify(result2.content)}`);
-    }
-
-    // Both should return results
-    expect(result1.content.length).toBeGreaterThan(0);
-    expect(result2.content.length).toBeGreaterThan(0);
-  }, testTimeout * 2);
-
+  it('a malformed call is rejected with a tool error naming the problem', async () => {
+    const r = await callTool(s.client, 'full-web-search', { query: '', limit: -1 });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/query is required|Invalid limit/);
+  });
 });

@@ -1,132 +1,75 @@
-// Shared console redirection setup
+/**
+ * get-github-repo-content against the real GitHub API (anonymous unless
+ * GITHUB_TOKEN is set; see utils.ts for the rate-limit skip). The old version
+ * never called this tool at all — it ran web searches with "github" in the
+ * query and passed on any text longer than 50 characters.
+ */
 import './setup.ts';
-
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { startStdioServer, callTool, callOk, searchIt, resultUrls, skipIfAnonymousGithubRateLimit, type Started } from './utils.js';
 
-// MCP SDK callTool signature: callTool(params, resultSchema?, options?)
-// When passing only 2 args where second is an object with timeout, it's treated as resultSchema!
-// Solution: use default schema (pass undefined explicitly) and pass options as third arg
+describe('GitHub repository tool (stdio, live)', () => {
+  let s: Started;
+  beforeAll(async () => { s = await startStdioServer('github'); }, 120000);
+  afterAll(async () => { await s?.close(); });
 
-describe('GitHub Integration Tests', () => {
-  let client: Client;
-  let transport: StdioClientTransport;
+  it('crawl mode returns the README of a public repository', async (ctx) => {
+    const r = await callTool(s.client, 'get-github-repo-content', { url: 'https://github.com/octocat/Hello-World' }, 60000);
+    skipIfAnonymousGithubRateLimit(ctx, r);
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain('**Repository:** octocat/Hello-World');
+    expect(r.text).toContain('Hello World!');
+  });
 
-  const testTimeout = 60000; // 60 seconds for GitHub API calls
-
-  beforeAll(async () => {
-    // Run server directly - MCP protocol messages will be read from stdout
-    transport = new StdioClientTransport({
-      command: 'node',
-      args: ['dist/index.js'],
-      stdioBufferMaxSize: 1024 * 1024 * 50, // 50MB buffer for large responses
-    });
-
-    client = new Client({ name: 'github-test-client', version: '1.0.0' });
-    
-    // Set up error handlers
-    client.onerror = (error) => {
-      console.error('MCP Transport Error:', error);
-    };
-
-    await client.connect(transport);
+  it('crawl mode caps the number of files at maxFiles', async (ctx) => {
+    const r = await callTool(s.client, 'get-github-repo-content', { url: 'https://github.com/microsoft/TypeScript', maxFiles: 5 }, 90000);
+    skipIfAnonymousGithubRateLimit(ctx, r);
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain('# TypeScript');
+    const n = Number(r.text.match(/\*\*Files \((\d+), previewLength=/)?.[1] ?? 0);
+    expect(n).toBeGreaterThanOrEqual(1);
+    expect(n).toBeLessThanOrEqual(5);
   }, 120000);
 
-  afterAll(async () => {
-    await client.close();
+  it('list mode returns the top-level directories and files', async (ctx) => {
+    const r = await callTool(s.client, 'get-github-repo-content', { url: 'https://github.com/microsoft/TypeScript', mode: 'list' }, 60000);
+    skipIfAnonymousGithubRateLimit(ctx, r);
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain('**Directory listing:**');
+    expect(r.text).toContain('README.md');
+    expect(r.text).toContain('package.json');
   });
 
-  it('should extract README from a public GitHub repository', async () => {
-    const result = await client.callTool({
-      name: 'full-web-search',
-      arguments: {
-        query: 'microsoft/TypeScript README github',
-        limit: 2,
-        includeContent: true,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
-    }
-
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
-    // Verify we got README content
-    expect(textContent.length).toBeGreaterThan(100);
-  }, testTimeout);
-
-  it('should handle invalid GitHub URL gracefully', async () => {
-    try {
-      await client.callTool({
-        name: 'full-web-search',
-        arguments: {
-          query: 'invalid-user/invalid-repo-12345 readme',
-          limit: 1,
-        },
-      }, undefined, { timeout: 10000 });
-      
-      // Should return results (may be empty)
-    } catch (error) {
-      console.log('Expected error for invalid repo:', error instanceof Error ? error.message : 'Unknown error');
-    }
+  it('file mode returns one file in full', async (ctx) => {
+    const r = await callTool(s.client, 'get-github-repo-content',
+      { url: 'https://github.com/microsoft/TypeScript', mode: 'file', path: 'README.md' }, 60000);
+    skipIfAnonymousGithubRateLimit(ctx, r);
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain('**File:** microsoft/TypeScript/README.md');
+    expect(r.text).toContain('# TypeScript');
   });
 
-  it('should handle GitHub URL with branch specified', async () => {
-    const result = await client.callTool({
-      name: 'full-web-search',
-      arguments: {
-        query: 'microsoft/TypeScript main readme github',
-        limit: 2,
-      },
-    }, undefined, { timeout: testTimeout });
+  it('a repository that does not exist is a "not found" tool error', async (ctx) => {
+    const r = await callTool(s.client, 'get-github-repo-content', { url: 'https://github.com/octocat/this-repo-does-not-exist-xyz' }, 60000);
+    skipIfAnonymousGithubRateLimit(ctx, r);
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/404|not found/i);
+  });
 
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
-    }
+  it('two repositories fetched in parallel each come back with their own README', async (ctx) => {
+    const [a, b] = await Promise.all([
+      callTool(s.client, 'get-github-repo-content', { url: 'https://github.com/octocat/Hello-World', maxFiles: 2 }, 90000),
+      callTool(s.client, 'get-github-repo-content', { url: 'https://github.com/octocat/Spoon-Knife', maxFiles: 2 }, 90000),
+    ]);
+    skipIfAnonymousGithubRateLimit(ctx, a);
+    skipIfAnonymousGithubRateLimit(ctx, b);
+    expect(a.text).toContain('**Repository:** octocat/Hello-World');
+    expect(b.text).toContain('**Repository:** octocat/Spoon-Knife');
+    expect(a.text).not.toContain('Spoon-Knife');
+  }, 120000);
 
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
-    // Should return content
-    expect(textContent.length).toBeGreaterThan(50);
-  }, testTimeout);
-
-  it('should extract repository information from GitHub search', async () => {
-    const result = await client.callTool({
-      name: 'get-web-search-summaries',
-      arguments: {
-        query: 'facebook/react github stars',
-        limit: 3,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
-    }
-
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
-    // Verify we got repository info
-    expect(textContent.length).toBeGreaterThan(50);
-  }, testTimeout);
-
-  it('should search GitHub repositories with content extraction', async () => {
-    const result = await client.callTool({
-      name: 'full-web-search',
-      arguments: {
-        query: 'microsoft/TypeScript repository github typescript',
-        limit: 2,
-        includeContent: true,
-      },
-    }, undefined, { timeout: testTimeout });
-
-    if (result.isError) {
-      throw new Error(`Tool execution failed: ${JSON.stringify(result.content)}`);
-    }
-
-    const textContent = result.content.find(c => c.type === 'text')?.text || '';
-    
-    expect(textContent.length).toBeGreaterThan(100);
-  }, testTimeout);
+  searchIt('a web search for a repository finds its github.com page', async () => {
+    const text = await callOk(s.client, 'full-web-search', { query: 'microsoft TypeScript github repository', limit: 3, includeContent: false });
+    expect(resultUrls(text).some((u) => /github\.com\/microsoft\/TypeScript/i.test(u))).toBe(true);
+  }, 120000);
 });
