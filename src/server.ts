@@ -35,6 +35,9 @@ class McpError extends Error {
 }
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+// zod 4 (2026-10-25, GHSA-mrhx-c7xc-m3w5 has no 3.x fix). Refusal wording is pinned in the schemas below
+// ('Invalid url', 'maxContentLength must be ...') because zod 4's default messages differ from 3's and
+// tests/integration/input-validation.test.ts asserts the text a client sees.
 import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -339,7 +342,7 @@ export class WebSearchMCPServer {
         query: z.string().describe('Search query to execute (recommended for comprehensive research)'),
         limit: z.number().optional().default(5).describe('Number of results to return with full content (1-10)'),
         includeContent: z.boolean().optional().default(true).describe('Whether to fetch full page content (default: true)'),
-        maxContentLength: z.number().int().nonnegative().optional().describe('Maximum characters per result content (0 = no limit). Usually not needed - content length is automatically optimized.'),
+        maxContentLength: z.number().int('maxContentLength must be an integer').nonnegative('maxContentLength must be greater than or equal to 0').optional().describe('Maximum characters per result content (0 = no limit). Usually not needed - content length is automatically optimized.'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: full-web-search`);
@@ -519,8 +522,8 @@ export class WebSearchMCPServer {
       'get-single-web-page-content',
       'Extract and return the full content from a single web page URL. This tool follows a provided URL and extracts the main page content. Useful for getting detailed content from a specific webpage without performing a search.',
       {
-        url: z.string().url().describe('The URL of the web page to extract content from'),
-        maxContentLength: z.number().int().nonnegative().optional().describe('Maximum characters for the extracted content (0 = no limit). Usually not needed - content length is automatically optimized.'),
+        url: z.string().url('Invalid url').describe('The URL of the web page to extract content from'),
+        maxContentLength: z.number().int('maxContentLength must be an integer').nonnegative('maxContentLength must be greater than or equal to 0').optional().describe('Maximum characters for the extracted content (0 = no limit). Usually not needed - content length is automatically optimized.'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-single-web-page-content`);
@@ -772,8 +775,8 @@ export class WebSearchMCPServer {
       'research_and_save_to_markdown',
       'Research web pages and save their content, research digest (entities, claims, terms), and source information into structured markdown files in the /docs/research-output directory for future reference. Supports batch research, content sanitization, quality scoring, and auto-cleanup of old files.',
       {
-        url: z.union([z.string().url(), z.array(z.string().url())]).describe('The URL of the web page(s) to research and save. Can be a single URL or an array of URLs for batch processing.'),
-        maxContentLength: z.number().int().nonnegative().optional().describe('Maximum characters per result content (0 = no limit)'),
+        url: z.union([z.string().url('Invalid url'), z.array(z.string().url('Invalid url'))]).describe('The URL of the web page(s) to research and save. Can be a single URL or an array of URLs for batch processing.'),
+        maxContentLength: z.number().int('maxContentLength must be an integer').nonnegative('maxContentLength must be greater than or equal to 0').optional().describe('Maximum characters per result content (0 = no limit)'),
         maxFiles: z.number().optional().default(50).describe('Maximum number of research files to keep. Oldest files are auto-deleted when limit is reached.'),
         filenamePrefix: z.string().optional().describe('Custom prefix for the output filename (e.g., "my-research" creates "my-research-2026-01-01-...")'),
         template: z.string().optional().describe('Custom markdown template for the research file. Use placeholders: {title}, {url}, {timestamp}, {wordCount}, {readingTime}, {qualityScore}, {entities}, {claims}, {keyTerms}, {content}. If not provided, default template is used.'),
@@ -1094,7 +1097,7 @@ export class WebSearchMCPServer {
       'get-website-sitemap',
       'Read a website\'s sitemap.xml and (optionally) filter it by keywords. With `extractTopMatching` set, this also fetches content for the top-N matched URLs in the same call — collapsing the typical sitemap → filter → extract chain into one round-trip. Recommended first step when you have a specific domain URL and want to find high-value pages on it.',
       {
-        url: z.string().url().describe('The base URL of the website (e.g., https://example.com).'),
+        url: z.string().url('Invalid url').describe('The base URL of the website (e.g., https://example.com).'),
         keywords: z.array(z.string()).optional().describe('Optional. When provided, URLs are scored by case-insensitive keyword count and only matches are returned, sorted best-first.'),
         offset: z.number().optional().default(0).describe('Starting index for pagination (default: 0).'),
         limit: z.number().optional().default(100).describe('Max URLs returned per page. Without keywords: default 100, max 500. With keywords: default 20, max 200.'),
@@ -1257,7 +1260,7 @@ export class WebSearchMCPServer {
       'get-github-repo-content',
       'Inspect a GitHub repository in three modes: `crawl` (default — README + recursive code-file crawl with per-file previews), `list` (one directory listing — files and folders by name), or `file` (full content of a single file at `path`). Set `previewLength` to widen the per-file preview cap in crawl mode (default 500, max 5000). Honors a caller-supplied GitHub token (X-GitHub-Token header or ?github_token query over HTTP; GITHUB_TOKEN env on stdio) for the authenticated 5000 req/hr quota.',
       {
-        url: z.string().url().describe('GitHub repo URL, e.g. https://github.com/owner/repo'),
+        url: z.string().url('Invalid url').describe('GitHub repo URL, e.g. https://github.com/owner/repo'),
         mode: z.enum(['crawl', 'list', 'file']).optional().default('crawl').describe('What to return. Default: crawl.'),
         path: z.string().optional().describe('Used by `list` (directory) and `file` (single file). Empty string lists the repo root.'),
         branch: z.string().optional().describe('Branch override (defaults to repo default branch).'),
@@ -1409,7 +1412,7 @@ export class WebSearchMCPServer {
       'get-openapi-spec',
       'Extract an OpenAPI/Swagger specification from an API documentation page. Discovers the spec via HTML link tags, common URL patterns, and versioned swagger files, then saves the full raw spec to docs/technical/openapi/. By default it returns a compact ENDPOINT INDEX (method + path + summary + tags) plus the saved file path — not the raw spec — because real specs are far too large to inline. Use pathFilter/tag/method to narrow the index, and read-cached-document (with offset paging) to fetch the full raw spec or any section.',
       {
-        url: z.string().url().describe('The URL of the API documentation page (e.g., https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro/)'),
+        url: z.string().url('Invalid url').describe('The URL of the API documentation page (e.g., https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro/)'),
         forceRefresh: z.boolean().optional().default(false).describe('Force refresh the cache and re-download the spec'),
         pathFilter: z.string().optional().describe('Return only endpoints whose path contains this substring (case-insensitive), e.g. "/users" or "auth".'),
         tag: z.string().optional().describe('Return only endpoints carrying this OpenAPI tag (case-insensitive).'),
@@ -1668,8 +1671,8 @@ export class WebSearchMCPServer {
       'get-pdf-content',
       'Extract and return text content from a PDF document. This tool uses HTTP-based extraction with browser fallback for complex PDFs. Use this when you need to extract readable text from PDF files found during web research.',
       {
-        url: z.string().url().describe('The URL of the PDF file to extract content from'),
-        maxContentLength: z.number().int().nonnegative().optional().describe('Maximum characters for the extracted content (0 = no limit).'),
+        url: z.string().url('Invalid url').describe('The URL of the PDF file to extract content from'),
+        maxContentLength: z.number().int('maxContentLength must be an integer').nonnegative('maxContentLength must be greater than or equal to 0').optional().describe('Maximum characters for the extracted content (0 = no limit).'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-pdf-content`);
