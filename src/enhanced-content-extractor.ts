@@ -1,3 +1,4 @@
+import { acquirePage } from './browser-watchdog.js';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import pLimit from 'p-limit';
@@ -300,27 +301,23 @@ export class EnhancedContentExtractor {
   private async extractWithBrowser(options: ContentExtractionOptions): Promise<string> {
     const { url, timeout = this.defaultTimeout } = options;
     
-    const browser = await this.browserPool.getBrowser();
     const browserType = this.browserPool.getLastUsedBrowserType();
-    
-    try {
-      // Create context options based on browser capabilities
-      const baseContextOptions = {
-        userAgent: this.getRandomUserAgent(),
-        viewport: { width: 1366, height: 768 },
-        locale: 'en-US',
-        timezoneId: 'America/New_York',
-        colorScheme: 'light' as const,
-        deviceScaleFactor: 1,
-        hasTouch: false,
-        isMobile: browserType !== 'firefox',
-      };
+    // Create context options based on browser capabilities
+    const baseContextOptions = {
+      userAgent: this.getRandomUserAgent(),
+      viewport: { width: 1366, height: 768 },
+      locale: 'en-US',
+      timezoneId: 'America/New_York',
+      colorScheme: 'light' as const,
+      deviceScaleFactor: 1,
+      hasTouch: false,
+      isMobile: browserType !== 'firefox',
+    };
 
-      // Create a new context for each request (isolation)
-      const context = await browser.newContext(baseContextOptions);
-
+    // Setup runs under a deadline; a wedged shared browser is discarded and relaunched next call.
+    const { browser, context, page } = await acquirePage(this.browserPool, baseContextOptions, async (ctx) => {
       // Add stealth scripts to avoid detection
-      await context.addInitScript(() => {
+      await ctx.addInitScript(() => {
         // Remove webdriver property
         Object.defineProperty(navigator, 'webdriver', {
           get: () => undefined,
@@ -344,7 +341,9 @@ export class EnhancedContentExtractor {
         }
       });
 
-      const page = await context.newPage();
+    });
+
+    try {
       
       // Set up request interception to block unnecessary resources
       await page.route('**/*', (route) => {
@@ -440,6 +439,9 @@ export class EnhancedContentExtractor {
     } catch (error) {
       console.error(`[BrowserExtractor] Browser extraction failed for ${url}:`, error);
       throw error;
+    } finally {
+      // Every exit path closes the context (it leaked on any goto/parse error before).
+      await context.close().catch(() => {});
     }
   }
 

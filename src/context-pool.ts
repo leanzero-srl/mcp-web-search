@@ -110,23 +110,50 @@ export class ContextPool {
    * Gets or creates the underlying browser instance
    */
   private async getBrowser(): Promise<Browser> {
-    // We use a single shared browser for all contexts in the pool
-    if (!this.sharedBrowser) {
-      console.log('[ContextPool] Launching new browser');
-      this.sharedBrowser = await createOptimizedBrowser({
-        engineType: this.engineType,
-        headlessMode: this.headlessMode,
-      });
-      
-      // Set up cleanup on process exit
-      process.on('exit', async () => {
-        await this.closeAll();
-      });
+    // We use a single shared browser for all contexts in the pool.
+    // A browser that dropped its connection is replaced, never reused.
+    if (this.sharedBrowser && !this.sharedBrowser.isConnected()) {
+      this.discardSharedBrowser('browser disconnected');
     }
-    
+    if (!this.sharedBrowser) {
+      if (!this.launching) {
+        console.log('[ContextPool] Launching new browser');
+        this.launching = createOptimizedBrowser({
+          engineType: this.engineType,
+          headlessMode: this.headlessMode,
+        }).then(b => { this.sharedBrowser = b; return b; })
+          .finally(() => { this.launching = null; });
+        if (!this.exitHookSet) {
+          this.exitHookSet = true;
+          process.on('exit', async () => {
+            await this.closeAll();
+          });
+        }
+      }
+      return await this.launching;
+    }
+
     return this.sharedBrowser;
   }
 
+  /**
+   * Drops the shared browser (wedged or disconnected) so the next getBrowser()
+   * launches a fresh one. The old one is closed in the background with a cap:
+   * close() on a wedged browser can itself hang, and the caller must not wait.
+   */
+  discardSharedBrowser(reason: string): void {
+    const old = this.sharedBrowser;
+    if (!old) return;
+    console.error(`[ContextPool] Discarding shared browser: ${reason}`);
+    this.sharedBrowser = null;
+    this.contexts.clear();
+    const closing = old.close().catch(() => {});
+    const cap = new Promise<void>(r => { const t = setTimeout(r, 5000); t.unref?.(); });
+    void Promise.race([closing, cap]);
+  }
+
+  private launching: Promise<Browser> | null = null;
+  private exitHookSet = false;
   private sharedBrowser: Browser | null = null;
 
   /**
