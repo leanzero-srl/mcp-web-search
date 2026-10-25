@@ -233,6 +233,11 @@ export class BrowserPool {
     this.browsers.clear();
   }
 
+  /** Drop the shared (pooled) browser so the next call relaunches it. */
+  discardSharedBrowser(reason: string): void {
+    this.contextPool?.discardSharedBrowser(reason);
+  }
+
   getLastUsedBrowserType(): string {
     return this.lastUsedBrowserType;
   }
