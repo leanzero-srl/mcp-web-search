@@ -20,8 +20,11 @@
 #     must be a dedicated key, not the website's (WEB_SEARCH_SERPER_KEY, ~150 credits shared with the advisors).
 #   GITHUB_TOKEN: from that file, else `gh auth token`. Anonymous GitHub calls would spend the workhorse IP's
 #     60 req/h quota that the live server's keyless users share.
+# Search cadence: with a key the 14 search tests run every LIVETESTS_SEARCH_EVERY_DAYS (default 7), not daily, so a free
+#   2,500-credit key lasts ~80 weeks (scripts/live-tests-search-gate.sh). The other tests run every day. The result JSON
+#   says whether search was skipped by schedule (search_scheduled_skip) and when it last fully passed (search_last_ok_at).
 # Env overrides (for a manual run): LIVETESTS_WORK, LIVETESTS_STATE_DIR, LIVETESTS_REF (default origin/main),
-#   LIVETESTS_REPO_URL (e.g. a local clone, to try unpushed commits).
+#   LIVETESTS_REPO_URL (e.g. a local clone, to try unpushed commits), LIVETESTS_SEARCH_EVERY_DAYS (0 = search tests now).
 set -u
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 WORK="${LIVETESTS_WORK:-$HOME/.local/share/mcp-web-search-livetests}"
@@ -32,6 +35,11 @@ KEYS_FILE="$HOME/.config/mcp-web-search-livetests/env"
 RESULT="$STATE_DIR/websearch-livetests.json"
 LOG="$STATE_DIR/websearch-livetests.log"
 VITEST_JSON="$WORK/vitest-result.json"
+SEARCH_STAMP="$STATE_DIR/websearch-livetests-search.stamp"
+SEARCH_EVERY_D="${LIVETESTS_SEARCH_EVERY_DAYS:-7}"
+KEY_CONFIGURED=""
+SEARCH_BY_SCHEDULE=""
+. "${0:A:h}/live-tests-search-gate.sh"
 mkdir -p "$WORK" "$STATE_DIR"
 
 # One run at a time (a 05:20 run and a manual kickstart must not share the clone).
@@ -49,12 +57,16 @@ echo "== mcp-web-search live tests $(date '+%Y-%m-%d %H:%M:%S %Z') ref=$REF"
 
 write_result() {  # $1 = exit code, $2 = stage reached
   EXIT_CODE="$1" STAGE="$2" START="$START" COMMIT="${COMMIT:-}" VITEST_JSON="$VITEST_JSON" RESULT="$RESULT" LOG="$LOG" \
+  SEARCH_STAMP="$SEARCH_STAMP" SEARCH_EVERY_D="$SEARCH_EVERY_D" KEY_CONFIGURED="$KEY_CONFIGURED" SEARCH_BY_SCHEDULE="$SEARCH_BY_SCHEDULE" \
   HAS_SERPER="${SERPER_API_KEY:+1}" HAS_GITHUB="${GITHUB_TOKEN:+1}" /usr/bin/python3 - <<'PY'
 import json, os, time
 e = os.environ
 out = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "exit_code": int(e["EXIT_CODE"]), "stage": e["STAGE"],
        "commit": e["COMMIT"], "duration_s": int(time.time()) - int(e["START"]), "log": e["LOG"],
-       "serper_key": bool(e.get("HAS_SERPER")), "github_token": bool(e.get("HAS_GITHUB"))}
+       "serper_key": bool(e.get("HAS_SERPER")), "github_token": bool(e.get("HAS_GITHUB")),
+       "serper_key_configured": bool(e.get("KEY_CONFIGURED")),
+       "search_every_days": int(e.get("SEARCH_EVERY_D") or 7)}
+out["search_scheduled_skip"] = bool(e.get("SEARCH_BY_SCHEDULE"))
 try:
     d = json.load(open(e["VITEST_JSON"])) if e["STAGE"] == "tests" else None
 except (OSError, ValueError):
@@ -76,9 +88,17 @@ if d:
     out["skipped_search"] = sum(1 for t in skips if "no SERPER_API_KEY" in t)
     out["skipped_other"] = len(skips) - out["skipped_search"]
     out["ok"] = out["exit_code"] == 0 and out["failed"] == 0 and out["passed"] > 0
+    stamp = e["SEARCH_STAMP"]
+    if out["ok"] and e.get("HAS_SERPER") and out["skipped_search"] == 0:  # every search test ran and passed today
+        open(stamp, "a").close()
+        os.utime(stamp, None)
 else:
     out["ok"] = False
     out["failures"] = [{"file": "-", "test": f"stage '{e['STAGE']}' failed", "message": "see log"}]
+try:
+    out["search_last_ok_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(os.stat(e["SEARCH_STAMP"]).st_mtime))
+except OSError:
+    pass
 tmp = e["RESULT"] + ".tmp"
 json.dump(out, open(tmp, "w"), indent=1)
 os.replace(tmp, e["RESULT"])
@@ -118,6 +138,15 @@ for k in SERPER_API_KEY UPSTASH_VECTOR_REST_URL UPSTASH_VECTOR_REST_TOKEN GITHUB
 done
 if [ -z "${GITHUB_TOKEN:-}" ]; then v=$(gh auth token 2>/dev/null); [ -n "$v" ] && export GITHUB_TOKEN="$v"; fi
 unset v
+# Search cadence (see header): with a key, skip the search tests unless their stamp is older than the cadence.
+if [ -n "${SERPER_API_KEY:-}" ]; then
+  KEY_CONFIGURED=1
+  if [ "$(search_gate "$SEARCH_STAMP" "$SEARCH_EVERY_D")" = skip ]; then
+    unset SERPER_API_KEY
+    SEARCH_BY_SCHEDULE=1
+    echo "== search tests: not today (every $SEARCH_EVERY_D d, to spare Serper credit; last full search run $(date -r "$(stat -f %m "$SEARCH_STAMP")" '+%Y-%m-%d %H:%M'))"
+  fi
+fi
 # Never inherit the live server's settings (DATA_DIR, PORT, PUBLIC_HOST, admin/provision secrets).
 unset DATA_DIR PORT PUBLIC_HOST OUTPUT_DIR DOC_OUTPUT_DIR CRAWL_CACHE_DIR MCP_WEB_SEARCH_ADMIN_TOKEN PROVISION_SECRET FILE_TOKEN_SECRET USE_SERPER_ONLY ENABLE_BROWSER_FALLBACKS
 yn() { [ -n "${(P)1:-}" ] && echo yes || echo no; }   # presence only, never the value
