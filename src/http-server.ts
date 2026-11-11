@@ -35,6 +35,7 @@ import { workspaceForTenant, directorySizeBytes, workspaceQuotaBytes, purgeExpir
 import { verifyDownloadToken } from './download-registry.js';
 import { logger } from './logger.js';
 import { refusedLogger } from './refused-log.js';
+import { enableUsageMeter, flushUsageSync, recordToolCall, recordToolError, type TenantClass } from './usage-meter.js';
 
 const PORT = Number(process.env.PORT) || 8443;
 
@@ -56,10 +57,56 @@ const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 const PUBLIC_HOST = process.env.PUBLIC_HOST;
 const SERVER_VERSION = '0.3.1';
 
+/**
+ * Internal keys spend the server's own Serper credits, so they work only from
+ * our machines: loopback and the tailnet (Tailscale Serve), never the public
+ * Funnel. Funnel sets `Tailscale-Funnel-Request` on every public request (and
+ * a client cannot remove it); loopback and tailnet-serve requests lack it.
+ * INTERNAL_TAILNET_ONLY=0 turns this off.
+ */
+function internalTailnetOnly(req: Request, res: Response, next: () => void): void {
+  if (req.tenant?.class === 'internal' && process.env.INTERNAL_TAILNET_ONLY !== '0' && req.get('tailscale-funnel-request')) {
+    logger.warn('[auth] internal key refused over the public Funnel', { tenant: req.tenant.id });
+    res.status(403).json({ error: 'this key works only from the tailnet, not over the public endpoint' });
+    return;
+  }
+  next();
+}
+
+/**
+ * Count every tool call (and every tool error: a thrown error or an isError
+ * result) for the calling tenant. Wraps `tool()` on the per-request McpServer
+ * before the shared tool set is registered on it.
+ */
+function meterToolsOn(server: McpServer, tenantId: string, cls: TenantClass): void {
+  const original = server.tool.bind(server) as (...a: unknown[]) => unknown;
+  (server as unknown as { tool: (...a: unknown[]) => unknown }).tool = (...args: unknown[]) => {
+    const cb = args[args.length - 1];
+    if (typeof cb === 'function') {
+      args[args.length - 1] = async (...cbArgs: unknown[]) => {
+        recordToolCall(tenantId, cls);
+        try {
+          const result = await (cb as (...a: unknown[]) => Promise<{ isError?: boolean }>)(...cbArgs);
+          if (result && result.isError) recordToolError(tenantId, cls);
+          return result;
+        } catch (err) {
+          recordToolError(tenantId, cls);
+          throw err;
+        }
+      };
+    }
+    return original(...args);
+  };
+}
+
 export function buildApp(sharedInstance: WebSearchMCPServer): Express {
   const app = express();
   // Funnel terminates TLS upstream; req.ip needs the X-Forwarded-For chain.
   app.set('trust proxy', true);
+
+  // Usage meter: tool calls, errors and upstream Serper requests per tenant,
+  // persisted under <DATA_DIR>/usage (served by GET /v1/admin/usage).
+  enableUsageMeter(process.env.DATA_DIR || process.cwd());
 
   // Audit every refused request (401/403/404/405/429) before anything can answer.
   app.use(refusedLogger('web-search'));
@@ -120,14 +167,15 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
     });
   };
 
-  app.post('/mcp', requireAuth, tenantRateLimiter, async (req: Request, res: Response) => {
+  app.post('/mcp', requireAuth, internalTailnetOnly, tenantRateLimiter, async (req: Request, res: Response) => {
     const started = Date.now();
     const body = req.body as { method?: string; params?: { name?: string }; id?: string | number | null } | undefined;
     const toolName = body?.method === 'tools/call' ? body?.params?.name : body?.method;
     auditOnFinish(req, res, started, toolName);
 
-    // Per-request keys, brought by each caller (never the operator's): the Serper
-    // search key and an optional GitHub token for the github tool. Header for
+    // Per-request keys brought by the caller: the Serper search key (used only by
+    // public keys; internal keys spend the server-side key, see serper-policy.ts)
+    // and an optional GitHub token for the github tool. Header for
     // header-capable clients, query param for Authorization-only clients (e.g.
     // claude.ai web). Never logged; carried via AsyncLocalStorage.
     const serperKey = req.get('x-serper-key') || (typeof req.query.serper_key === 'string' ? req.query.serper_key : undefined) || undefined;
@@ -189,6 +237,8 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
       version: SERVER_VERSION,
     }, { instructions: WEB_SEARCH_INSTRUCTIONS });
     attachClientDetect(mcpServer);
+    const tenantClass: TenantClass = req.tenant?.class === 'internal' ? 'internal' : 'public';
+    if (tenantId) meterToolsOn(mcpServer, tenantId, tenantClass);
     sharedInstance.registerToolsOn(mcpServer);
 
     const transportOpts: ConstructorParameters<typeof StreamableHTTPServerTransport>[0] = {
@@ -217,7 +267,7 @@ export function buildApp(sharedInstance: WebSearchMCPServer): Express {
     });
 
     try {
-      await requestContext.run({ serperKey, githubToken, outputDir, tenantId, workspace }, async () => {
+      await requestContext.run({ serperKey, githubToken, outputDir, tenantId, workspace, hosted: true, tenantClass }, async () => {
         await mcpServer.connect(transport);
         await transport.handleRequest(req, res, req.body);
       });
@@ -262,6 +312,7 @@ if (isDirectRun) {
   const shutdown = async (signal: string): Promise<void> => {
     logger.info(`[boot] ${signal} received, shutting down`);
     server.close();
+    flushUsageSync();
     try {
       await sharedInstance.closeAll();
     } catch (err) {

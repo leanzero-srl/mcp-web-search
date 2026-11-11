@@ -16,8 +16,8 @@ import { semanticCache } from './semantic-cache.js';
 // Import request deduplicator to prevent duplicate concurrent API calls
 import { requestDeduplicator } from './request-deduplicator.js';
 
-// Per-request context: a caller-supplied Serper key overrides the process env.
-import { requestContext } from './request-context.js';
+// Which Serper key a search may spend (per tenant class) + caps/metering.
+import { resolveSerperKey, admitSerperRequest, SerperPolicyError } from './serper-policy.js';
 
 export interface SearchEngineConfig {
   maxRequestsPerMinute?: number;
@@ -48,6 +48,11 @@ export class SearchEngine {
     const sanitizedQuery = sanitizeQuery(query);
 
     console.log(`[SearchEngine] Starting search for query: "${sanitizedQuery}"`);
+
+    // Hosted callers who may not search at all (public without its own key,
+    // internal with no server key) are refused here, before the cache or any
+    // fallback, with a plain-words SerperPolicyError.
+    resolveSerperKey();
 
     // OPTIMIZATION 1: Check semantic cache FIRST, before any rate limiting or concurrency overhead
     const cacheEnabled = process.env.SEMANTIC_CACHE_ENABLED !== 'false';
@@ -101,6 +106,7 @@ export class SearchEngine {
           return { results, engine: 'serper-only' };
         }
       } catch (error) {
+        if (error instanceof SerperPolicyError) throw error;
         console.error('[SearchEngine] Serper API failed:', error instanceof Error ? error.message : 'Unknown');
       }
       // If Serper fails, optionally try browser fallbacks
@@ -136,6 +142,7 @@ export class SearchEngine {
         })
       );
     } catch (error) {
+      if (error instanceof SerperPolicyError) throw error;
       console.error('[SearchEngine] Search error:', error);
       if (axios.isAxiosError(error)) {
         console.error('[SearchEngine] Axios error details:', {
@@ -228,6 +235,7 @@ export class SearchEngine {
           console.log(`[SearchEngine] Engine ${engineType} returned no results.`);
         }
       } catch (error) {
+        if (error instanceof SerperPolicyError) throw error;
         console.log(`[SearchEngine] Engine ${engineType} search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
     }
@@ -320,6 +328,7 @@ export class SearchEngine {
           }
         }
       } catch (error) {
+        if (error instanceof SerperPolicyError) throw error;
         console.error(`[SearchEngine] ${approach.name} approach failed:`, error);
         await this.handleBrowserError(error, approach.name);
       }
@@ -403,9 +412,10 @@ export class SearchEngine {
    * Runs a search with a specific browser engine
    */
   private async tryApiSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
-    // Prefer the per-request key (HTTP callers bring their own); fall back to the
-    // process env (stdio callers set it in their mcp.json `env`).
-    const apiKey = requestContext.getStore()?.serperKey || process.env.SERPER_API_KEY;
+    // Hosted: public = the caller's own key only, internal = the server-side key
+    // only (serper-policy.ts). stdio: caller key, else the process env.
+    const resolved = resolveSerperKey();
+    const apiKey = resolved.apiKey;
     if (!apiKey) {
       console.error('[SearchEngine] API search failed: SERPER_API_KEY is not set');
       return [];
@@ -422,6 +432,10 @@ export class SearchEngine {
 
     console.log(`[SearchEngine] Starting API-based search for: "${query}"`);
     const timestamp = generateTimestamp();
+
+    // One upstream request = one Serper credit: refuse past a cap or budget,
+    // else count it (tenant, class, keySource). Throws SerperPolicyError.
+    admitSerperRequest(resolved);
 
     try {
       const response = await axios.post(

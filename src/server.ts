@@ -10,6 +10,7 @@
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { SerperPolicyError } from './serper-policy.js';
 
 // Define MCP Error types locally (not exported from @modelcontextprotocol/sdk/server/mcp.js)
 enum ERROR_CODES {
@@ -167,6 +168,12 @@ export class WebSearchMCPServer {
    */
   private handleError(error: unknown, toolName: string): never {
     console.error(`[MCP] Error in ${toolName}:`, error);
+
+    // A Serper key/cap/budget refusal is already written for the caller: pass
+    // it through unchanged (the SDK returns it as an isError tool result).
+    if (error instanceof SerperPolicyError) {
+      throw error;
+    }
 
     if (error instanceof McpError) {
       throw error;
@@ -2081,6 +2088,7 @@ export class WebSearchMCPServer {
         status: combinedStatus,
       };
     } catch (error) {
+      if (error instanceof SerperPolicyError) throw error;
       // Re-throw McpError directly, otherwise convert to internal error
       if (error instanceof McpError) {
         auditLogger.logToolError('full-web-search', error.code, error.message, 'McpError');

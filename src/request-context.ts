@@ -7,7 +7,8 @@
  * without threading it through every tool schema (which would also leak the key
  * into tool-call logs/transcripts), the HTTP layer stashes the key here for the
  * duration of the request and `search-engine.ts` reads it back at call time,
- * falling back to `process.env.SERPER_API_KEY`.
+ * falling back to `process.env.SERPER_API_KEY` ON STDIO ONLY: hosted callers
+ * never reach the env key (serper-policy.ts decides per tenant class).
  *
  * The stdio transport never populates the store, so it transparently falls back
  * to the process env (the user's `mcp.json` `env` block) — behaviour unchanged.
@@ -25,6 +26,11 @@ export interface RequestCtx {
   outputDir?: string;
   /** Hosted caller's tenant id (null on stdio / unauthenticated). */
   tenantId?: string;
+  /** True for every hosted HTTP request (never on stdio). serper-policy.ts
+   *  uses it to close the env-key fallback for hosted callers. */
+  hosted?: boolean;
+  /** Hosted caller's tenant class: 'public' (default) or 'internal'. */
+  tenantClass?: 'public' | 'internal';
   /** Absolute path of the hosted caller's private workspace, or undefined on
    *  stdio. When set, every file this server writes/reads/lists on the caller's
    *  behalf (research markdown, OpenAPI/crawl cache) is rooted here, so one

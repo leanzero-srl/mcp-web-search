@@ -4,6 +4,7 @@
  */
 
 import { SearchEngine } from './search-engine.js';
+import { SerperPolicyError } from './serper-policy.js';
 import { SearchResult } from './types.js';
 import { StandardIntentDetector, QueryIntent, generateIntentBasedExpansions } from './query-intent-detector.js';
 import { SemanticExpander, HeuristicSemanticExpander } from './semantic-expander.js';
@@ -321,6 +322,7 @@ export class ProgressiveSearchEngine implements IProgressiveSearchEngine {
         return result.results;
       }
     } catch (error) {
+      if (error instanceof SerperPolicyError) throw error; // a refusal, not a miss
       console.warn(`[ProgressiveSearchEngine] Primary engine failed, trying fallbacks:`, error);
     }
     
@@ -338,6 +340,7 @@ export class ProgressiveSearchEngine implements IProgressiveSearchEngine {
           return result.results;
         }
       } catch (error) {
+        if (error instanceof SerperPolicyError) throw error; // a refusal, not a miss
         console.warn(`[ProgressiveSearchEngine] Engine ${i} failed:`, error);
       }
     }
@@ -364,6 +367,7 @@ export class ProgressiveSearchEngine implements IProgressiveSearchEngine {
           return result.results;
         }
       } catch (error) {
+        if (error instanceof SerperPolicyError) throw error; // a refusal, not a miss
         console.warn(`[ProgressiveSearchEngine] Engine search failed for "${query}":`, error);
       }
     }
@@ -390,6 +394,7 @@ export class ProgressiveSearchEngine implements IProgressiveSearchEngine {
           return deepResults;
         }
       } catch (error) {
+        if (error instanceof SerperPolicyError) throw error; // a refusal, not a miss
         console.warn(`[ProgressiveSearchEngine] Deep search for "${topic}" failed:`, error);
       }
     }

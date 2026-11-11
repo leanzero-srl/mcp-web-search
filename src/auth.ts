@@ -23,6 +23,8 @@ import { logger } from './logger.js';
 import { verifyOAuth, oauthEnabled, protectedResourceMetadataUrl } from './oauth.js';
 import { archiveTenantWorkspace, getWorkspacesBase, workspaceDirName } from './doc-root.js';
 import { forgetCrawlCacheForRoot } from './crawl-cache.js';
+import { usageReport, type TenantClass, type TenantInfo } from './usage-meter.js';
+import { getSerperBalance } from './serper-policy.js';
 
 const DATA_DIR = process.env.DATA_DIR || process.cwd();
 const TENANTS_PATH = path.join(DATA_DIR, 'tenants.json');
@@ -35,6 +37,10 @@ interface ExpiringHash {
 
 interface TenantRecord {
   displayName: string;
+  /** 'public' (default when absent: every key minted before 2026-11-11 and
+   *  every /v1/provision key) or 'internal' (admin-minted, tailnet-only,
+   *  searches on the server-side Serper key). */
+  class?: TenantClass;
   bearerHash: string;
   expiringHashes: ExpiringHash[];
   createdAt: string;
@@ -48,7 +54,7 @@ declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
-      tenant?: { id: string; displayName: string };
+      tenant?: { id: string; displayName: string; class: TenantClass };
     }
   }
 }
@@ -143,13 +149,17 @@ function activeHashes(record: TenantRecord): string[] {
 }
 
 /** Match a presented token against the stored argon2id tenant bearers. */
-async function matchStaticBearer(token: string): Promise<{ id: string; displayName: string } | null> {
+export function tenantClassOf(record: { class?: unknown } | undefined): TenantClass {
+  return record?.class === 'internal' ? 'internal' : 'public';
+}
+
+async function matchStaticBearer(token: string): Promise<{ id: string; displayName: string; class: TenantClass } | null> {
   const tenants = await loadTenants();
   for (const [tenantId, record] of Object.entries(tenants)) {
     for (const h of activeHashes(record)) {
       try {
         if (await argon2.verify(h, token)) {
-          return { id: tenantId, displayName: record.displayName };
+          return { id: tenantId, displayName: record.displayName, class: tenantClassOf(record) };
         }
       } catch {
         // malformed hash — skip
@@ -191,7 +201,7 @@ export const requireAuth = async (req: Request, res: Response, next: NextFunctio
   const claims = await verifyOAuth(token);
   if (claims) {
     const sub = typeof claims.sub === 'string' ? claims.sub : 'oauth';
-    req.tenant = { id: `oauth:${sub}`, displayName: (claims.email as string) || sub };
+    req.tenant = { id: `oauth:${sub}`, displayName: (claims.email as string) || sub, class: 'public' };
     return next();
   }
 
@@ -237,9 +247,17 @@ export const requireBearer = async (req: Request, res: Response, next: NextFunct
   res.status(401).json({ error: 'unauthorized' });
 };
 
+/** Per-minute request limit for a tenant: public TENANT_RATE_LIMIT (20),
+ *  internal INTERNAL_TENANT_RATE_LIMIT (120). Read per request. */
+export function tenantRateLimitFor(cls: TenantClass | undefined): number {
+  return cls === 'internal'
+    ? Number(process.env.INTERNAL_TENANT_RATE_LIMIT) || 120
+    : Number(process.env.TENANT_RATE_LIMIT) || 20;
+}
+
 export const tenantRateLimiter = rateLimit({
   windowMs: 60_000,
-  max: () => Number(process.env.TENANT_RATE_LIMIT) || 20,
+  max: (req: Request) => tenantRateLimitFor(req.tenant?.class),
   keyGenerator: (req: Request) => req.tenant?.id || req.ip || 'unknown',
   standardHeaders: true,
   legacyHeaders: false,
@@ -286,23 +304,24 @@ function generateBearer(): string {
   return randomBytes(32).toString('base64url');
 }
 
-export interface CreatedTenant { tenantId: string; bearer: string; displayName: string }
+export interface CreatedTenant { tenantId: string; bearer: string; displayName: string; class: TenantClass }
 
 /** Mint a new tenant with a fresh random bearer (argon2id-hashed at rest). */
-async function createTenant(displayName: string): Promise<CreatedTenant> {
+async function createTenant(displayName: string, cls: TenantClass = 'public'): Promise<CreatedTenant> {
   const tenants = await loadTenants();
   const tenantId = randomUUID();
   const bearer = generateBearer();
   const bearerHash = await argon2.hash(bearer, { type: argon2.argon2id });
   tenants[tenantId] = {
     displayName,
+    class: cls,
     bearerHash,
     expiringHashes: [],
     createdAt: new Date().toISOString(),
     lastUsedAt: null,
   };
   await saveTenants(tenants);
-  return { tenantId, bearer, displayName };
+  return { tenantId, bearer, displayName, class: cls };
 }
 
 /**
@@ -338,8 +357,13 @@ export function mountAdminRoutes(app: Express): void {
       res.status(400).json({ error: 'displayName required' });
       return;
     }
-    const created = await createTenant(displayName);
-    logger.info('[admin] minted tenant', { tenantId: created.tenantId, displayName });
+    const rawClass = req.body?.class ?? 'public';
+    if (rawClass !== 'public' && rawClass !== 'internal') {
+      res.status(400).json({ error: "class must be 'public' or 'internal'" });
+      return;
+    }
+    const created = await createTenant(displayName, rawClass);
+    logger.info('[admin] minted tenant', { tenantId: created.tenantId, displayName, class: created.class });
     res.status(201).json(created);
   });
 
@@ -348,11 +372,24 @@ export function mountAdminRoutes(app: Express): void {
     const list = Object.entries(tenants).map(([id, r]) => ({
       tenantId: id,
       displayName: r.displayName,
+      class: tenantClassOf(r),
       createdAt: r.createdAt,
       lastUsedAt: r.lastUsedAt,
       activeHashCount: activeHashes(r).length,
     }));
     res.json({ tenants: list });
+  });
+
+  // Usage and Serper spend (README "GET /v1/admin/usage"). Shape is stable: a
+  // health/digest job builds against it. Never carries a key, hash or bearer.
+  router.get('/usage', adminAuth, async (req: Request, res: Response) => {
+    const days = Number(req.query.days) || 7;
+    const tenants = await loadTenants();
+    const info: Record<string, TenantInfo> = {};
+    for (const [id, r] of Object.entries(tenants)) info[id] = { displayName: r.displayName, class: tenantClassOf(r) };
+    const report = usageReport(days, info);
+    const serperBalance = await getSerperBalance();
+    res.json({ ...report, serperBalance });
   });
 
   router.delete('/tenants/:id', adminAuth, async (req: Request, res: Response) => {
@@ -443,7 +480,9 @@ export function mountProvisionRoutes(app: Express): void {
   router.post('/', async (req: Request, res: Response) => {
     const label = String(req.body?.label || req.body?.displayName || 'self-service')
       .trim().slice(0, 120) || 'self-service';
-    const created = await createTenant(label);
+    // Always public: a provisioned key must bring its own Serper key. The body's
+    // `class` is ignored on purpose (internal keys are admin-only).
+    const created = await createTenant(label, 'public');
     logger.info('[provision] minted tenant', { tenantId: created.tenantId, label });
     res.status(201).json(created);
   });
