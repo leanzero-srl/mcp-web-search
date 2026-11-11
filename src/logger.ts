@@ -18,6 +18,8 @@
  * `info` in production, `debug` when `DEBUG=true` is set.
  */
 
+import { installStdioErrorGuards, isSinkError, noteDroppedWrite } from './stdio-guard.js';
+
 type Level = 'debug' | 'info' | 'warn' | 'error';
 
 const LEVEL_ORDER: Record<Level, number> = {
@@ -45,7 +47,22 @@ function emit(level: Level, msg: string, meta?: Record<string, unknown>): void {
     ...(meta ?? {}),
   });
   // Always stderr — never stdout (MCP stdio uses stdout for JSON-RPC frames).
-  process.stderr.write(line + '\n');
+  writeStderr(line + '\n');
+}
+
+/**
+ * Write to stderr without ever taking the process down: a full disk under the
+ * launchd log file (ENOSPC) or a closed reader (EPIPE) drops the line and
+ * counts it (stdio-guard.ts). Logging resumes by itself once the sink works.
+ */
+function writeStderr(text: string): void {
+  installStdioErrorGuards();
+  try {
+    process.stderr.write(text, (err) => { if (err) noteDroppedWrite(); });
+  } catch (err) {
+    if (!isSinkError(err)) throw err;
+    noteDroppedWrite();
+  }
 }
 
 export const logger = {
@@ -70,18 +87,18 @@ export function installStdioSafeConsoleShim(): void {
       .join(' ');
 
   console.log = (...args: unknown[]) => {
-    process.stderr.write(`[stdout-redirect] ${stringify(args)}\n`);
+    writeStderr(`[stdout-redirect] ${stringify(args)}\n`);
   };
   console.info = console.log;
   console.warn = (...args: unknown[]) => {
-    process.stderr.write(`[warn] ${stringify(args)}\n`);
+    writeStderr(`[warn] ${stringify(args)}\n`);
   };
   console.error = (...args: unknown[]) => {
-    process.stderr.write(`[error] ${stringify(args)}\n`);
+    writeStderr(`[error] ${stringify(args)}\n`);
   };
   console.debug = (...args: unknown[]) => {
     if (minLevel <= LEVEL_ORDER.debug) {
-      process.stderr.write(`[debug] ${stringify(args)}\n`);
+      writeStderr(`[debug] ${stringify(args)}\n`);
     }
   };
 }

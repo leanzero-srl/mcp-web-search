@@ -19,6 +19,10 @@
  *     instance with `skipShutdownHooks: true` so it owns the shutdown path.
  */
 
+// A full disk under the launchd log file (ENOSPC) or a closed stdio reader
+// (EPIPE) must drop the log line, never kill the process: guard stdout/stderr
+// before anything else can write to them.
+import './stdio-guard.js';
 import express, { type Express, type Request, type Response } from 'express';
 import cors from 'cors';
 import compression from 'compression';

@@ -107,8 +107,15 @@ function writeNow(snapshot: MonthFile): Promise<void> {
   const run = writeChain.then(async () => {
     await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
     const tmp = `${target}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
-    await fs.promises.writeFile(tmp, body, { mode: 0o600 });
-    await fs.promises.rename(tmp, target);
+    try {
+      await fs.promises.writeFile(tmp, body, { mode: 0o600 });
+      await fs.promises.rename(tmp, target);
+    } catch (err) {
+      // Disk full (ENOSPC): drop the partial temp file so failed flushes
+      // (every USAGE_FLUSH_MS) cannot pile files up; counters stay in memory.
+      await fs.promises.unlink(tmp).catch(() => {});
+      throw err;
+    }
   });
   writeChain = run.catch((err) => {
     logger.warn('[usage] could not persist usage file', { error: (err as Error).message });
@@ -150,8 +157,13 @@ export function flushUsageSync(): void {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const target = fileFor(state.month);
     const tmp = `${target}.tmp.${process.pid}.exit`;
-    fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
-    fs.renameSync(tmp, target);
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
+      fs.renameSync(tmp, target);
+    } catch (err) {
+      try { fs.unlinkSync(tmp); } catch { /* never written */ }
+      throw err;
+    }
   } catch { /* best effort */ }
 }
 

@@ -26,6 +26,22 @@ import { forgetCrawlCacheForRoot } from './crawl-cache.js';
 import { usageReport, type TenantClass, type TenantInfo } from './usage-meter.js';
 import { getSerperBalance } from './serper-policy.js';
 
+/**
+ * Express 4 does not catch a rejected async handler: the rejection becomes an
+ * unhandledRejection, which kills the process (Node's default). A tenants.json
+ * write that fails with ENOSPC (disk full) did exactly that on /v1/provision.
+ * This answers 500 and logs instead; nothing else is swallowed.
+ */
+function asyncRoute(fn: (req: Request, res: Response) => Promise<void>) {
+  return (req: Request, res: Response, _next: NextFunction): void => {
+    fn(req, res).catch((err: unknown) => {
+      const e = err as NodeJS.ErrnoException;
+      logger.error('[auth] route failed', { path: req.path, method: req.method, code: e?.code, error: e?.message });
+      if (!res.headersSent) res.status(500).json({ error: 'internal error' });
+    });
+  };
+}
+
 const DATA_DIR = process.env.DATA_DIR || process.cwd();
 const TENANTS_PATH = path.join(DATA_DIR, 'tenants.json');
 const ROTATE_GRACE_MS = 5 * 60 * 1000;
@@ -87,8 +103,14 @@ let saveChain: Promise<void> = Promise.resolve();
 async function writeTenantsFile(tenants: TenantMap): Promise<void> {
   await fs.mkdir(path.dirname(TENANTS_PATH), { recursive: true });
   const tmp = `${TENANTS_PATH}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
-  await fs.writeFile(tmp, JSON.stringify(tenants, null, 2), { mode: 0o600 });
-  await fs.rename(tmp, TENANTS_PATH);
+  try {
+    await fs.writeFile(tmp, JSON.stringify(tenants, null, 2), { mode: 0o600 });
+    await fs.rename(tmp, TENANTS_PATH);
+  } catch (err) {
+    // Disk full (ENOSPC) leaves a partial temp file behind: never let those pile up.
+    await fs.unlink(tmp).catch(() => {});
+    throw err;
+  }
   try {
     await fs.chmod(TENANTS_PATH, 0o600);
   } catch {
@@ -351,7 +373,7 @@ export function mountAdminRoutes(app: Express): void {
   router.use(localhostOnly);
   router.use(express.json({ limit: '16kb' }));
 
-  router.post('/tenants', adminAuth, async (req: Request, res: Response) => {
+  router.post('/tenants', adminAuth, asyncRoute(async (req: Request, res: Response) => {
     const displayName = (req.body?.displayName || '').trim();
     if (!displayName) {
       res.status(400).json({ error: 'displayName required' });
@@ -365,9 +387,9 @@ export function mountAdminRoutes(app: Express): void {
     const created = await createTenant(displayName, rawClass);
     logger.info('[admin] minted tenant', { tenantId: created.tenantId, displayName, class: created.class });
     res.status(201).json(created);
-  });
+  }));
 
-  router.get('/tenants', adminAuth, async (_req: Request, res: Response) => {
+  router.get('/tenants', adminAuth, asyncRoute(async (_req: Request, res: Response) => {
     const tenants = await loadTenants();
     const list = Object.entries(tenants).map(([id, r]) => ({
       tenantId: id,
@@ -378,11 +400,11 @@ export function mountAdminRoutes(app: Express): void {
       activeHashCount: activeHashes(r).length,
     }));
     res.json({ tenants: list });
-  });
+  }));
 
   // Usage and Serper spend (README "GET /v1/admin/usage"). Shape is stable: a
   // health/digest job builds against it. Never carries a key, hash or bearer.
-  router.get('/usage', adminAuth, async (req: Request, res: Response) => {
+  router.get('/usage', adminAuth, asyncRoute(async (req: Request, res: Response) => {
     const days = Number(req.query.days) || 7;
     const tenants = await loadTenants();
     const info: Record<string, TenantInfo> = {};
@@ -390,9 +412,9 @@ export function mountAdminRoutes(app: Express): void {
     const report = usageReport(days, info);
     const serperBalance = await getSerperBalance();
     res.json({ ...report, serperBalance });
-  });
+  }));
 
-  router.delete('/tenants/:id', adminAuth, async (req: Request, res: Response) => {
+  router.delete('/tenants/:id', adminAuth, asyncRoute(async (req: Request, res: Response) => {
     const ok = await revokeTenant(req.params.id);
     if (!ok) {
       res.status(404).json({ error: 'tenant not found' });
@@ -400,9 +422,9 @@ export function mountAdminRoutes(app: Express): void {
     }
     logger.info('[admin] revoked tenant', { tenantId: req.params.id });
     res.json({ revoked: req.params.id });
-  });
+  }));
 
-  router.post('/tenants/:id/rotate', adminAuth, async (req: Request, res: Response) => {
+  router.post('/tenants/:id/rotate', adminAuth, asyncRoute(async (req: Request, res: Response) => {
     const tenants = await loadTenants();
     const record = tenants[req.params.id];
     if (!record) {
@@ -430,7 +452,7 @@ export function mountAdminRoutes(app: Express): void {
       bearer: newBearer,
       oldBearerExpiresAt: new Date(expiresAt).toISOString(),
     });
-  });
+  }));
 
   app.use('/v1/admin', router);
 }
@@ -477,7 +499,7 @@ export function mountProvisionRoutes(app: Express): void {
 
   // Mint a tenant bearer for one self-service user. `label` is a free-text tag
   // (e.g. the user's email) stored as the tenant displayName for the audit log.
-  router.post('/', async (req: Request, res: Response) => {
+  router.post('/', asyncRoute(async (req: Request, res: Response) => {
     const label = String(req.body?.label || req.body?.displayName || 'self-service')
       .trim().slice(0, 120) || 'self-service';
     // Always public: a provisioned key must bring its own Serper key. The body's
@@ -485,10 +507,10 @@ export function mountProvisionRoutes(app: Express): void {
     const created = await createTenant(label, 'public');
     logger.info('[provision] minted tenant', { tenantId: created.tenantId, label });
     res.status(201).json(created);
-  });
+  }));
 
   // Revoke a previously-provisioned tenant by id.
-  router.delete('/:id', async (req: Request, res: Response) => {
+  router.delete('/:id', asyncRoute(async (req: Request, res: Response) => {
     const ok = await revokeTenant(req.params.id);
     if (!ok) {
       res.status(404).json({ error: 'tenant not found' });
@@ -496,7 +518,7 @@ export function mountProvisionRoutes(app: Express): void {
     }
     logger.info('[provision] revoked tenant', { tenantId: req.params.id });
     res.json({ revoked: req.params.id });
-  });
+  }));
 
   app.use('/v1/provision', router);
 }
