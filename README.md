@@ -178,6 +178,63 @@ needs different ceilings.
 
 ---
 
+## 🔑 Hosted server: key classes, Serper credits and usage
+
+This applies to the hosted HTTP transport (`node dist/http-server.js`) only. stdio is unchanged: it uses the caller's key, else `SERPER_API_KEY`.
+
+### Key classes
+
+| Class | Who gets it | Serper key it spends | Where it works | Requests/min |
+|---|---|---|---|---|
+| `public` (default) | every key from `/v1/provision`, every key minted before 2026-11-11, `POST /v1/admin/tenants` without `class` | only the caller's own `X-Serper-Key` / `?serper_key`. The server's `SERPER_API_KEY` is never used. No key = a "bring your own key" error. | anywhere, including the public Funnel | `TENANT_RATE_LIMIT` (20) |
+| `internal` | `POST /v1/admin/tenants {"displayName":"…","class":"internal"}` (localhost admin only) | only the server-side key in `INTERNAL_SERPER_KEY_FILE` (default `<DATA_DIR>/internal-serper.key`, must be mode 600). A caller-sent key is ignored. Missing or group/other-readable file = a clear error, never a fallback. | loopback and the tailnet only: a request with the `Tailscale-Funnel-Request` header (set by Funnel on every public request) gets 403 and a `refused.jsonl` line. `INTERNAL_TAILNET_ONLY=0` turns this off. | `INTERNAL_TENANT_RATE_LIMIT` (120) |
+
+### Metering, caps and budgets
+
+Every upstream Serper request (one request = one credit) is counted with its tenant, class and key source: `internal` (the server key), `own` (a caller key whose sha256 is listed in `OWN_SERPER_KEY_SHA256`, comma-separated: our own key, e.g. the website's) or `byo` (anyone else's key). Tool calls and tool errors are counted per tenant per UTC day. Counters live in `<DATA_DIR>/usage/usage-YYYY-MM.json` (0600, atomic writes, debounced by `USAGE_FLUSH_MS`, 2000 ms) and survive restarts. No key, key hash or bearer is ever stored there.
+
+Before each upstream request the server refuses (an `isError` tool result in plain words: which limit, the number, when it resets) when a limit is used up. Days and months are UTC.
+
+| Variable | Default | Counts | Basis (measured 2026-11-11) |
+|---|---|---|---|
+| `PUBLIC_MONTHLY_SERPER_CAP` | 300 | Serper requests per public key per month (all key sources) | The only key in use is the website's (`leanzero-site-2026-10-17`; the other 9 keys have no `lastUsedAt` since it was added on 2026-10-10). The surviving logs (2026-11-11 01:35-22:58 UTC) show 1 Serper-backed search that day, so about 30/month: 300 is 10x that. |
+| `INTERNAL_MONTHLY_SERPER_CAP` | 3000 | Serper requests per internal key per month | New class, no history yet: 100/day per Mac. |
+| `OWN_DAILY_BUDGET` / `OWN_MONTHLY_BUDGET` | 150 / 2000 | all `own` requests (our key sent by a caller), every tenant together | 150x the measured website day; guards against our key being used through other keys. |
+| `INTERNAL_DAILY_BUDGET` / `INTERNAL_MONTHLY_BUDGET` | 500 / 8000 | all `internal` requests together (not counted in the own budget) | New class, no history yet. With the own budget, at most 10,000 of the 50,074 credits on the account can go per month. |
+
+At 80 % of any budget the server logs one `[usage] Serper budget at or above 80 %` WARN line per budget per period and the usage endpoint shows `warn: true`.
+
+### `GET /v1/admin/usage?days=N`
+
+Localhost-only and admin-token gated like the rest of `/v1/admin`. `days` defaults to 7 (max 400); days are newest first, one entry per UTC day, zeros when idle. This shape is stable (a health/digest job reads it):
+
+```json
+{
+  "generatedAt": "2026-11-11T22:00:00.000Z",
+  "timezone": "UTC",
+  "days": [
+    { "date": "2026-11-11",
+      "calls":  { "public": 0, "internal": 0 },
+      "serper": { "internal": 0, "own": 0, "byo": 0 },
+      "errors": { "public": 0, "internal": 0 } }
+  ],
+  "budgets": {
+    "ownDaily":        { "used": 0, "limit": 150,  "pct": 0, "warn": false, "resetsAt": "2026-11-12T00:00:00.000Z" },
+    "ownMonthly":      { "used": 0, "limit": 2000, "pct": 0, "warn": false, "resetsAt": "2026-12-01T00:00:00.000Z" },
+    "internalDaily":   { "used": 0, "limit": 500,  "pct": 0, "warn": false, "resetsAt": "2026-11-12T00:00:00.000Z" },
+    "internalMonthly": { "used": 0, "limit": 8000, "pct": 0, "warn": false, "resetsAt": "2026-12-01T00:00:00.000Z" }
+  },
+  "caps": { "publicMonthlyPerKey": 300, "internalMonthlyPerKey": 3000 },
+  "month": "2026-11",
+  "tenants": [
+    { "id": "<tenant uuid>", "displayName": "<name or null>", "class": "public", "calls": 0, "serper": 0, "errors": 0 }
+  ],
+  "serperBalance": 50074
+}
+```
+
+`tenants` holds this month's totals for every known key plus any key with activity this month (`displayName: null` for revoked or OAuth ids), sorted by `serper` then `calls`. `pct` has one decimal. `serperBalance` is the credits left on the internal key's account (Serper's free `GET /account`, called at most once per 10 minutes), or `null` when there is no internal key or the call failed.
+
 ## 🤖 Client-Aware Tool Behavior
 
 This server detects the calling MCP client at the `initialize` handshake (via
